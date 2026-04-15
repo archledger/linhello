@@ -34,7 +34,9 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# @resources is needed by onnxruntime's thread pool (sched_setaffinity);
+# keep @privileged stripped so bpf/kexec/init_module stay denied.
+SystemCallFilter=~@privileged
 
 # Devices: TPM resource manager + V4L cameras.
 DeviceAllow=/dev/tpmrm0 rw
