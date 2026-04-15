@@ -17,11 +17,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Status,
+    /// Capture a face sample. Default appends to any existing samples so you
+    /// can enroll separate frames for glasses-on / glasses-off / etc; auth
+    /// takes the best match across all of them. `--reset` wipes prior
+    /// samples and stores just this one.
     Enroll {
         #[arg(long)]
         user: Option<String>,
+        #[arg(long)]
+        reset: bool,
     },
     Verify {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Seal your login password under the current PCR policy so face-auth
+    /// can release it at login and pam_gnome_keyring can unlock the
+    /// existing keyring via `use_authtok`. Re-run after changing your
+    /// login password.
+    SealPassword {
         #[arg(long)]
         user: Option<String>,
     },
@@ -227,10 +241,16 @@ fn main() -> Result<()> {
             }
             other => bail!("unexpected response: {other:?}"),
         },
-        Cmd::Enroll { user } => {
+        Cmd::Enroll { user, reset } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
-            match send(Request::Enroll { user: user.clone() })? {
-                Response::Enrolled => println!("enrolled: {user}"),
+            match send(Request::Enroll {
+                user: user.clone(),
+                reset,
+            })? {
+                Response::Enrolled { samples } => {
+                    println!("enrolled: {user} ({samples} sample{})",
+                        if samples == 1 { "" } else { "s" });
+                }
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }
@@ -244,6 +264,35 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 }
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        Cmd::SealPassword { user } => {
+            use zeroize::Zeroize;
+            let user = user.map(Ok).unwrap_or_else(current_user)?;
+            let prompt = format!("Login password for {user}: ");
+            let mut pw = rpassword::prompt_password(&prompt)
+                .context("reading password from TTY")?
+                .into_bytes();
+            let mut confirm = rpassword::prompt_password("Confirm: ")
+                .context("reading password confirmation")?
+                .into_bytes();
+            let matched = pw == confirm;
+            confirm.zeroize();
+            if !matched {
+                pw.zeroize();
+                bail!("passwords do not match");
+            }
+            // IPC request takes ownership of the password buffer; the
+            // daemon wraps it in Zeroizing before passing to tpm::seal.
+            let resp = send(Request::SealPassword {
+                user: user.clone(),
+                password: std::mem::take(&mut pw),
+            });
+            pw.zeroize(); // belt-and-suspenders; take() already emptied it
+            match resp? {
+                Response::PasswordSealed => println!("password sealed for {user}"),
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }

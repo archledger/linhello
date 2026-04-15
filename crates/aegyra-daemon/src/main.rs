@@ -77,11 +77,11 @@ async fn handle(stream: UnixStream) -> Result<()> {
 async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
     match req {
         Request::Status => task::spawn_blocking(do_status).await.unwrap_or_else(err),
-        Request::Enroll { user } => {
+        Request::Enroll { user, reset } => {
             if !is_root(peer_uid) {
                 return forbidden("enroll");
             }
-            task::spawn_blocking(move || do_enroll(&user))
+            task::spawn_blocking(move || do_enroll(&user, reset))
                 .await
                 .unwrap_or_else(err)
         }
@@ -160,9 +160,14 @@ fn do_status() -> Response {
     }
 }
 
-fn do_enroll(user: &str) -> Response {
-    match aegyra_biometrics::enroll_user(user) {
-        Ok(()) => Response::Enrolled,
+fn do_enroll(user: &str, reset: bool) -> Response {
+    let res = if reset {
+        aegyra_biometrics::enroll_user_reset(user)
+    } else {
+        aegyra_biometrics::enroll_user(user)
+    };
+    match res.and_then(|()| aegyra_biometrics::enroll::sample_count(user)) {
+        Ok(samples) => Response::Enrolled { samples },
         Err(e) => Response::Error {
             message: e.to_string(),
         },

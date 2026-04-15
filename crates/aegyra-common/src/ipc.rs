@@ -11,7 +11,14 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    Enroll { user: String },
+    /// Capture one frame and store the resulting embedding. Default appends
+    /// to any existing samples (supports glasses-on / glasses-off / other
+    /// appearance variations). `reset: true` wipes prior samples first.
+    Enroll {
+        user: String,
+        #[serde(default)]
+        reset: bool,
+    },
     Verify { user: String },
     /// Verify the user's face and, on success, return the unsealed keyring
     /// secret. Only callers with uid 0 are permitted.
@@ -40,7 +47,9 @@ pub enum Response {
         secure_boot: bool,
         loader: Option<String>,
     },
-    Enrolled,
+    Enrolled {
+        samples: usize,
+    },
     Verified {
         matched: bool,
         score: f32,

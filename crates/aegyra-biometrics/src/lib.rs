@@ -34,16 +34,27 @@ fn capture_and_embed() -> Result<Vec<f32>> {
 }
 
 pub fn authenticate_user(user: &str) -> Result<AuthResult> {
-    let enrolled = enroll::load_embedding(user)?;
+    let samples = enroll::load_embeddings(user)?;
     let live = capture_and_embed()?;
-    let score = matcher::cosine(&live, &enrolled);
+    let score = samples
+        .iter()
+        .map(|s| matcher::cosine(&live, s))
+        .fold(f32::NEG_INFINITY, f32::max);
     Ok(AuthResult {
         matched: score >= MATCH_THRESHOLD,
         score,
     })
 }
 
+/// Append one face sample to the user's enrollment. File is created on
+/// first call.
 pub fn enroll_user(user: &str) -> Result<()> {
+    let vec = capture_and_embed()?;
+    enroll::append_embedding(user, &vec)
+}
+
+/// Wipe all existing samples and store a fresh single sample.
+pub fn enroll_user_reset(user: &str) -> Result<()> {
     let vec = capture_and_embed()?;
     enroll::save_embedding(user, &vec)
 }

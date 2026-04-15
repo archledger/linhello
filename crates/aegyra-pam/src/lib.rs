@@ -31,8 +31,8 @@ pub unsafe extern "C" fn faceauth_unseal_keyring(
     };
     let dst = slice::from_raw_parts_mut(buf, len);
 
-    match client::request(&Request::Unseal { user }) {
-        Ok(Response::Unsealed { secret }) => {
+    match client::request(&Request::UnsealPassword { user }) {
+        Ok(Response::PasswordUnsealed { secret }) => {
             if secret.len() > dst.len() {
                 return -1;
             }
