@@ -43,6 +43,47 @@ pub unsafe extern "C" fn faceauth_unseal_keyring(
     }
 }
 
+/// Reseal `password` as the user's login password envelope. Called from the
+/// PAM `password` stack after the new token has been accepted by the upstream
+/// module, so the face-auth path stays in lockstep with the real password.
+///
+/// Returns 0 on success, -1 on error. The input buffer is zeroed before
+/// return regardless of outcome.
+///
+/// # Safety
+/// `user` must be a NUL-terminated C string. `password` must point to `len`
+/// readable (and writable, for zeroing) bytes.
+#[no_mangle]
+pub unsafe extern "C" fn faceauth_reseal_password(
+    user: *const libc::c_char,
+    password: *mut u8,
+    len: usize,
+) -> i32 {
+    if user.is_null() || password.is_null() || len == 0 {
+        return -1;
+    }
+    let user_str = match CStr::from_ptr(user).to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return -1,
+    };
+
+    // Copy into an owned Vec that will be zeroized on drop, then zero the
+    // caller's buffer immediately so the plaintext never lingers at two sites.
+    let src = slice::from_raw_parts_mut(password, len);
+    let pw = zeroize::Zeroizing::new(src.to_vec());
+    for b in src.iter_mut() {
+        std::ptr::write_volatile(b, 0);
+    }
+
+    match client::request(&Request::SealPassword {
+        user: user_str,
+        password: pw.to_vec(),
+    }) {
+        Ok(Response::PasswordSealed) => 0,
+        _ => -1,
+    }
+}
+
 /// Zero a caller-provided buffer.
 ///
 /// # Safety

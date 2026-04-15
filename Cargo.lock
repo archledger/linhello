@@ -93,6 +93,7 @@ dependencies = [
  "libc",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

@@ -21,3 +21,12 @@
 # stack must still authenticate.
 
 auth    sufficient   pam_faceauth.so
+
+# Keep the TPM-sealed password envelope in sync with the real login password.
+# MUST be listed AFTER the module that actually updates the password (pam_unix)
+# and MUST be `optional` so a reseal failure doesn't block the change itself.
+# Typical usage inside a full password stack:
+#
+#   password  required   pam_unix.so    sha512 shadow use_authtok
+#   password  optional   pam_faceauth.so
+password optional   pam_faceauth.so

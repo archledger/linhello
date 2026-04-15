@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 extern int  faceauth_unseal_keyring(const char *user, uint8_t *buf, size_t len);
+extern int  faceauth_reseal_password(const char *user, uint8_t *buf, size_t len);
 extern void faceauth_zero_buf(uint8_t *buf, size_t len);
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
@@ -50,5 +51,55 @@ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,
                               int argc, const char **argv)
 {
     (void)pamh; (void)flags; (void)argc; (void)argv;
+    return PAM_SUCCESS;
+}
+
+/*
+ * Password stack: keep the sealed envelope in sync with the real login
+ * password. This module must run AFTER the module that actually changes the
+ * password (e.g. pam_unix), and be marked `optional` so a reseal failure
+ * doesn't block the password change itself.
+ *
+ * PAM drives password change in two phases:
+ *   PAM_PRELIM_CHECK  — sanity / old-authtok check. We defer.
+ *   PAM_UPDATE_AUTHTOK — the new token is in PAM_AUTHTOK. Reseal now.
+ */
+PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags,
+                                int argc, const char **argv)
+{
+    (void)argc; (void)argv;
+
+    if (flags & PAM_PRELIM_CHECK) {
+        return PAM_SUCCESS;
+    }
+    if (!(flags & PAM_UPDATE_AUTHTOK)) {
+        return PAM_SUCCESS;
+    }
+
+    const char *user = NULL;
+    if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || user == NULL) {
+        return PAM_IGNORE;
+    }
+
+    const void *authtok = NULL;
+    if (pam_get_item(pamh, PAM_AUTHTOK, &authtok) != PAM_SUCCESS
+        || authtok == NULL) {
+        return PAM_IGNORE;
+    }
+
+    /* Copy into a local buffer so the Rust side can zero it in place without
+     * clobbering PAM's own copy. */
+    size_t n = strnlen((const char *)authtok, 512);
+    if (n == 0 || n >= 512) {
+        return PAM_IGNORE;
+    }
+    uint8_t buf[512];
+    memcpy(buf, authtok, n);
+
+    int rc = faceauth_reseal_password(user, buf, n);
+    faceauth_zero_buf(buf, sizeof(buf));
+
+    /* `optional` module: never fail the password change itself. */
+    (void)rc;
     return PAM_SUCCESS;
 }
