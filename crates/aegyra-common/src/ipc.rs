@@ -18,6 +18,14 @@ pub enum Request {
     Unseal { user: String },
     /// Seal a freshly generated random secret under the current PCR policy.
     Reseal,
+    /// Seal a user-supplied secret (login password) against PCRs for the
+    /// given user. Per-user envelope at /etc/aegyra/<user>/password_envelope.json.
+    /// Root-only.
+    SealPassword { user: String, password: Vec<u8> },
+    /// Face-verify the user and, on success, return their TPM-sealed login
+    /// password so pam_gnome_keyring can unlock the existing keyring with
+    /// `use_authtok`. Root-only.
+    UnsealPassword { user: String },
     /// Report envelope presence, PCR drift, and TPM reachability without
     /// attempting a full unseal.
     Diagnose,
@@ -42,6 +50,10 @@ pub enum Response {
     },
     Resealed {
         bytes: usize,
+    },
+    PasswordSealed,
+    PasswordUnsealed {
+        secret: Vec<u8>,
     },
     Diagnosed {
         envelope_present: bool,

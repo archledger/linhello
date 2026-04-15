@@ -102,6 +102,22 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
             }
             task::spawn_blocking(do_reseal).await.unwrap_or_else(err)
         }
+        Request::SealPassword { user, password } => {
+            if !is_root(peer_uid) {
+                return forbidden("seal_password");
+            }
+            task::spawn_blocking(move || do_seal_password(&user, password))
+                .await
+                .unwrap_or_else(err)
+        }
+        Request::UnsealPassword { user } => {
+            if !is_root(peer_uid) {
+                return forbidden("unseal_password");
+            }
+            task::spawn_blocking(move || do_unseal_password(&user))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
     }
 }
@@ -230,6 +246,37 @@ fn do_diagnose() -> Response {
 fn do_reseal() -> Response {
     match aegyra_core::reseal_random_secret() {
         Ok(secret) => Response::Resealed { bytes: secret.len() },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_seal_password(user: &str, password: Vec<u8>) -> Response {
+    // Wrap incoming bytes in Zeroizing so we wipe them regardless of which
+    // branch returns.
+    let password = zeroize::Zeroizing::new(password);
+    match aegyra_core::seal_password(user, &password) {
+        Ok(()) => Response::PasswordSealed,
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_unseal_password(user: &str) -> Response {
+    match aegyra_biometrics::authenticate_user(user) {
+        Ok(r) if r.matched => match aegyra_core::unseal_password(user) {
+            Ok(secret) => Response::PasswordUnsealed {
+                secret: secret.to_vec(),
+            },
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        },
+        Ok(r) => Response::Error {
+            message: format!("face mismatch (score {:.4})", r.score),
+        },
         Err(e) => Response::Error {
             message: e.to_string(),
         },
