@@ -13,6 +13,7 @@ name = "aegyra-biometrics"
 version = "0.1.0"
 dependencies = [
  "aegyra-common",
+ "aegyra-liveness",
  "anyhow",
  "image",
  "ndarray",
@@ -75,6 +76,7 @@ dependencies = [
  "aegyra-biometrics",
  "aegyra-common",
  "aegyra-core",
+ "aegyra-liveness",
  "aegyra-secureboot",
  "anyhow",
  "serde",
@@ -83,6 +85,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "aegyra-liveness"
+version = "0.1.0"
+dependencies = [
+ "aegyra-common",
+ "image",
+ "ndarray",
+ "ort",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

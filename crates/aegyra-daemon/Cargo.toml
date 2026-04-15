@@ -13,6 +13,7 @@ path = "src/main.rs"
 aegyra-common.workspace = true
 aegyra-core.workspace = true
 aegyra-biometrics.workspace = true
+aegyra-liveness.workspace = true
 aegyra-secureboot.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

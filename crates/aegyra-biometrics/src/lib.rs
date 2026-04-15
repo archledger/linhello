@@ -20,7 +20,10 @@ pub struct AuthResult {
     pub score: f32,
 }
 
-fn capture_and_embed() -> Result<Vec<f32>> {
+/// Capture one frame, detect the primary face, and run the liveness gate.
+/// Returns the frame + face on success; errors (with a human-readable reason)
+/// when no face is visible or liveness rejects.
+fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
     let frame = camera::capture_frame()?;
     let detector = detect::Detector::load_default()?;
     let faces = detector.detect(&frame)?;
@@ -28,9 +31,39 @@ fn capture_and_embed() -> Result<Vec<f32>> {
         .into_iter()
         .next()
         .ok_or_else(|| bio_err("no face detected"))?;
+
+    let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
+    let report = evaluator.evaluate(&frame, face.bbox, camera::DEFAULT_DEVICE)?;
+    if matches!(report.decision, aegyra_liveness::LivenessDecision::Spoof) {
+        return Err(bio_err(format!(
+            "liveness check failed: {}",
+            report.reason.as_deref().unwrap_or("spoof detected")
+        )));
+    }
+    Ok((frame, face))
+}
+
+fn capture_and_embed() -> Result<Vec<f32>> {
+    let (frame, face) = capture_detect_live()?;
     let aligned = align::align(&frame, &face)?;
     let embedder = embed::Embedder::load_default()?;
     embedder.embed(&aligned)
+}
+
+/// Standalone liveness probe for `aegyra liveness-test`. Captures one frame,
+/// runs detection + liveness, and returns the raw report. Never touches
+/// enrollment data or embeddings.
+pub fn run_liveness_test() -> Result<aegyra_liveness::LivenessReport> {
+    let frame = camera::capture_frame()?;
+    let detector = detect::Detector::load_default()?;
+    let faces = detector.detect(&frame)?;
+    let bbox = faces
+        .into_iter()
+        .next()
+        .map(|f| f.bbox)
+        .ok_or_else(|| bio_err("no face detected"))?;
+    let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
+    evaluator.evaluate(&frame, bbox, camera::DEFAULT_DEVICE)
 }
 
 pub fn authenticate_user(user: &str) -> Result<AuthResult> {

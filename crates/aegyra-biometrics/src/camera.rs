@@ -11,7 +11,7 @@ use v4l::{Device, FourCC};
 
 pub type Frame = ImageBuffer<Rgb<u8>, Vec<u8>>;
 
-const DEFAULT_DEVICE: &str = "/dev/video0";
+pub const DEFAULT_DEVICE: &str = "/dev/video0";
 const CAPTURE_WIDTH: u32 = 640;
 const CAPTURE_HEIGHT: u32 = 480;
 

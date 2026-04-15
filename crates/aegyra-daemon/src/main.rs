@@ -1,6 +1,6 @@
 //! Root-privileged service: enrollment, TPM sealing, and IPC over /run/aegyra.sock.
 
-use aegyra_common::ipc::{Request, Response};
+use aegyra_common::ipc::{LivenessSummary, Request, Response};
 use aegyra_common::client::socket_path;
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -119,6 +119,7 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .unwrap_or_else(err)
         }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
+        Request::LivenessTest => task::spawn_blocking(do_liveness_test).await.unwrap_or_else(err),
     }
 }
 
@@ -244,6 +245,32 @@ fn do_diagnose() -> Response {
             tracked_pcrs,
             pcr_drift: None,
             tpm_error: Some(e.to_string()),
+        },
+    }
+}
+
+fn do_liveness_test() -> Response {
+    match aegyra_biometrics::run_liveness_test() {
+        Ok(report) => {
+            let decision = match report.decision {
+                aegyra_liveness::LivenessDecision::Real => "real",
+                aegyra_liveness::LivenessDecision::Spoof => "spoof",
+                aegyra_liveness::LivenessDecision::Uncertain => "uncertain",
+            };
+            Response::LivenessChecked {
+                summary: LivenessSummary {
+                    decision: decision.into(),
+                    spoof_prob: report.signals.spoof_prob,
+                    ml_score: report.signals.ml_score,
+                    device_score: report.signals.device_score,
+                    device_name: report.signals.device_name,
+                    device_driver: report.signals.device_driver,
+                    reason: report.reason,
+                },
+            }
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
         },
     }
 }

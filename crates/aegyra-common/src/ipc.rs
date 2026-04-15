@@ -36,6 +36,23 @@ pub enum Request {
     /// Report envelope presence, PCR drift, and TPM reachability without
     /// attempting a full unseal.
     Diagnose,
+    /// Capture one frame and run the liveness pipeline. Debug-only; returns
+    /// raw signals so the operator can tune thresholds. Does not touch
+    /// enrollment data.
+    LivenessTest,
+}
+
+/// Wire-side liveness summary. Mirrors `aegyra_liveness::LivenessReport` but
+/// lives here so `aegyra-common` stays a leaf crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivenessSummary {
+    pub decision: String, // "real" | "spoof" | "uncertain"
+    pub spoof_prob: Option<f32>,
+    pub ml_score: Option<f32>,
+    pub device_score: f32,
+    pub device_name: Option<String>,
+    pub device_driver: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +89,9 @@ pub enum Response {
         /// the PCRs whose SHA-256 differs from the seal-time snapshot.
         pcr_drift: Option<Vec<u32>>,
         tpm_error: Option<String>,
+    },
+    LivenessChecked {
+        summary: LivenessSummary,
     },
     Error {
         message: String,

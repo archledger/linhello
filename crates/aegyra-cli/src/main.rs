@@ -45,6 +45,10 @@ enum Cmd {
         action: SbAction,
     },
     Diag,
+    /// Capture one frame and print raw liveness signals (ML spoof score,
+    /// camera trust). Use to tune `AEGYRA_SPOOF_THRESHOLD` or diagnose
+    /// false rejects.
+    LivenessTest,
 }
 
 #[derive(Subcommand)]
@@ -308,6 +312,30 @@ fn main() -> Result<()> {
             SbAction::Sign { paths } => secureboot_sign(&paths)?,
             SbAction::Verify => secureboot_verify()?,
             SbAction::List => secureboot_list()?,
+        },
+        Cmd::LivenessTest => match send(Request::LivenessTest)? {
+            Response::LivenessChecked { summary } => {
+                let fmt_opt = |v: Option<f32>| {
+                    v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "n/a".into())
+                };
+                println!("ML spoof_prob  : {}", fmt_opt(summary.spoof_prob));
+                println!("ML real_score  : {}", fmt_opt(summary.ml_score));
+                println!(
+                    "device trust   : {:.2}  ({}, driver={})",
+                    summary.device_score,
+                    summary.device_name.as_deref().unwrap_or("?"),
+                    summary.device_driver.as_deref().unwrap_or("?"),
+                );
+                println!("decision       : {}", summary.decision.to_uppercase());
+                if let Some(r) = summary.reason {
+                    println!("reason         : {r}");
+                }
+                if summary.decision != "real" {
+                    std::process::exit(1);
+                }
+            }
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response: {other:?}"),
         },
         Cmd::Diag => match send(Request::Diagnose)? {
             Response::Diagnosed {

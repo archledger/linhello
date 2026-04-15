@@ -4,6 +4,7 @@ members = [
     "crates/aegyra-common",
     "crates/aegyra-core",
     "crates/aegyra-biometrics",
+    "crates/aegyra-liveness",
     "crates/aegyra-secureboot",
     "crates/aegyra-pam",
     "crates/aegyra-daemon",
@@ -21,6 +22,7 @@ repository = "https://github.com/archledger/aegyra"
 aegyra-common = { path = "crates/aegyra-common" }
 aegyra-core = { path = "crates/aegyra-core" }
 aegyra-biometrics = { path = "crates/aegyra-biometrics" }
+aegyra-liveness = { path = "crates/aegyra-liveness" }
 aegyra-secureboot = { path = "crates/aegyra-secureboot" }
 
 anyhow = "1"
