@@ -1,0 +1,44 @@
+# Maintainer: Ben <archledger236@gmail.com>
+pkgname=aegyra
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="TPM-backed facial authentication and PAM keyring unlock for Linux"
+arch=('x86_64')
+url="https://github.com/archledger/aegyra"
+license=('GPL3')
+depends=('tpm2-tss' 'pam' 'v4l-utils' 'gcc-libs' 'glibc')
+makedepends=('rust' 'cargo' 'clang')
+optdepends=('sbctl: secure-boot key enrollment via `aegyra secureboot setup`')
+install=aegyra.install
+# Source is local-checkout based; expect the tree at ../../ relative to this file.
+source=()
+sha256sums=()
+
+_srcroot="$startdir/../.."
+
+prepare() {
+    # Use a clean copy so cargo target dir lives under $srcdir, not the tree.
+    cp -a "$_srcroot"/{Cargo.toml,Cargo.lock,rust-toolchain.toml,crates,pam,etc,Makefile} "$srcdir/"
+}
+
+build() {
+    cd "$srcdir"
+    make PREFIX=/usr PAMDIR=/usr/lib/security SYSTEMDDIR=/usr/lib/systemd/system \
+        CARGO_TARGET_DIR="$srcdir/target"
+}
+
+package() {
+    cd "$srcdir"
+    make install \
+        DESTDIR="$pkgdir" \
+        PREFIX=/usr \
+        PAMDIR=/usr/lib/security \
+        SYSTEMDDIR=/usr/lib/systemd/system \
+        CARGO_TARGET_DIR="$srcdir/target"
+
+    # Models are not packaged — user installs their own InsightFace buffalo_l
+    # weights. Ship the directory and a README pointer.
+    install -dm755 "$pkgdir/etc/aegyra"
+    install -Dm644 "$_srcroot/models/README.md" \
+        "$pkgdir/usr/share/doc/aegyra/models.md" 2>/dev/null || true
+}

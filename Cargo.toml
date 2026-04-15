@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aegyra-common",
+    "crates/aegyra-core",
+    "crates/aegyra-biometrics",
+    "crates/aegyra-secureboot",
+    "crates/aegyra-pam",
+    "crates/aegyra-daemon",
+    "crates/aegyra-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/archledger/aegyra"
+
+[workspace.dependencies]
+aegyra-common = { path = "crates/aegyra-common" }
+aegyra-core = { path = "crates/aegyra-core" }
+aegyra-biometrics = { path = "crates/aegyra-biometrics" }
+aegyra-secureboot = { path = "crates/aegyra-secureboot" }
+
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1.7", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

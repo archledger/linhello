@@ -1,0 +1,82 @@
+//! V4L2 camera capture. Produces an RGB8 frame suitable for the pipeline.
+
+use crate::bio_err;
+use aegyra_common::Result;
+use image::{ImageBuffer, Rgb};
+use v4l::buffer::Type;
+use v4l::io::mmap::Stream;
+use v4l::io::traits::CaptureStream;
+use v4l::video::Capture;
+use v4l::{Device, FourCC};
+
+pub type Frame = ImageBuffer<Rgb<u8>, Vec<u8>>;
+
+const DEFAULT_DEVICE: &str = "/dev/video0";
+const CAPTURE_WIDTH: u32 = 640;
+const CAPTURE_HEIGHT: u32 = 480;
+
+/// Capture a single frame from the default camera. Blocks until one frame
+/// is delivered or the device errors out.
+pub fn capture_frame() -> Result<Frame> {
+    capture_from(DEFAULT_DEVICE)
+}
+
+pub fn capture_from(path: &str) -> Result<Frame> {
+    let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+
+    let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
+    fmt.width = CAPTURE_WIDTH;
+    fmt.height = CAPTURE_HEIGHT;
+    fmt.fourcc = FourCC::new(b"MJPG");
+    let fmt = dev.set_format(&fmt).map_err(|e| bio_err(format!("set format: {e}")))?;
+
+    let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| bio_err(format!("stream init: {e}")))?;
+
+    let (buf, _meta) = stream.next().map_err(|e| bio_err(format!("stream next: {e}")))?;
+
+    decode(&fmt.fourcc, buf, fmt.width, fmt.height)
+}
+
+fn decode(fourcc: &FourCC, buf: &[u8], w: u32, h: u32) -> Result<Frame> {
+    match &fourcc.repr {
+        b"MJPG" => {
+            let img = image::load_from_memory_with_format(buf, image::ImageFormat::Jpeg)
+                .map_err(|e| bio_err(format!("jpeg decode: {e}")))?;
+            Ok(img.to_rgb8())
+        }
+        b"YUYV" => Ok(yuyv_to_rgb(buf, w, h)),
+        other => Err(bio_err(format!(
+            "unsupported camera pixel format: {:?}",
+            std::str::from_utf8(other).unwrap_or("?")
+        ))),
+    }
+}
+
+fn yuyv_to_rgb(buf: &[u8], w: u32, h: u32) -> Frame {
+    let mut out = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(w, h);
+    let row = (w * 2) as usize;
+    for y in 0..h as usize {
+        let base = y * row;
+        for x in (0..w as usize).step_by(2) {
+            let i = base + x * 2;
+            if i + 3 >= buf.len() {
+                break;
+            }
+            let (y0, u, y1, v) = (buf[i] as i32, buf[i + 1] as i32, buf[i + 2] as i32, buf[i + 3] as i32);
+            out.put_pixel(x as u32, y as u32, yuv_pixel(y0, u, v));
+            out.put_pixel(x as u32 + 1, y as u32, yuv_pixel(y1, u, v));
+        }
+    }
+    out
+}
+
+fn yuv_pixel(y: i32, u: i32, v: i32) -> Rgb<u8> {
+    let c = y - 16;
+    let d = u - 128;
+    let e = v - 128;
+    let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+    Rgb([r, g, b])
+}

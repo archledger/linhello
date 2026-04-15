@@ -1,0 +1,237 @@
+//! Root-privileged service: enrollment, TPM sealing, and IPC over /run/aegyra.sock.
+
+use aegyra_common::ipc::{Request, Response};
+use aegyra_common::client::socket_path;
+use anyhow::{Context, Result};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::task;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let socket: PathBuf = parse_socket_arg().unwrap_or_else(socket_path);
+    if socket.exists() {
+        std::fs::remove_file(&socket)
+            .with_context(|| format!("removing stale socket {}", socket.display()))?;
+    }
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("binding {}", socket.display()))?;
+    // 0660 would be ideal with an `aegyra` group; until we ship that group
+    // assignment, use 0666 and rely on the per-op uid check for privileged ops.
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("chmod {}", socket.display()))?;
+
+    tracing::info!("aegyrad listening on {}", socket.display());
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = handle(stream).await {
+                tracing::warn!(error = %e, "connection error");
+            }
+        });
+    }
+}
+
+async fn handle(stream: UnixStream) -> Result<()> {
+    let peer_uid = stream.peer_cred().ok().and_then(|c| Some(c.uid()));
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).await?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let response = match serde_json::from_str::<Request>(line.trim_end()) {
+        Ok(req) => dispatch(req, peer_uid).await,
+        Err(e) => Response::Error {
+            message: format!("malformed request: {e}"),
+        },
+    };
+
+    let mut out =
+        serde_json::to_vec(&response).context("serializing response")?;
+    out.push(b'\n');
+    write.write_all(&out).await?;
+    write.flush().await?;
+    Ok(())
+}
+
+async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
+    match req {
+        Request::Status => task::spawn_blocking(do_status).await.unwrap_or_else(err),
+        Request::Enroll { user } => {
+            if !is_root(peer_uid) {
+                return forbidden("enroll");
+            }
+            task::spawn_blocking(move || do_enroll(&user))
+                .await
+                .unwrap_or_else(err)
+        }
+        Request::Verify { user } => task::spawn_blocking(move || do_verify(&user))
+            .await
+            .unwrap_or_else(err),
+        Request::Unseal { user } => {
+            if !is_root(peer_uid) {
+                return forbidden("unseal");
+            }
+            task::spawn_blocking(move || do_unseal(&user))
+                .await
+                .unwrap_or_else(err)
+        }
+        Request::Reseal => {
+            if !is_root(peer_uid) {
+                return forbidden("reseal");
+            }
+            task::spawn_blocking(do_reseal).await.unwrap_or_else(err)
+        }
+        Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
+    }
+}
+
+fn is_root(uid: Option<u32>) -> bool {
+    matches!(uid, Some(0))
+}
+
+fn parse_socket_arg() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--socket" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(v) = a.strip_prefix("--socket=") {
+            return Some(PathBuf::from(v));
+        }
+    }
+    None
+}
+
+fn forbidden(op: &str) -> Response {
+    Response::Error {
+        message: format!("{op} requires root"),
+    }
+}
+
+fn err(e: task::JoinError) -> Response {
+    Response::Error {
+        message: format!("worker panicked: {e}"),
+    }
+}
+
+fn do_status() -> Response {
+    Response::Status {
+        security_level: aegyra_core::detect_security_level(),
+        boot_mode: aegyra_secureboot::detect_boot_mode(),
+        secure_boot: aegyra_secureboot::is_secure_boot_enabled(),
+        loader: aegyra_secureboot::loader_identity(),
+    }
+}
+
+fn do_enroll(user: &str) -> Response {
+    match aegyra_biometrics::enroll_user(user) {
+        Ok(()) => Response::Enrolled,
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_verify(user: &str) -> Response {
+    match aegyra_biometrics::authenticate_user(user) {
+        Ok(r) => Response::Verified {
+            matched: r.matched,
+            score: r.score,
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_unseal(user: &str) -> Response {
+    match aegyra_biometrics::authenticate_user(user) {
+        Ok(r) if r.matched => match aegyra_core::unseal_keyring_secret() {
+            Ok(secret) => Response::Unsealed {
+                secret: secret.to_vec(),
+            },
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        },
+        Ok(r) => Response::Error {
+            message: format!("face mismatch (score {:.4})", r.score),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_diagnose() -> Response {
+    let path = aegyra_core::envelope_path();
+    let envelope_present = path.exists();
+    let security_level = aegyra_core::detect_security_level();
+
+    if !envelope_present {
+        return Response::Diagnosed {
+            envelope_present: false,
+            security_level,
+            tracked_pcrs: Vec::new(),
+            pcr_drift: None,
+            tpm_error: None,
+        };
+    }
+
+    let env = match aegyra_core::envelope::SealedEnvelope::load(&path) {
+        Ok(e) => e,
+        Err(e) => {
+            return Response::Error {
+                message: format!("envelope load: {e}"),
+            }
+        }
+    };
+    let tracked_pcrs = env.pcrs.clone();
+
+    match aegyra_core::tpm::diagnose_pcrs(&env) {
+        Ok(changed) => Response::Diagnosed {
+            envelope_present: true,
+            security_level,
+            tracked_pcrs,
+            pcr_drift: if changed.is_empty() { None } else { Some(changed) },
+            tpm_error: None,
+        },
+        Err(e) => Response::Diagnosed {
+            envelope_present: true,
+            security_level,
+            tracked_pcrs,
+            pcr_drift: None,
+            tpm_error: Some(e.to_string()),
+        },
+    }
+}
+
+fn do_reseal() -> Response {
+    match aegyra_core::reseal_random_secret() {
+        Ok(secret) => Response::Resealed { bytes: secret.len() },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}

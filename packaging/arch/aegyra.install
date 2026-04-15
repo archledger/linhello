@@ -1,0 +1,29 @@
+post_install() {
+    systemctl daemon-reload || true
+    cat <<'EOF'
+
+Aegyra installed. Next steps:
+
+  1. Install InsightFace buffalo_l weights into /etc/aegyra:
+         cp det_10g.onnx     /etc/aegyra/det_10g.onnx
+         cp w600k_r50.onnx   /etc/aegyra/face.onnx
+
+  2. Enable the daemon:
+         systemctl enable --now aegyrad
+
+  3. Enroll your face:
+         sudo aegyra enroll --user $USER
+
+  4. Review `aegyra status` and `aegyra diag` before wiring into PAM.
+
+EOF
+}
+
+post_upgrade() {
+    systemctl daemon-reload || true
+    systemctl try-restart aegyrad || true
+}
+
+post_remove() {
+    systemctl daemon-reload || true
+}

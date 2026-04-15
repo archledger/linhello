@@ -1,0 +1,16 @@
+[package]
+name = "aegyra-pam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "aegyra_pam"
+crate-type = ["cdylib"]
+
+[dependencies]
+aegyra-common.workspace = true
+libc = "0.2"
+tracing.workspace = true
+tracing-subscriber.workspace = true
