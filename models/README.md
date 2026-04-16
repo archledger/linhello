@@ -44,10 +44,21 @@ The MiniFASNet `2.7_80x80_MiniFASNetV2` model from
 `minivision-ai/Silent-Face-Anti-Spoofing` is expected. Input is `[1,3,80,80]`
 BGR float32 (0–255, no mean/std); output is three logits with class 1 = real.
 
-Export from the upstream repo (PyTorch → ONNX) and install:
+Upstream ships `.pth` weights, not ONNX. Convert them yourself — we don't
+trust third-party mirrors for a security-critical gate, because a tampered
+model that always outputs "real" would silently defeat liveness:
 
 ```sh
-sudo install -m 0644 2.7_80x80_MiniFASNetV2.onnx /etc/aegyra/antispoof.onnx
+# one-time (~2 GB on Arch)
+sudo pacman -S python-pytorch git
+
+# from the aegyra repo root
+python3 scripts/convert_antispoof.py antispoof.onnx
+
+# install
+sudo install -m 0644 antispoof.onnx /etc/aegyra/antispoof.onnx
+sudo systemctl restart aegyrad
+aegyra liveness-test     # should now print a real spoof_prob
 ```
 
 Tune or disable:
