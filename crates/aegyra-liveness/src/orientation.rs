@@ -9,9 +9,11 @@
 //! Convention: positive yaw = face turned to the CAMERA'S right (user's
 //! left). Positive pitch = face tilted up.
 
-/// Maximum angular deviation from frontal in any axis for a valid
-/// authentication frame. WBF specifies ±15°.
-pub const MAX_ANGLE_DEG: f32 = 15.0;
+/// Maximum angular deviation from frontal for a valid authentication
+/// frame. WBF specifies ±15°; we use ±18° because natural desk posture
+/// produces pitch -16° routinely (measured: 1-in-10 FRR at ±15°, 0%
+/// at ±18° across 20 runs on Ben's rig, 2026-04-15).
+pub const MAX_ANGLE_DEG: f32 = 18.0;
 
 /// Approximate yaw and pitch (degrees) from 5 landmarks.
 ///
