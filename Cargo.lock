@@ -79,6 +79,7 @@ dependencies = [
  "aegyra-liveness",
  "aegyra-secureboot",
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
