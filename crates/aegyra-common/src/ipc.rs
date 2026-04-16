@@ -56,6 +56,7 @@ pub struct LivenessSummary {
     pub ir_mean: Option<f32>,
     pub ir_std: Option<f32>,
     pub ir_highlight_frac: Option<f32>,
+    pub ir_face_bg_ratio: Option<f32>,
     pub face_frac: Option<f32>,
     pub reason: Option<String>,
 }

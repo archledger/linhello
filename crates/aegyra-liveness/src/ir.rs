@@ -43,10 +43,17 @@ use image::GrayImage;
 /// so a real face at arm's length can score the same as a wall photo.
 pub const MIN_FACE_FRAC: f32 = 0.25;
 
-/// All three conditions must hold simultaneously for a PASS. Derived from
-/// the one-shot calibration above; tighten later if we see false rejects.
-const MIN_MEAN: f32 = 120.0;
-const MIN_STD: f32 = 25.0;
+/// Minimum face/background IR intensity ratio. A real face under the
+/// emitter at normal laptop distance should have ratio ≥ 1.3 (face is
+/// 30%+ brighter than surroundings because the emitter concentrates on
+/// it). A flat photo of a face on a wall has ratio ~1.0 (same surface,
+/// same ambient illumination). This signal is AE-gain-invariant.
+const MIN_FACE_BG_RATIO: f32 = 1.3;
+
+/// Highlight fraction is a bonus-confidence signal — eye glints only
+/// appear at very close range (~40 cm). We use it as a soft signal:
+/// hi_frac > 0.08 → full confidence; < 0.08 → score still depends on
+/// face_bg_ratio alone. Not a hard gate.
 const MIN_HIGHLIGHT_FRAC: f32 = 0.08;
 
 #[derive(Debug, Clone)]
@@ -54,6 +61,14 @@ pub struct IrSignals {
     pub mean_face: f32,
     pub std_face: f32,
     pub highlight_frac: f32,
+    /// Mean IR intensity of pixels OUTSIDE the face bbox.
+    pub mean_bg: f32,
+    /// `mean_face / mean_bg`. A real face under the active emitter is
+    /// brighter than the background (emitter concentrates on what's in
+    /// front). A flat photo at distance has ratio ~1.0 because the "face"
+    /// area reflects the same ambient IR as the surrounding surface.
+    /// AE-gain-invariant — the main advantage over absolute thresholds.
+    pub face_bg_ratio: f32,
     pub ir_score: f32,
 }
 
@@ -74,14 +89,11 @@ pub fn classify(s: &IrSignals, face_frac: f32) -> IrVerdict {
     if face_frac < MIN_FACE_FRAC {
         return IrVerdict::TooFar;
     }
-    if s.mean_face < MIN_MEAN {
-        return IrVerdict::Reject("IR illumination too low (face not close enough to emitter)");
-    }
-    if s.highlight_frac < MIN_HIGHLIGHT_FRAC {
-        return IrVerdict::Reject("no eye-glint / hotspot pattern (characteristic of flat surface)");
-    }
-    if s.std_face < MIN_STD {
-        return IrVerdict::Reject("IR intensity too uniform (characteristic of flat surface)");
+    if s.face_bg_ratio < MIN_FACE_BG_RATIO {
+        return IrVerdict::Reject(
+            "face not brighter than background under IR emitter \
+             (characteristic of flat surface at ambient distance)",
+        );
     }
     IrVerdict::Real
 }
@@ -123,34 +135,56 @@ pub fn evaluate(ir: &GrayImage, rgb_bbox: [f32; 4], rgb_size: (u32, u32)) -> IrS
         }
     }
     if n == 0 {
-        return IrSignals {
-            mean_face: 0.0,
-            std_face: 0.0,
-            highlight_frac: 0.0,
-            ir_score: 0.0,
-        };
+        return empty_signals();
     }
 
     let mean = sum as f32 / n as f32;
-    // var = E[x²] - (E[x])² ; clamp against rounding noise
     let var = (sum_sq as f32 / n as f32 - mean * mean).max(0.0);
     let std = var.sqrt();
     let hi_frac = hi as f32 / n as f32;
 
-    // Score is the *joint* satisfaction of all three thresholds: 1.0 if
-    // every one clears, else the worst-performing fraction. Single-signal
-    // scoring hides the fact that real-far and wall-photo can match on
-    // mean alone; only requiring all three signals simultaneously gives
-    // the ≫10× separation we saw in calibration.
-    let mean_ok = (mean / MIN_MEAN).min(1.0);
-    let std_ok = (std / MIN_STD).min(1.0);
+    // Background: mean of all pixels OUTSIDE the face bbox.
+    let total_px = ir.width() as u64 * ir.height() as u64;
+    let bg_n = total_px.saturating_sub(n);
+    let frame_sum: u64 = ir.pixels().map(|p| p.0[0] as u64).sum();
+    let bg_sum = frame_sum.saturating_sub(sum);
+    let mean_bg = if bg_n > 0 {
+        bg_sum as f32 / bg_n as f32
+    } else {
+        1.0
+    };
+    let face_bg_ratio = if mean_bg > 1.0 {
+        mean / mean_bg
+    } else {
+        mean
+    };
+
+    // Score: face/background ratio normalized against the minimum
+    // expected for a real face under the emitter. Ratio ≥ MIN_FACE_BG_RATIO
+    // means the emitter is differentially illuminating the face region —
+    // signature of a 3D object close to the source, not a flat surface
+    // at ambient-IR distance.
+    let ratio_ok = (face_bg_ratio / MIN_FACE_BG_RATIO).min(1.0);
     let hi_ok = (hi_frac / MIN_HIGHLIGHT_FRAC).min(1.0);
-    let ir_score = mean_ok.min(std_ok).min(hi_ok);
+    let ir_score = ratio_ok.min(hi_ok.max(0.5));
 
     IrSignals {
         mean_face: mean,
         std_face: std,
         highlight_frac: hi_frac,
+        mean_bg,
+        face_bg_ratio,
         ir_score,
+    }
+}
+
+fn empty_signals() -> IrSignals {
+    IrSignals {
+        mean_face: 0.0,
+        std_face: 0.0,
+        highlight_frac: 0.0,
+        mean_bg: 0.0,
+        face_bg_ratio: 0.0,
+        ir_score: 0.0,
     }
 }

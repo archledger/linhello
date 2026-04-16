@@ -269,6 +269,7 @@ fn do_liveness_test() -> Response {
                     ir_mean: report.signals.ir_mean,
                     ir_std: report.signals.ir_std,
                     ir_highlight_frac: report.signals.ir_highlight_frac,
+                    ir_face_bg_ratio: report.signals.ir_face_bg_ratio,
                     face_frac: report.signals.face_frac,
                     reason: report.reason,
                 },

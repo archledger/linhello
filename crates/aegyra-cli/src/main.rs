@@ -331,8 +331,9 @@ fn main() -> Result<()> {
                     summary.device_driver.as_deref().unwrap_or("?"),
                 );
                 println!(
-                    "IR score       : {}  (mean {}, std {}, hi-frac {})",
+                    "IR score       : {}  (face/bg {}, mean {}, std {}, hi {})",
                     fmt_opt(summary.ir_score),
+                    fmt_opt_n(summary.ir_face_bg_ratio, 2),
                     fmt_opt_n(summary.ir_mean, 1),
                     fmt_opt_n(summary.ir_std, 1),
                     fmt_opt_n(summary.ir_highlight_frac, 3),

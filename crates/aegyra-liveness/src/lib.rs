@@ -129,6 +129,10 @@ pub struct LivenessSignals {
     /// eye glints show as small bright clusters; glossy paper photos
     /// show a single diffuse hotspot; matte photos/screens show none.
     pub ir_highlight_frac: Option<f32>,
+    /// face_mean / background_mean in the IR frame. AE-gain-invariant
+    /// signal: a real face under the emitter is brighter than surroundings;
+    /// a flat photo on a wall is not.
+    pub ir_face_bg_ratio: Option<f32>,
     /// Face bbox width / frame width. Gates the IR signal: we only
     /// trust IR when face_frac ≥ `ir::MIN_FACE_FRAC` (25%), otherwise
     /// the user is too far for active-NIR to discriminate a live face
@@ -154,6 +158,7 @@ impl LivenessSignals {
             ir_mean: None,
             ir_std: None,
             ir_highlight_frac: None,
+            ir_face_bg_ratio: None,
             face_frac: None,
             motion_score: None,
             blink_score: None,
@@ -283,6 +288,7 @@ impl LivenessEvaluator {
             signals.ir_mean = Some(s.mean_face);
             signals.ir_std = Some(s.std_face);
             signals.ir_highlight_frac = Some(s.highlight_frac);
+            signals.ir_face_bg_ratio = Some(s.face_bg_ratio);
 
             match ir::classify(&s, face_frac) {
                 ir::IrVerdict::Real => { /* IR passes; fall through to ML */ }
