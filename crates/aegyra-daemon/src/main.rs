@@ -271,6 +271,8 @@ fn do_liveness_test() -> Response {
                     ir_highlight_frac: report.signals.ir_highlight_frac,
                     ir_face_bg_ratio: report.signals.ir_face_bg_ratio,
                     face_frac: report.signals.face_frac,
+                    yaw_deg: report.signals.yaw_deg,
+                    pitch_deg: report.signals.pitch_deg,
                     reason: report.reason,
                 },
             }

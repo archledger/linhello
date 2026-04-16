@@ -15,6 +15,7 @@
 pub mod antispoof;
 pub mod device;
 pub mod ir;
+pub mod orientation;
 
 use aegyra_common::{AegyraError, Result};
 use image::RgbImage;
@@ -139,6 +140,12 @@ pub struct LivenessSignals {
     /// from a wall photo.
     pub face_frac: Option<f32>,
 
+    // --- head orientation (Phase B — ±15° gate) ---
+    /// Estimated yaw (horizontal turn), degrees. 0 = frontal.
+    pub yaw_deg: Option<f32>,
+    /// Estimated pitch (vertical tilt), degrees. 0 = frontal.
+    pub pitch_deg: Option<f32>,
+
     // --- reserved for future signals (not yet implemented) ---
     pub motion_score: Option<f32>,
     pub blink_score: Option<f32>,
@@ -160,6 +167,8 @@ impl LivenessSignals {
             ir_highlight_frac: None,
             ir_face_bg_ratio: None,
             face_frac: None,
+            yaw_deg: None,
+            pitch_deg: None,
             motion_score: None,
             blink_score: None,
             consistency_score: None,
@@ -248,10 +257,29 @@ impl LivenessEvaluator {
         &self,
         frame: &RgbImage,
         bbox: [f32; 4],
+        landmarks: &[[f32; 2]; 5],
         camera_path: &str,
         ir: Option<&image::GrayImage>,
     ) -> Result<LivenessReport> {
         let mut signals = LivenessSignals::empty();
+
+        // Head-orientation gate (WBF ±15°). Reject off-axis faces early —
+        // reduces FAR (side-of-face spoofs) and improves ArcFace match
+        // quality (recognition degrades off-axis).
+        let (yaw, pitch) = orientation::estimate_pose(landmarks);
+        signals.yaw_deg = Some(yaw);
+        signals.pitch_deg = Some(pitch);
+        if !orientation::is_frontal(yaw, pitch, orientation::MAX_ANGLE_DEG) {
+            return Ok(LivenessReport {
+                decision: LivenessDecision::Uncertain,
+                reason: Some(format!(
+                    "face not facing camera (yaw {yaw:.0}°, pitch {pitch:.0}°; \
+                     need within ±{:.0}°)",
+                    orientation::MAX_ANGLE_DEG,
+                )),
+                signals,
+            });
+        }
 
         // Device check is cheap and always runs. A virtual cam is an instant
         // reject regardless of ML score.

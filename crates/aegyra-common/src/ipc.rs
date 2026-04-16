@@ -58,6 +58,8 @@ pub struct LivenessSummary {
     pub ir_highlight_frac: Option<f32>,
     pub ir_face_bg_ratio: Option<f32>,
     pub face_frac: Option<f32>,
+    pub yaw_deg: Option<f32>,
+    pub pitch_deg: Option<f32>,
     pub reason: Option<String>,
 }
 

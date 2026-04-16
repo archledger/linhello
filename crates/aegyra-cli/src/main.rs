@@ -345,6 +345,11 @@ fn main() -> Result<()> {
                         .map(|v| format!("{:.0}% of frame", v * 100.0))
                         .unwrap_or_else(|| "n/a".into())
                 );
+                println!(
+                    "orientation    : yaw {}°, pitch {}°",
+                    fmt_opt_n(summary.yaw_deg, 0),
+                    fmt_opt_n(summary.pitch_deg, 0),
+                );
                 println!("decision       : {}", summary.decision.to_uppercase());
                 if let Some(r) = summary.reason {
                     println!("reason         : {r}");
