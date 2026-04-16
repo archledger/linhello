@@ -1,6 +1,7 @@
 //! Root-privileged service: enrollment, TPM sealing, and IPC over /run/aegyra.sock.
 
 use aegyra_common::ipc::{LivenessSummary, Request, Response};
+use aegyra_liveness::device_binding::{CameraBinding, DeviceIdentity};
 use aegyra_common::client::socket_path;
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -190,8 +191,55 @@ fn do_enroll(user: &str, reset: bool) -> Response {
     if let Err(e) = aegyra_core::save_encrypted_embedding(user, &all_raw, &key) {
         return Response::Error { message: format!("save enrollment: {e}") };
     }
+
+    // Record camera identity (soft-SDCP). Overwritten on each enroll so
+    // a hardware upgrade is handled by re-enrolling.
+    save_camera_binding(user, &snapshot_camera_binding());
+
     let samples = all_raw.len() / (aegyra_biometrics::enroll::EMBEDDING_DIM * 4);
     Response::Enrolled { samples }
+}
+
+fn camera_binding_path(user: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(aegyra_common::CONFIG_ROOT)
+        .join(user)
+        .join("camera_binding.json")
+}
+
+fn snapshot_camera_binding() -> CameraBinding {
+    use aegyra_biometrics::camera::{DEFAULT_DEVICE, DEFAULT_IR_DEVICE};
+    CameraBinding {
+        rgb: DeviceIdentity::from_device(DEFAULT_DEVICE)
+            .unwrap_or_else(|| DeviceIdentity {
+                vid: String::new(), pid: String::new(),
+                serial: String::new(), name: "unknown".into(),
+            }),
+        ir: DeviceIdentity::from_device(DEFAULT_IR_DEVICE),
+    }
+}
+
+fn save_camera_binding(user: &str, binding: &CameraBinding) {
+    let path = camera_binding_path(user);
+    if let Ok(json) = serde_json::to_string_pretty(binding) {
+        let _ = std::fs::write(&path, json);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn check_camera_binding(user: &str) -> Result<(), String> {
+    let path = camera_binding_path(user);
+    if !path.exists() {
+        return Ok(());
+    }
+    let json = std::fs::read_to_string(&path).map_err(|e| format!("read binding: {e}"))?;
+    let enrolled: CameraBinding =
+        serde_json::from_str(&json).map_err(|e| format!("parse binding: {e}"))?;
+    let current = snapshot_camera_binding();
+    enrolled.verify(&current)
 }
 
 fn embedding_to_bytes(vec: &[f32]) -> Vec<u8> {
@@ -224,6 +272,9 @@ fn do_verify(user: &str) -> Response {
 /// generates + TPM-seals an AES key, encrypts the embeddings, deletes
 /// the plaintext file. Falls back to legacy only if TPM is unreachable.
 fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
+    // Soft-SDCP: verify camera hardware hasn't been swapped since enrollment.
+    check_camera_binding(user)?;
+
     match aegyra_core::ensure_template_key(user) {
         Ok(key) => {
             let raw = aegyra_core::load_encrypted_embedding(user, &key)

@@ -1,0 +1,82 @@
+//! Camera device identity for soft-SDCP binding.
+//!
+//! At enrollment we snapshot the USB identity (VID, PID, serial) of the
+//! cameras that produced the frames. At verify we re-read sysfs and
+//! reject if any of these changed — a sign that the original camera was
+//! swapped for a rogue device feeding pre-recorded frames.
+//!
+//! This is NOT cryptographic device attestation (real SDCP uses a
+//! per-chip certificate + challenge-response). It raises the bar: an
+//! attacker must either modify sysfs (requires root) or present a USB
+//! device with the exact same descriptor tuple.
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    pub vid: String,
+    pub pid: String,
+    pub serial: String,
+    pub name: String,
+}
+
+impl DeviceIdentity {
+    /// Read identity for a v4l device (e.g. `/dev/video0`) by walking
+    /// its sysfs ancestry up to the USB device node.
+    pub fn from_device(device_path: &str) -> Option<Self> {
+        let node = Path::new(device_path).file_name()?.to_str()?;
+        let sys = Path::new("/sys/class/video4linux").join(node);
+        let name = read_trim(&sys.join("name"))?;
+
+        let real = std::fs::canonicalize(sys.join("device")).ok()?;
+        let mut p = real.as_path();
+        loop {
+            let vid_path = p.join("idVendor");
+            if vid_path.exists() {
+                let vid = read_trim(&vid_path)?;
+                let pid = read_trim(&p.join("idProduct"))?;
+                let serial = read_trim(&p.join("serial")).unwrap_or_default();
+                return Some(DeviceIdentity { vid, pid, serial, name });
+            }
+            p = p.parent()?;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraBinding {
+    pub rgb: DeviceIdentity,
+    pub ir: Option<DeviceIdentity>,
+}
+
+impl CameraBinding {
+    /// Check whether `current` matches `self`. Returns `Ok(())` on match,
+    /// `Err(reason)` describing which field diverged.
+    pub fn verify(&self, current: &CameraBinding) -> Result<(), String> {
+        check_device("RGB", &self.rgb, &current.rgb)?;
+        match (&self.ir, &current.ir) {
+            (Some(enrolled), Some(current_ir)) => check_device("IR", enrolled, current_ir),
+            (Some(_), None) => Err("IR camera was present at enrollment but is now missing".into()),
+            // IR absent at enroll, present now — OK (upgrade, not attack)
+            _ => Ok(()),
+        }
+    }
+}
+
+fn check_device(label: &str, enrolled: &DeviceIdentity, current: &DeviceIdentity) -> Result<(), String> {
+    if enrolled.vid != current.vid {
+        return Err(format!("{label} camera VID changed: enrolled {}, now {}", enrolled.vid, current.vid));
+    }
+    if enrolled.pid != current.pid {
+        return Err(format!("{label} camera PID changed: enrolled {}, now {}", enrolled.pid, current.pid));
+    }
+    if !enrolled.serial.is_empty() && enrolled.serial != current.serial {
+        return Err(format!("{label} camera serial changed: enrolled {}, now {}", enrolled.serial, current.serial));
+    }
+    Ok(())
+}
+
+fn read_trim(p: &Path) -> Option<String> {
+    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+}

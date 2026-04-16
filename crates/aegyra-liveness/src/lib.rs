@@ -14,6 +14,7 @@
 
 pub mod antispoof;
 pub mod device;
+pub mod device_binding;
 pub mod ir;
 pub mod orientation;
 
