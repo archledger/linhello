@@ -100,15 +100,22 @@ def main() -> int:
 
         print(f"==> exporting ONNX → {out_path}")
         dummy = torch.randn(1, 3, 80, 80)
+        # `external_data=False` keeps the whole model in one file (the dynamo
+        # exporter otherwise spills tensors to a sidecar `<out>.data`, which
+        # onnxruntime then refuses to find unless installed alongside).
+        #
+        # `opset_version=18` matches what the current torch exporter can
+        # produce; newer is fine for our onnxruntime 1.17+.
         torch.onnx.export(
             model,
             dummy,
             str(out_path),
             input_names=["input"],
             output_names=["logits"],
-            opset_version=13,
+            opset_version=18,
             do_constant_folding=True,
             dynamic_axes=None,
+            external_data=False,
         )
 
     sz = out_path.stat().st_size
