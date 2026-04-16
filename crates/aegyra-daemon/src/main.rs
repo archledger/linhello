@@ -219,17 +219,22 @@ fn do_verify(user: &str) -> Response {
     }
 }
 
-/// Load enrolled samples, preferring encrypted storage. Falls back to
-/// legacy `embedding.bin` (auto-migrates to encrypted if TPM available).
+/// Load enrolled samples, preferring encrypted storage. If the user has
+/// a legacy `embedding.bin` and no encrypted store yet, auto-migrates:
+/// generates + TPM-seals an AES key, encrypts the embeddings, deletes
+/// the plaintext file. Falls back to legacy only if TPM is unreachable.
 fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
-    // If a template-key envelope exists, use encrypted path.
-    if let Ok(key) = aegyra_core::unseal_template_key(user) {
-        let raw = aegyra_core::load_encrypted_embedding(user, &key)
-            .map_err(|e| e.to_string())?;
-        return aegyra_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string());
+    match aegyra_core::ensure_template_key(user) {
+        Ok(key) => {
+            let raw = aegyra_core::load_encrypted_embedding(user, &key)
+                .map_err(|e| e.to_string())?;
+            aegyra_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string())
+        }
+        Err(e) => {
+            tracing::warn!("template key unavailable ({e}), using legacy storage");
+            aegyra_biometrics::enroll::load_embeddings(user).map_err(|e| e.to_string())
+        }
     }
-    // Legacy fallback: read unencrypted embedding.bin directly.
-    aegyra_biometrics::enroll::load_embeddings(user).map_err(|e| e.to_string())
 }
 
 fn do_unseal(user: &str) -> Response {
