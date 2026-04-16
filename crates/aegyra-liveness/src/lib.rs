@@ -129,6 +129,11 @@ pub struct LivenessSignals {
     /// eye glints show as small bright clusters; glossy paper photos
     /// show a single diffuse hotspot; matte photos/screens show none.
     pub ir_highlight_frac: Option<f32>,
+    /// Face bbox width / frame width. Gates the IR signal: we only
+    /// trust IR when face_frac ≥ `ir::MIN_FACE_FRAC` (25%), otherwise
+    /// the user is too far for active-NIR to discriminate a live face
+    /// from a wall photo.
+    pub face_frac: Option<f32>,
 
     // --- reserved for future signals (not yet implemented) ---
     pub motion_score: Option<f32>,
@@ -149,6 +154,7 @@ impl LivenessSignals {
             ir_mean: None,
             ir_std: None,
             ir_highlight_frac: None,
+            face_frac: None,
             motion_score: None,
             blink_score: None,
             consistency_score: None,
@@ -260,8 +266,16 @@ impl LivenessEvaluator {
             });
         }
 
-        // IR signal when a companion sensor is present. Measurement-only
-        // for now — we surface the numbers but don't yet gate on them.
+        // Face coverage: fraction of frame width the detected bbox spans.
+        // Gates the IR signal below (IR is only trustworthy when the face
+        // is close enough to the active emitter — roughly ≥25% of frame).
+        let bbox_w = (bbox[2] - bbox[0]).max(0.0);
+        let face_frac = bbox_w / frame.width().max(1) as f32;
+        signals.face_frac = Some(face_frac);
+
+        // IR gate when a companion sensor is present. Policy derived from
+        // calibration on Ben's ASUS WBF rig — see aegyra-liveness/src/ir.rs
+        // for thresholds and rationale.
         if let Some(ir_frame) = ir {
             let rgb_size = (frame.width(), frame.height());
             let s = ir::evaluate(ir_frame, bbox, rgb_size);
@@ -269,6 +283,33 @@ impl LivenessEvaluator {
             signals.ir_mean = Some(s.mean_face);
             signals.ir_std = Some(s.std_face);
             signals.ir_highlight_frac = Some(s.highlight_frac);
+
+            match ir::classify(&s, face_frac) {
+                ir::IrVerdict::Real => { /* IR passes; fall through to ML */ }
+                ir::IrVerdict::TooFar => {
+                    // Uncertain, not spoof: the user is legitimate but
+                    // positioned where we can't verify. Surface as a
+                    // human-actionable message; the caller (PAM stack,
+                    // sudo, etc.) turns this into a retry loop.
+                    return Ok(LivenessReport {
+                        decision: LivenessDecision::Uncertain,
+                        reason: Some(format!(
+                            "move closer to the camera — face fills {:.0}% of frame, \
+                             need ≥{:.0}% for IR liveness",
+                            face_frac * 100.0,
+                            ir::MIN_FACE_FRAC * 100.0,
+                        )),
+                        signals,
+                    });
+                }
+                ir::IrVerdict::Reject(reason) => {
+                    return Ok(LivenessReport {
+                        decision: LivenessDecision::Spoof,
+                        reason: Some(format!("IR liveness rejected: {reason}")),
+                        signals,
+                    });
+                }
+            }
         }
 
         // ML check when available.

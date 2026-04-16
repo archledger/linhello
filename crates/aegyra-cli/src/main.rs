@@ -337,6 +337,13 @@ fn main() -> Result<()> {
                     fmt_opt_n(summary.ir_std, 1),
                     fmt_opt_n(summary.ir_highlight_frac, 3),
                 );
+                println!(
+                    "face coverage  : {}",
+                    summary
+                        .face_frac
+                        .map(|v| format!("{:.0}% of frame", v * 100.0))
+                        .unwrap_or_else(|| "n/a".into())
+                );
                 println!("decision       : {}", summary.decision.to_uppercase());
                 if let Some(r) = summary.reason {
                     println!("reason         : {r}");
