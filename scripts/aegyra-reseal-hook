@@ -57,4 +57,12 @@ if [ "$failed" -gt 0 ]; then
     echo "  → WARNING: $failed user(s) failed to reseal — run 'aegyra diag' after reboot"
 fi
 
-echo "  → run 'aegyra diag' after rebooting to verify PCR state"
+echo "  → verifying current PCR state..."
+diag_out=$("$AEGYRA" diag 2>&1) || true
+if echo "$diag_out" | grep -q "CHANGED"; then
+    echo "  → WARNING: PCR drift detected — envelopes may fail after reboot"
+    echo "$diag_out" | sed 's/^/    /'
+    echo "  → run 'aegyra diag' again after rebooting"
+else
+    echo "  → PCR state: no drift"
+fi
