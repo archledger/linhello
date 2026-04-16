@@ -10,6 +10,12 @@ ExecStart=/usr/local/bin/aegyrad
 Restart=on-failure
 RestartSec=2s
 
+# Fail-closed liveness: if /etc/aegyra/antispoof.onnx is missing, refuse to
+# verify rather than silently falling back to the device-trust-only gate.
+# Override in a drop-in (/etc/systemd/system/aegyrad.service.d/) if you need
+# to run without the anti-spoof model during early bring-up.
+Environment=AEGYRA_REQUIRE_ANTISPOOF=1
+
 # Needs root: TPM (/dev/tpmrm0), camera (/dev/video*), /run/aegyra.sock,
 # and read access to /etc/aegyra for sealed envelope + models.
 User=root
