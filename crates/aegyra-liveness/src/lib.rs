@@ -14,6 +14,7 @@
 
 pub mod antispoof;
 pub mod device;
+pub mod ir;
 
 use aegyra_common::{AegyraError, Result};
 use image::RgbImage;
@@ -110,12 +111,30 @@ pub struct LivenessSignals {
     pub device_name: Option<String>,
     pub device_driver: Option<String>,
 
-    // --- reserved for future signals (Phase 2/4 in design) ---
+    // --- IR companion sensor (Phase A — active-IR liveness) ---
+    /// Heuristic 0..1 score derived from IR intensity in the face region.
+    /// Near-0 for a wall photo (1/r² fall-off under active NIR) or a
+    /// screen replay (screens emit almost no NIR). Near-1 for a real
+    /// face well-illuminated by the active IR emitter.
+    pub ir_score: Option<f32>,
+    /// Raw mean pixel intensity in the face bbox (0–255). Surfaced so the
+    /// operator can calibrate a threshold on their own rig before we
+    /// promote `ir_score` to a hard gate.
+    pub ir_mean: Option<f32>,
+    /// Std-dev of IR intensity in the face bbox. Real skin under active
+    /// NIR has structure (nose shadow, eye sockets); flat photos at
+    /// distance are nearly uniform.
+    pub ir_std: Option<f32>,
+    /// Fraction of near-saturated (>240) pixels in the face bbox. Real
+    /// eye glints show as small bright clusters; glossy paper photos
+    /// show a single diffuse hotspot; matte photos/screens show none.
+    pub ir_highlight_frac: Option<f32>,
+
+    // --- reserved for future signals (not yet implemented) ---
     pub motion_score: Option<f32>,
     pub blink_score: Option<f32>,
     pub consistency_score: Option<f32>,
     pub depth_score: Option<f32>,
-    pub ir_score: Option<f32>,
 }
 
 impl LivenessSignals {
@@ -126,11 +145,14 @@ impl LivenessSignals {
             device_score: 0.5,
             device_name: None,
             device_driver: None,
+            ir_score: None,
+            ir_mean: None,
+            ir_std: None,
+            ir_highlight_frac: None,
             motion_score: None,
             blink_score: None,
             consistency_score: None,
             depth_score: None,
-            ir_score: None,
         }
     }
 }
@@ -208,12 +230,15 @@ impl LivenessEvaluator {
 
     /// Evaluate liveness for `frame` with a detected face at `bbox`
     /// (x1, y1, x2, y2 in frame pixels). `camera_path` is the device that
-    /// produced the frame (e.g. `/dev/video0`).
+    /// produced the frame (e.g. `/dev/video0`). `ir` is an optional
+    /// grayscale frame from the companion NIR sensor; when present we
+    /// populate the `ir_*` fields of `LivenessSignals`.
     pub fn evaluate(
         &self,
         frame: &RgbImage,
         bbox: [f32; 4],
         camera_path: &str,
+        ir: Option<&image::GrayImage>,
     ) -> Result<LivenessReport> {
         let mut signals = LivenessSignals::empty();
 
@@ -233,6 +258,17 @@ impl LivenessEvaluator {
                 )),
                 signals,
             });
+        }
+
+        // IR signal when a companion sensor is present. Measurement-only
+        // for now — we surface the numbers but don't yet gate on them.
+        if let Some(ir_frame) = ir {
+            let rgb_size = (frame.width(), frame.height());
+            let s = ir::evaluate(ir_frame, bbox, rgb_size);
+            signals.ir_score = Some(s.ir_score);
+            signals.ir_mean = Some(s.mean_face);
+            signals.ir_std = Some(s.std_face);
+            signals.ir_highlight_frac = Some(s.highlight_frac);
         }
 
         // ML check when available.

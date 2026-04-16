@@ -10,15 +10,71 @@ use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
 pub type Frame = ImageBuffer<Rgb<u8>, Vec<u8>>;
+pub type IrFrame = ImageBuffer<image::Luma<u8>, Vec<u8>>;
 
 pub const DEFAULT_DEVICE: &str = "/dev/video0";
+/// Companion IR sensor on Windows-Hello-style laptops. Typically 8-bit
+/// greyscale (`GREY` FourCC) paired with an active NIR (~850 nm)
+/// illuminator that fires whenever the device is opened. ASUS / Lenovo /
+/// HP use /dev/video2 conventionally (video0/1 are the dual-node RGB cam).
+pub const DEFAULT_IR_DEVICE: &str = "/dev/video2";
 const CAPTURE_WIDTH: u32 = 640;
 const CAPTURE_HEIGHT: u32 = 480;
+const IR_CAPTURE_WIDTH: u32 = 640;
+const IR_CAPTURE_HEIGHT: u32 = 400;
 
 /// Capture a single frame from the default camera. Blocks until one frame
 /// is delivered or the device errors out.
 pub fn capture_frame() -> Result<Frame> {
     capture_from(DEFAULT_DEVICE)
+}
+
+/// Capture a single frame from the default IR companion sensor. Returns
+/// `Ok(None)` (not an error) if the device is absent — laptops without a
+/// Windows-Hello-class IR camera are supported, the IR signal just never
+/// contributes.
+pub fn capture_ir_frame() -> Result<Option<IrFrame>> {
+    if !std::path::Path::new(DEFAULT_IR_DEVICE).exists() {
+        return Ok(None);
+    }
+    capture_ir_from(DEFAULT_IR_DEVICE).map(Some)
+}
+
+pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
+    let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+
+    let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
+    fmt.width = IR_CAPTURE_WIDTH;
+    fmt.height = IR_CAPTURE_HEIGHT;
+    fmt.fourcc = FourCC::new(b"GREY");
+    let fmt = dev
+        .set_format(&fmt)
+        .map_err(|e| bio_err(format!("set format: {e}")))?;
+
+    let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| bio_err(format!("stream init: {e}")))?;
+    let (buf, _meta) = stream
+        .next()
+        .map_err(|e| bio_err(format!("stream next: {e}")))?;
+
+    if &fmt.fourcc.repr != b"GREY" {
+        return Err(bio_err(format!(
+            "unexpected IR pixel format: {:?}",
+            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("?")
+        )));
+    }
+    let (w, h) = (fmt.width, fmt.height);
+    let expected = (w * h) as usize;
+    if buf.len() < expected {
+        return Err(bio_err(format!(
+            "short IR buffer: got {}, expected {}",
+            buf.len(),
+            expected
+        )));
+    }
+    let img = ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, buf[..expected].to_vec())
+        .ok_or_else(|| bio_err("IR buffer dimensions mismatch"))?;
+    Ok(img)
 }
 
 pub fn capture_from(path: &str) -> Result<Frame> {

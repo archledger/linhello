@@ -265,6 +265,10 @@ fn do_liveness_test() -> Response {
                     device_score: report.signals.device_score,
                     device_name: report.signals.device_name,
                     device_driver: report.signals.device_driver,
+                    ir_score: report.signals.ir_score,
+                    ir_mean: report.signals.ir_mean,
+                    ir_std: report.signals.ir_std,
+                    ir_highlight_frac: report.signals.ir_highlight_frac,
                     reason: report.reason,
                 },
             }

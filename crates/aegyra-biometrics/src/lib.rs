@@ -33,7 +33,10 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
         .ok_or_else(|| bio_err("no face detected"))?;
 
     let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
-    let report = evaluator.evaluate(&frame, face.bbox, camera::DEFAULT_DEVICE)?;
+    // Opportunistic IR capture. Missing sensor ⇒ IR signals are absent,
+    // not an error — laptops without a WBF-class IR cam are supported.
+    let ir = camera::capture_ir_frame().ok().flatten();
+    let report = evaluator.evaluate(&frame, face.bbox, camera::DEFAULT_DEVICE, ir.as_ref())?;
     if matches!(report.decision, aegyra_liveness::LivenessDecision::Spoof) {
         return Err(bio_err(format!(
             "liveness check failed: {}",
@@ -63,7 +66,8 @@ pub fn run_liveness_test() -> Result<aegyra_liveness::LivenessReport> {
         .map(|f| f.bbox)
         .ok_or_else(|| bio_err("no face detected"))?;
     let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
-    evaluator.evaluate(&frame, bbox, camera::DEFAULT_DEVICE)
+    let ir = camera::capture_ir_frame().ok().flatten();
+    evaluator.evaluate(&frame, bbox, camera::DEFAULT_DEVICE, ir.as_ref())
 }
 
 pub fn authenticate_user(user: &str) -> Result<AuthResult> {

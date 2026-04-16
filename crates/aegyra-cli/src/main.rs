@@ -318,6 +318,10 @@ fn main() -> Result<()> {
                 let fmt_opt = |v: Option<f32>| {
                     v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "n/a".into())
                 };
+                let fmt_opt_n = |v: Option<f32>, prec: usize| {
+                    v.map(|x| format!("{x:.*}", prec))
+                        .unwrap_or_else(|| "n/a".into())
+                };
                 println!("ML spoof_prob  : {}", fmt_opt(summary.spoof_prob));
                 println!("ML real_score  : {}", fmt_opt(summary.ml_score));
                 println!(
@@ -325,6 +329,13 @@ fn main() -> Result<()> {
                     summary.device_score,
                     summary.device_name.as_deref().unwrap_or("?"),
                     summary.device_driver.as_deref().unwrap_or("?"),
+                );
+                println!(
+                    "IR score       : {}  (mean {}, std {}, hi-frac {})",
+                    fmt_opt(summary.ir_score),
+                    fmt_opt_n(summary.ir_mean, 1),
+                    fmt_opt_n(summary.ir_std, 1),
+                    fmt_opt_n(summary.ir_highlight_frac, 3),
                 );
                 println!("decision       : {}", summary.decision.to_uppercase());
                 if let Some(r) = summary.reason {

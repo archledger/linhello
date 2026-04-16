@@ -52,6 +52,10 @@ pub struct LivenessSummary {
     pub device_score: f32,
     pub device_name: Option<String>,
     pub device_driver: Option<String>,
+    pub ir_score: Option<f32>,
+    pub ir_mean: Option<f32>,
+    pub ir_std: Option<f32>,
+    pub ir_highlight_frac: Option<f32>,
     pub reason: Option<String>,
 }
 
