@@ -23,6 +23,14 @@ const CAPTURE_HEIGHT: u32 = 480;
 const IR_CAPTURE_WIDTH: u32 = 640;
 const IR_CAPTURE_HEIGHT: u32 = 400;
 
+/// Frames to capture-and-discard before the real one. UVC sensors ramp
+/// auto-exposure and auto-gain over the first ~8–15 frames after a
+/// format change; grabbing frame 0 gives a shot mid-ramp, which for IR
+/// makes intensity vary 3× at constant distance. 8 frames at 15 fps
+/// (IR) ≈ 530 ms; at 30 fps (RGB) ≈ 270 ms. Tuned against Ben's ASUS
+/// WBF rig, 2026-04-15: halved IR FRR.
+const AE_WARMUP_FRAMES: usize = 8;
+
 /// Capture a single frame from the default camera. Blocks until one frame
 /// is delivered or the device errors out.
 pub fn capture_frame() -> Result<Frame> {
@@ -53,6 +61,12 @@ pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
 
     let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| bio_err(format!("stream init: {e}")))?;
+    // AE warmup — see notes on AE_WARMUP_FRAMES.
+    for _ in 0..AE_WARMUP_FRAMES {
+        stream
+            .next()
+            .map_err(|e| bio_err(format!("IR warmup: {e}")))?;
+    }
     let (buf, _meta) = stream
         .next()
         .map_err(|e| bio_err(format!("stream next: {e}")))?;
@@ -88,6 +102,14 @@ pub fn capture_from(path: &str) -> Result<Frame> {
 
     let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| bio_err(format!("stream init: {e}")))?;
+
+    // Warm up — discard the first N frames while AE/AGC converge. Without
+    // this, captures grabbed mid-ramp produce wildly variable exposure.
+    for _ in 0..AE_WARMUP_FRAMES {
+        stream
+            .next()
+            .map_err(|e| bio_err(format!("warmup: {e}")))?;
+    }
 
     let (buf, _meta) = stream.next().map_err(|e| bio_err(format!("stream next: {e}")))?;
 
