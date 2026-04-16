@@ -88,6 +88,10 @@ pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 
 // ── Template-key management ──────────────────────────────────────────
 
+pub fn template_key_path_pub(user: &str) -> Result<PathBuf> {
+    template_key_path(user)
+}
+
 fn template_key_path(user: &str) -> Result<PathBuf> {
     if user.is_empty() || user.contains('/') || user.contains('\0') {
         return Err(AegyraError::Policy("invalid user name".into()));

@@ -40,6 +40,10 @@ pub enum Request {
     /// raw signals so the operator can tune thresholds. Does not touch
     /// enrollment data.
     LivenessTest,
+    /// Unseal + immediately reseal all per-user TPM envelopes (password +
+    /// template key) under current PCR state. Used by the pacman hook
+    /// after kernel/bootloader updates. Root-only.
+    ResealUserEnvelopes { user: String },
 }
 
 /// Wire-side liveness summary. Mirrors `aegyra_liveness::LivenessReport` but
@@ -100,6 +104,10 @@ pub enum Response {
     },
     LivenessChecked {
         summary: LivenessSummary,
+    },
+    UserEnvelopesResealed {
+        password: bool,
+        template_key: bool,
     },
     Error {
         message: String,

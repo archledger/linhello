@@ -146,6 +146,14 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
         }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
         Request::LivenessTest => task::spawn_blocking(do_liveness_test).await.unwrap_or_else(err),
+        Request::ResealUserEnvelopes { user } => {
+            if !is_root(peer_uid) {
+                return forbidden("reseal_user_envelopes");
+            }
+            task::spawn_blocking(move || do_reseal_user_envelopes(&user))
+                .await
+                .unwrap_or_else(err)
+        }
     }
 }
 
@@ -419,6 +427,51 @@ fn do_reseal() -> Response {
         Err(e) => Response::Error {
             message: e.to_string(),
         },
+    }
+}
+
+fn do_reseal_user_envelopes(user: &str) -> Response {
+    let mut pw_ok = false;
+    let mut tk_ok = false;
+
+    // Password envelope: unseal (current PCRs) → reseal.
+    match aegyra_core::unseal_password(user) {
+        Ok(plaintext) => match aegyra_core::seal_password(user, &plaintext) {
+            Ok(()) => pw_ok = true,
+            Err(e) => tracing::warn!("reseal password for {user}: {e}"),
+        },
+        Err(e) => tracing::warn!("unseal password for {user}: {e}"),
+    }
+
+    // Template-key envelope: unseal → reseal.
+    match aegyra_core::unseal_template_key(user) {
+        Ok(key) => {
+            let level = aegyra_core::detect_security_level();
+            match aegyra_core::tpm::seal(&key, level) {
+                Ok(env) => {
+                    if let Ok(path) = aegyra_core::template_key_path_pub(user) {
+                        match env.save(&path) {
+                            Ok(()) => {
+                                tk_ok = true;
+                                // Invalidate the daemon's cached key so next
+                                // verify picks up the fresh envelope.
+                                let cache = get_template_key_cache();
+                                let mut map = cache.lock().unwrap();
+                                map.remove(user);
+                            }
+                            Err(e) => tracing::warn!("save template key for {user}: {e}"),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("reseal template key for {user}: {e}"),
+            }
+        }
+        Err(e) => tracing::warn!("unseal template key for {user}: {e}"),
+    }
+
+    Response::UserEnvelopesResealed {
+        password: pw_ok,
+        template_key: tk_ok,
     }
 }
 

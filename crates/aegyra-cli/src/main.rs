@@ -52,6 +52,13 @@ enum Cmd {
     /// Run N consecutive verify cycles and report FRR, score statistics,
     /// and per-run latency. Measures real-world false-reject rate against
     /// WBF targets (FRR < 10% with liveness).
+    /// Unseal + reseal all per-user TPM envelopes (password + template key)
+    /// under current PCR state. Called by the pacman hook after kernel or
+    /// bootloader updates. Requires root.
+    ResealUserEnvelopes {
+        #[arg(long)]
+        user: String,
+    },
     Benchmark {
         #[arg(long)]
         user: Option<String>,
@@ -374,6 +381,19 @@ fn main() -> Result<()> {
             Response::Error { message } => bail!(message),
             other => bail!("unexpected response: {other:?}"),
         },
+        Cmd::ResealUserEnvelopes { user } => {
+            match send(Request::ResealUserEnvelopes { user: user.clone() })? {
+                Response::UserEnvelopesResealed { password, template_key } => {
+                    println!(
+                        "resealed {user}: password={}, template_key={}",
+                        if password { "ok" } else { "skipped" },
+                        if template_key { "ok" } else { "skipped" },
+                    );
+                }
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         Cmd::Benchmark { user, runs, interval } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
             println!("Aegyra FRR Benchmark");

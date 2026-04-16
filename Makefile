@@ -68,6 +68,10 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/gdm-password
 	install -Dm644 etc/pam.d/examples/sudo \
 	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/sudo
+	install -Dm755 scripts/aegyra-reseal-hook \
+	    $(DESTDIR)$(BINDIR)/aegyra-reseal-hook
+	install -Dm644 etc/pacman.d/hooks/aegyra-reseal.hook \
+	    $(DESTDIR)/etc/pacman.d/hooks/aegyra-reseal.hook
 	install -dm755 $(DESTDIR)$(CONFDIR)
 	@echo
 	@echo "Installed. Next:"

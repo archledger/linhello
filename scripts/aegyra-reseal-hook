@@ -1,0 +1,60 @@
+#!/bin/bash
+# Pacman post-transaction hook: reseal Aegyra TPM envelopes after a
+# kernel/bootloader/Secure-Boot update.
+#
+# Context: Aegyra seals secrets under PCR 7 (Secure Boot state) and
+# PCR 11 (UKI cmdline). A kernel update with the same cmdline doesn't
+# change these PCRs, so reseal is a harmless no-op. If Secure Boot keys
+# were rotated (sbctl), PCR 7 changes IMMEDIATELY (efivars) and reseal
+# captures the new value. If the UKI cmdline changed, the new PCR 11
+# value only takes effect after reboot — we can't predict it, so we
+# warn and rely on password fallback for the first post-reboot login.
+#
+# The hook reseals:
+#   1. Global envelope (/etc/aegyra/tpm_envelope.json)
+#   2. Per-user password envelopes (unseal current → reseal)
+#   3. Per-user template-key envelopes (unseal current → reseal)
+#
+# If the daemon isn't running, we skip silently — the user hasn't set
+# up face auth yet.
+
+set -euo pipefail
+
+AEGYRA=/usr/local/bin/aegyra
+CONF=/etc/aegyra
+
+# Drain stdin (NeedsTargets pipes package list, we don't use it).
+cat > /dev/null
+
+if ! systemctl is-active --quiet aegyrad 2>/dev/null; then
+    exit 0
+fi
+
+echo "  → resealing global TPM envelope"
+"$AEGYRA" reseal 2>/dev/null || true
+
+resealed=0
+failed=0
+
+for user_dir in "$CONF"/*/; do
+    [ -d "$user_dir" ] || continue
+    user=$(basename "$user_dir")
+
+    # Password envelope: unseal (current PCRs) → reseal.
+    if [ -f "$user_dir/password_envelope.json" ]; then
+        if "$AEGYRA" reseal-user-envelopes --user "$user" 2>/dev/null; then
+            resealed=$((resealed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    fi
+done
+
+if [ "$resealed" -gt 0 ]; then
+    echo "  → resealed envelopes for $resealed user(s)"
+fi
+if [ "$failed" -gt 0 ]; then
+    echo "  → WARNING: $failed user(s) failed to reseal — run 'aegyra diag' after reboot"
+fi
+
+echo "  → run 'aegyra diag' after rebooting to verify PCR state"
