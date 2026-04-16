@@ -49,6 +49,19 @@ enum Cmd {
     /// camera trust). Use to tune `AEGYRA_SPOOF_THRESHOLD` or diagnose
     /// false rejects.
     LivenessTest,
+    /// Run N consecutive verify cycles and report FRR, score statistics,
+    /// and per-run latency. Measures real-world false-reject rate against
+    /// WBF targets (FRR < 10% with liveness).
+    Benchmark {
+        #[arg(long)]
+        user: Option<String>,
+        /// Number of verify cycles to run.
+        #[arg(long, default_value = "20")]
+        runs: u32,
+        /// Seconds between runs (allows repositioning).
+        #[arg(long, default_value = "2")]
+        interval: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,6 +374,115 @@ fn main() -> Result<()> {
             Response::Error { message } => bail!(message),
             other => bail!("unexpected response: {other:?}"),
         },
+        Cmd::Benchmark { user, runs, interval } => {
+            let user = user.map(Ok).unwrap_or_else(current_user)?;
+            println!("Aegyra FRR Benchmark");
+            println!("user     : {user}");
+            println!("runs     : {runs}");
+            println!("interval : {interval}s");
+            println!();
+
+            let mut passed = 0u32;
+            let mut failed_match = 0u32;
+            let mut failed_liveness = 0u32;
+            let mut no_face = 0u32;
+            let mut other_err = 0u32;
+            let mut scores: Vec<f32> = Vec::new();
+            let mut latencies: Vec<f64> = Vec::new();
+
+            for i in 1..=runs {
+                let t0 = std::time::Instant::now();
+                let resp = send(Request::Verify { user: user.clone() });
+                let elapsed = t0.elapsed().as_secs_f64();
+                latencies.push(elapsed);
+
+                match resp {
+                    Ok(Response::Verified { matched, score }) => {
+                        if matched {
+                            passed += 1;
+                            scores.push(score);
+                            print!("  [{i:>3}/{runs}] PASS  score={score:.4}");
+                        } else {
+                            failed_match += 1;
+                            scores.push(score);
+                            print!("  [{i:>3}/{runs}] FAIL  score={score:.4}");
+                        }
+                    }
+                    Ok(Response::Error { message }) => {
+                        if message.contains("no face") {
+                            no_face += 1;
+                            print!("  [{i:>3}/{runs}] NOFACE");
+                        } else if message.contains("liveness") || message.contains("move closer")
+                            || message.contains("not facing") || message.contains("IR")
+                        {
+                            failed_liveness += 1;
+                            print!("  [{i:>3}/{runs}] LIVE  {message}");
+                        } else {
+                            other_err += 1;
+                            print!("  [{i:>3}/{runs}] ERR   {message}");
+                        }
+                    }
+                    Err(e) => {
+                        other_err += 1;
+                        print!("  [{i:>3}/{runs}] ERR   {e}");
+                    }
+                    _ => {
+                        other_err += 1;
+                        print!("  [{i:>3}/{runs}] ERR   unexpected response");
+                    }
+                }
+                println!("  ({elapsed:.2}s)");
+
+                if i < runs {
+                    std::thread::sleep(std::time::Duration::from_secs(interval as u64));
+                }
+            }
+
+            let total = runs;
+            let frr_match = failed_match as f64 / total as f64 * 100.0;
+            let frr_all = (failed_match + failed_liveness + no_face) as f64 / total as f64 * 100.0;
+
+            println!();
+            println!("Results:");
+            println!("  Passed          : {passed}/{total} ({:.1}%)", passed as f64 / total as f64 * 100.0);
+            println!("  Match failures  : {failed_match}/{total} ({frr_match:.1}%)");
+            println!("  Liveness rejects: {failed_liveness}/{total}");
+            println!("  No face         : {no_face}/{total}");
+            if other_err > 0 {
+                println!("  Other errors    : {other_err}/{total}");
+            }
+
+            if !scores.is_empty() {
+                let n = scores.len() as f32;
+                let mean = scores.iter().sum::<f32>() / n;
+                let min = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let var = scores.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n;
+                println!();
+                println!("Score statistics (all detected runs):");
+                println!("  Mean : {mean:.4}");
+                println!("  Min  : {min:.4}");
+                println!("  Max  : {max:.4}");
+                println!("  Std  : {:.4}", var.sqrt());
+            }
+
+            if !latencies.is_empty() {
+                let n = latencies.len() as f64;
+                let mean = latencies.iter().sum::<f64>() / n;
+                let min = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                println!();
+                println!("Latency:");
+                println!("  Mean : {mean:.2}s");
+                println!("  Min  : {min:.2}s");
+                println!("  Max  : {max:.2}s");
+            }
+
+            println!();
+            println!("WBF targets:");
+            println!("  FRR (match only)       : {frr_match:.1}%  (target < 5%)  {}", if frr_match < 5.0 { "PASS" } else { "FAIL" });
+            println!("  FRR (including liveness): {frr_all:.1}%  (target < 10%) {}", if frr_all < 10.0 { "PASS" } else { "FAIL" });
+        }
         Cmd::Diag => match send(Request::Diagnose)? {
             Response::Diagnosed {
                 envelope_present,
