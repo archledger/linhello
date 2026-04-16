@@ -68,6 +68,12 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/gdm-password
 	install -Dm644 etc/pam.d/examples/sudo \
 	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/sudo
+	install -Dm644 etc/pam.d/examples/sddm \
+	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/sddm
+	install -Dm644 etc/pam.d/examples/lightdm \
+	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/lightdm
+	install -Dm644 etc/pam.d/examples/system-login \
+	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/system-login
 	install -Dm755 scripts/aegyra-reseal-hook \
 	    $(DESTDIR)$(BINDIR)/aegyra-reseal-hook
 	install -Dm644 etc/pacman.d/hooks/aegyra-reseal.hook \
