@@ -29,7 +29,7 @@ const IR_CAPTURE_HEIGHT: u32 = 400;
 /// makes intensity vary 3× at constant distance. 8 frames at 15 fps
 /// (IR) ≈ 530 ms; at 30 fps (RGB) ≈ 270 ms. Tuned against Ben's ASUS
 /// WBF rig, 2026-04-15: halved IR FRR.
-const AE_WARMUP_FRAMES: usize = 8;
+const AE_WARMUP_FRAMES: usize = 5;
 
 /// Capture a single frame from the default camera. Blocks until one frame
 /// is delivered or the device errors out.

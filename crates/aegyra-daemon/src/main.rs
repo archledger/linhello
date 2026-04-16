@@ -2,6 +2,31 @@
 
 use aegyra_common::ipc::{LivenessSummary, Request, Response};
 use aegyra_liveness::device_binding::{CameraBinding, DeviceIdentity};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+static TEMPLATE_KEY_CACHE: std::sync::OnceLock<Mutex<HashMap<String, zeroize::Zeroizing<Vec<u8>>>>> =
+    std::sync::OnceLock::new();
+
+fn get_template_key_cache() -> &'static Mutex<HashMap<String, zeroize::Zeroizing<Vec<u8>>>> {
+    TEMPLATE_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_template_key(user: &str) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let cache = get_template_key_cache();
+    {
+        let map = cache.lock().unwrap();
+        if let Some(key) = map.get(user) {
+            return Ok(key.clone());
+        }
+    }
+    let key = aegyra_core::ensure_template_key(user).map_err(|e| e.to_string())?;
+    {
+        let mut map = cache.lock().unwrap();
+        map.insert(user.to_string(), key.clone());
+    }
+    Ok(key)
+}
 use aegyra_common::client::socket_path;
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -170,8 +195,7 @@ fn do_enroll(user: &str, reset: bool) -> Response {
     };
     let raw = embedding_to_bytes(&embedding);
 
-    // Ensure per-user AES key exists (creates + TPM-seals on first enroll).
-    let key = match aegyra_core::ensure_template_key(user) {
+    let key = match cached_template_key(user) {
         Ok(k) => k,
         Err(e) => return Response::Error { message: format!("template key: {e}") },
     };
@@ -272,10 +296,9 @@ fn do_verify(user: &str) -> Response {
 /// generates + TPM-seals an AES key, encrypts the embeddings, deletes
 /// the plaintext file. Falls back to legacy only if TPM is unreachable.
 fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
-    // Soft-SDCP: verify camera hardware hasn't been swapped since enrollment.
     check_camera_binding(user)?;
 
-    match aegyra_core::ensure_template_key(user) {
+    match cached_template_key(user) {
         Ok(key) => {
             let raw = aegyra_core::load_encrypted_embedding(user, &key)
                 .map_err(|e| e.to_string())?;
