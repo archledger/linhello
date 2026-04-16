@@ -20,34 +20,55 @@ use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Default location for the MiniFASNet ONNX model. See `models/README.md`.
+/// Primary MiniFASNet model (2.7× scale, MiniFASNetV2). Always required
+/// when anti-spoof is enabled.
 pub const DEFAULT_ANTISPOOF_MODEL: &str = "/etc/aegyra/antispoof.onnx";
+
+/// Secondary MiniFASNet model (4.0× scale, MiniFASNetV1SE). Optional — if
+/// present, we run both and average softmax outputs (dual-model fusion is
+/// what upstream recommends). If absent we fall back to single-model mode.
+pub const DEFAULT_ANTISPOOF_MODEL_4: &str = "/etc/aegyra/antispoof_4.onnx";
 
 /// Reject if `spoof_prob >= this`. 0.5 is the MiniFASNet default.
 pub const DEFAULT_SPOOF_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessConfig {
-    /// Path to the anti-spoof ONNX model. `None` ⇒ skip ML check entirely
-    /// (device check still runs).
+    /// Primary anti-spoof model (2.7× scale). `None` ⇒ skip ML check
+    /// entirely (device check still runs).
     pub antispoof_model: Option<PathBuf>,
+    /// Secondary anti-spoof model (4.0× scale) for dual-model fusion.
+    /// `None` ⇒ run single-model (weaker — see upstream).
+    pub antispoof_model_4: Option<PathBuf>,
     /// Reject threshold on the softmax spoof probability.
     pub spoof_threshold: f32,
-    /// If true, absence of the anti-spoof model is a hard failure. If false,
-    /// we warn once and proceed with device check only.
+    /// If true, absence of the primary anti-spoof model is a hard failure.
+    /// The secondary model is always optional — its absence only downgrades
+    /// to single-model mode, it never fails.
     pub require_antispoof: bool,
 }
 
 impl LivenessConfig {
-    /// Build from environment: `AEGYRA_ANTISPOOF_MODEL`, `AEGYRA_SPOOF_THRESHOLD`,
-    /// `AEGYRA_REQUIRE_ANTISPOOF`. Always resolves to a concrete path (env
-    /// override or default); `LivenessEvaluator::new` then surfaces a
-    /// path-specific error if the file is missing.
+    /// Build from environment:
+    ///   * `AEGYRA_ANTISPOOF_MODEL`   — primary (2.7×) model path, default
+    ///     `/etc/aegyra/antispoof.onnx`. Always resolves to a concrete path;
+    ///     existence is checked in `LivenessEvaluator::new`.
+    ///   * `AEGYRA_ANTISPOOF_MODEL_4` — secondary (4.0×) model path,
+    ///     default `/etc/aegyra/antispoof_4.onnx`. Optional at runtime: if
+    ///     the file is missing, we downgrade to single-model mode with a
+    ///     one-time warning.
+    ///   * `AEGYRA_SPOOF_THRESHOLD`    — reject threshold (default 0.5).
+    ///   * `AEGYRA_REQUIRE_ANTISPOOF`  — fail-closed on missing primary.
     pub fn from_env() -> Self {
         let antispoof_model = Some(
             std::env::var_os("AEGYRA_ANTISPOOF_MODEL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_ANTISPOOF_MODEL)),
+        );
+        let antispoof_model_4 = Some(
+            std::env::var_os("AEGYRA_ANTISPOOF_MODEL_4")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_ANTISPOOF_MODEL_4)),
         );
 
         let spoof_threshold = std::env::var("AEGYRA_SPOOF_THRESHOLD")
@@ -63,6 +84,7 @@ impl LivenessConfig {
 
         LivenessConfig {
             antispoof_model,
+            antispoof_model_4,
             spoof_threshold,
             require_antispoof,
         }
@@ -128,8 +150,13 @@ pub struct LivenessEvaluator {
 
 impl LivenessEvaluator {
     pub fn new(config: LivenessConfig) -> Result<Self> {
-        let antispoof = match &config.antispoof_model {
-            Some(path) if path.exists() => Some(antispoof::AntiSpoofModel::load(path)?),
+        // Build the ensemble. Primary (2.7×) is mandatory when require_antispoof
+        // is set; secondary (4.0×) is always optional and, if missing, we
+        // downgrade to single-model mode with a warning.
+        let mut items: Vec<(std::path::PathBuf, f32, &'static str)> = Vec::new();
+
+        match &config.antispoof_model {
+            Some(path) if path.exists() => items.push((path.clone(), 2.7, "2.7_V2")),
             Some(path) => {
                 if config.require_antispoof {
                     return Err(AegyraError::Biometrics(format!(
@@ -138,20 +165,39 @@ impl LivenessEvaluator {
                     )));
                 }
                 tracing::warn!(
-                    "anti-spoof model not found at {} — liveness ML check disabled",
+                    "primary anti-spoof model not found at {} — liveness ML check disabled",
                     path.display()
                 );
-                None
             }
             None => {
                 if config.require_antispoof {
                     return Err(AegyraError::Biometrics(
-                        "anti-spoof model required but AEGYRA_ANTISPOOF_MODEL not set".into(),
+                        "anti-spoof required but no primary model configured".into(),
                     ));
                 }
                 tracing::warn!("liveness ML check disabled (no anti-spoof model configured)");
-                None
             }
+        }
+
+        if let Some(p4) = &config.antispoof_model_4 {
+            if p4.exists() {
+                items.push((p4.clone(), 4.0, "4.0_V1SE"));
+            } else {
+                tracing::warn!(
+                    "secondary anti-spoof model not found at {} — running single-model \
+                     (weaker against printed-photo attacks; install the 4.0× model \
+                     for dual-model fusion)",
+                    p4.display()
+                );
+            }
+        }
+
+        let antispoof = if items.is_empty() {
+            None
+        } else {
+            let refs: Vec<(&std::path::Path, f32, &str)> =
+                items.iter().map(|(p, s, l)| (p.as_path(), *s, *l)).collect();
+            Some(antispoof::AntiSpoofModel::load_ensemble(&refs)?)
         };
         Ok(Self { config, antispoof })
     }

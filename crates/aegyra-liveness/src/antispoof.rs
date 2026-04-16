@@ -1,13 +1,19 @@
 //! MiniFASNet anti-spoof inference.
 //!
-//! Reference model: `minivision-ai/Silent-Face-Anti-Spoofing`, specifically the
-//! `2.7_80x80_MiniFASNetV2` export converted to ONNX. Input shape
-//! `[1, 3, 80, 80]` BGR float32 (0–255, no normalization). Output shape
-//! `[1, 3]` — three logits corresponding to `[fake_print, real, fake_screen]`.
-//! We take softmax and treat class 1 as "real", so `spoof_prob = 1 - p[1]`.
+//! Reference: `minivision-ai/Silent-Face-Anti-Spoofing`. Upstream's own
+//! `test.py` runs a *dual-model ensemble* — a 2.7×-crop `MiniFASNetV2` and a
+//! 4.0×-crop `MiniFASNetV1SE` — and sums the softmax outputs before picking
+//! a class. Single-model MiniFASNet is known-weak against printed-photo
+//! attacks (empirically observed on Ben's setup: real face 0.001,
+//! large printed photo 0.03–0.13; no safe threshold between them).
 //!
-//! The scaled-crop (factor 2.7 around the face box) matches that repo's
-//! `CropImage` logic: expand bbox around its center, clip to frame, resize.
+//! We replicate the ensemble: each `(session, scale)` pair produces a
+//! 3-way softmax; we average across models, then treat class 1 as "real"
+//! so `spoof_prob = 1 - avg_p[1]`. If only one model is configured we
+//! fall back to single-model behaviour (still useful, just weaker).
+//!
+//! Input shape per model: `[1, 3, 80, 80]` BGR float32, raw 0–255 (no
+//! mean/std). Scaled-crop logic matches upstream's `CropImage`.
 
 use aegyra_common::{AegyraError, Result};
 use image::{imageops::FilterType, RgbImage};
@@ -18,7 +24,6 @@ use std::path::Path;
 use std::sync::{Mutex, Once};
 
 const INPUT_SIZE: u32 = 80;
-const SCALE: f32 = 2.7;
 
 static ORT_INIT: Once = Once::new();
 static DEFAULT_DYLIB: &str = "/usr/lib/libonnxruntime.so";
@@ -44,56 +49,93 @@ fn ensure_ort() -> Result<()> {
     Ok(())
 }
 
-pub struct AntiSpoofModel {
+struct Member {
     session: Mutex<Session>,
+    scale: f32,
+    label: String,
+}
+
+pub struct AntiSpoofModel {
+    members: Vec<Member>,
 }
 
 impl AntiSpoofModel {
+    /// Load a single model at `path` using `scale` for the pre-crop. Kept
+    /// as a thin wrapper over `load_ensemble` for existing single-model
+    /// callers.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Err(AegyraError::Biometrics(format!(
-                "anti-spoof model not found at {}",
-                path.display()
-            )));
-        }
-        ensure_ort()?;
-        let session = Session::builder()
-            .map_err(|e| AegyraError::Biometrics(format!("ort builder: {e}")))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| AegyraError::Biometrics(format!("opt level: {e}")))?
-            .commit_from_file(path)
-            .map_err(|e| AegyraError::Biometrics(format!("load anti-spoof: {e}")))?;
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        Self::load_ensemble(&[(path, 2.7, "single")])
     }
 
-    /// Predict spoof probability (0.0 = real, 1.0 = spoof) for `frame`
-    /// with face bbox `[x1, y1, x2, y2]` in frame pixels.
-    pub fn predict(&self, frame: &RgbImage, bbox: [f32; 4]) -> Result<f32> {
-        let crop = crop_scaled(frame, bbox, SCALE, INPUT_SIZE);
-        let arr = preprocess(&crop);
-        let input = Value::from_array(arr)
-            .map_err(|e| AegyraError::Biometrics(format!("build input: {e}")))?;
-
-        let mut session = self.session.lock().unwrap();
-        let outputs = session
-            .run(ort::inputs![input])
-            .map_err(|e| AegyraError::Biometrics(format!("antispoof inference: {e}")))?;
-        let (_shape, data) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| AegyraError::Biometrics(format!("extract: {e}")))?;
-        let logits = data.to_vec();
-        if logits.len() < 2 {
-            return Err(AegyraError::Biometrics(format!(
-                "unexpected antispoof output shape (len {})",
-                logits.len()
-            )));
+    /// Load an ensemble. Each entry is `(path, pre-crop scale, label)`.
+    /// Labels are only used in error messages.
+    pub fn load_ensemble(items: &[(&Path, f32, &str)]) -> Result<Self> {
+        if items.is_empty() {
+            return Err(AegyraError::Biometrics(
+                "anti-spoof ensemble is empty".into(),
+            ));
         }
-        let probs = softmax(&logits);
-        // Class 1 = "real" in the minivision 3-class convention.
-        // If the model happens to be binary [fake, real], same mapping works.
-        let real_p = probs.get(1).copied().unwrap_or(0.0);
+        ensure_ort()?;
+        let mut members = Vec::with_capacity(items.len());
+        for (path, scale, label) in items {
+            if !path.exists() {
+                return Err(AegyraError::Biometrics(format!(
+                    "anti-spoof model ({label}) not found at {}",
+                    path.display()
+                )));
+            }
+            let session = Session::builder()
+                .map_err(|e| AegyraError::Biometrics(format!("ort builder: {e}")))?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| AegyraError::Biometrics(format!("opt level: {e}")))?
+                .commit_from_file(path)
+                .map_err(|e| {
+                    AegyraError::Biometrics(format!("load anti-spoof ({label}): {e}"))
+                })?;
+            members.push(Member {
+                session: Mutex::new(session),
+                scale: *scale,
+                label: (*label).to_string(),
+            });
+        }
+        Ok(Self { members })
+    }
+
+    /// Predict spoof probability (0.0 = real, 1.0 = spoof) for `frame` with
+    /// face bbox `[x1, y1, x2, y2]`. For an ensemble we sum softmax outputs
+    /// across members, average by count, and take class 1 as "real" — the
+    /// approach upstream uses in `test.py`.
+    pub fn predict(&self, frame: &RgbImage, bbox: [f32; 4]) -> Result<f32> {
+        // Three-class convention [fake_print, real, fake_screen]; binary
+        // models still work because we only look at index 1.
+        let mut sum = [0.0f32; 3];
+        for m in &self.members {
+            let crop = crop_scaled(frame, bbox, m.scale, INPUT_SIZE);
+            let arr = preprocess(&crop);
+            let input = Value::from_array(arr).map_err(|e| {
+                AegyraError::Biometrics(format!("build input ({}): {e}", m.label))
+            })?;
+            let mut session = m.session.lock().unwrap();
+            let outputs = session.run(ort::inputs![input]).map_err(|e| {
+                AegyraError::Biometrics(format!("antispoof inference ({}): {e}", m.label))
+            })?;
+            let (_shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
+                AegyraError::Biometrics(format!("extract ({}): {e}", m.label))
+            })?;
+            let logits = data.to_vec();
+            if logits.len() < 2 {
+                return Err(AegyraError::Biometrics(format!(
+                    "unexpected antispoof output shape from {} (len {})",
+                    m.label,
+                    logits.len()
+                )));
+            }
+            let probs = softmax(&logits);
+            for i in 0..sum.len().min(probs.len()) {
+                sum[i] += probs[i];
+            }
+        }
+        let real_p = sum[1] / self.members.len() as f32;
         Ok((1.0 - real_p).clamp(0.0, 1.0))
     }
 }
