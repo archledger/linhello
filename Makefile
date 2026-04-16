@@ -27,7 +27,12 @@ PAM_SO       := pam/pam_faceauth.so
 # aegyra-pam ships as libaegyra_pam.so (cdylib). pam_faceauth.so dlopens it.
 RUST_PAM_LIB := $(TARGET_DIR)/libaegyra_pam.so
 
-.PHONY: all build pam install check clean
+.PHONY: all build pam install check clean dist
+
+# Version must match pkgver in packaging/arch/PKGBUILD.
+DIST_VERSION ?= 0.1.0
+DIST_PREFIX  := aegyra-$(DIST_VERSION)
+DIST_TARBALL := packaging/arch/$(DIST_PREFIX).tar.gz
 
 all: build pam
 
@@ -75,3 +80,16 @@ install: all
 clean:
 	$(CARGO) clean
 	rm -f $(PAM_SO)
+
+# `make dist` produces a source tarball usable by packaging/arch/PKGBUILD
+# in a clean chroot (`extra-x86_64-build`). Uses `git archive` so only
+# tracked files land in the tarball — no /target, no local envelopes.
+dist: $(DIST_TARBALL)
+
+$(DIST_TARBALL):
+	@if [ -n "$$(git status --porcelain)" ]; then \
+	    echo "refusing to roll dist tarball with a dirty tree — commit or stash first"; \
+	    exit 1; \
+	fi
+	git archive --format=tar.gz --prefix=$(DIST_PREFIX)/ -o $@ HEAD
+	@echo "wrote $@"
