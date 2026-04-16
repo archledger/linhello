@@ -54,7 +54,7 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
     Ok((frame, face))
 }
 
-fn capture_and_embed() -> Result<Vec<f32>> {
+pub fn capture_and_embed() -> Result<Vec<f32>> {
     let (frame, face) = capture_detect_live()?;
     let aligned = align::align(&frame, &face)?;
     let embedder = embed::Embedder::load_default()?;
@@ -80,14 +80,26 @@ pub fn run_liveness_test() -> Result<aegyra_liveness::LivenessReport> {
 pub fn authenticate_user(user: &str) -> Result<AuthResult> {
     let samples = enroll::load_embeddings(user)?;
     let live = capture_and_embed()?;
+    Ok(match_against(&live, &samples))
+}
+
+/// Match a live embedding against stored samples. Separated out so the
+/// daemon can call this with pre-decrypted embeddings from the encrypted
+/// store.
+pub fn match_against(live: &[f32], samples: &[Vec<f32>]) -> AuthResult {
     let score = samples
         .iter()
-        .map(|s| matcher::cosine(&live, s))
+        .map(|s| matcher::cosine(live, s))
         .fold(f32::NEG_INFINITY, f32::max);
-    Ok(AuthResult {
+    AuthResult {
         matched: score >= MATCH_THRESHOLD,
         score,
-    })
+    }
+}
+
+/// Parse raw bytes (from decrypted storage) into embedding vectors.
+pub fn parse_embeddings(raw: &[u8]) -> Result<Vec<Vec<f32>>> {
+    enroll::parse_raw_embeddings(raw)
 }
 
 /// Append one face sample to the user's enrollment. File is created on

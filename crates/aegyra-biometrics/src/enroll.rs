@@ -67,13 +67,8 @@ pub fn append_embedding(user: &str, vec: &[f32]) -> Result<()> {
     Ok(())
 }
 
-/// Load all enrolled samples for a user. Returns a non-empty vector on
-/// success.
-pub fn load_embeddings(user: &str) -> Result<Vec<Vec<f32>>> {
-    let path = embedding_path(user)?;
-    let bytes = fs::read(&path).map_err(|e| {
-        bio_err(format!("read enrollment {}: {e}", path.display()))
-    })?;
+/// Parse raw embedding bytes into f32 vectors.
+pub fn parse_raw_embeddings(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
     if bytes.is_empty() || bytes.len() % STRIDE_BYTES != 0 {
         return Err(bio_err(format!(
             "enrollment size {} not a multiple of {} (dim={})",
@@ -92,6 +87,16 @@ pub fn load_embeddings(user: &str) -> Result<Vec<Vec<f32>>> {
         })
         .collect();
     Ok(samples)
+}
+
+/// Load all enrolled samples for a user. Returns a non-empty vector on
+/// success.
+pub fn load_embeddings(user: &str) -> Result<Vec<Vec<f32>>> {
+    let path = embedding_path(user)?;
+    let bytes = fs::read(&path).map_err(|e| {
+        bio_err(format!("read enrollment {}: {e}", path.display()))
+    })?;
+    parse_raw_embeddings(&bytes)
 }
 
 pub fn sample_count(user: &str) -> Result<usize> {

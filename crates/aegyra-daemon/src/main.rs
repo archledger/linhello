@@ -162,43 +162,94 @@ fn do_status() -> Response {
 }
 
 fn do_enroll(user: &str, reset: bool) -> Response {
-    let res = if reset {
-        aegyra_biometrics::enroll_user_reset(user)
-    } else {
-        aegyra_biometrics::enroll_user(user)
+    // Capture + liveness + embed.
+    let embedding = match aegyra_biometrics::capture_and_embed() {
+        Ok(v) => v,
+        Err(e) => return Response::Error { message: e.to_string() },
     };
-    match res.and_then(|()| aegyra_biometrics::enroll::sample_count(user)) {
-        Ok(samples) => Response::Enrolled { samples },
-        Err(e) => Response::Error {
-            message: e.to_string(),
-        },
+    let raw = embedding_to_bytes(&embedding);
+
+    // Ensure per-user AES key exists (creates + TPM-seals on first enroll).
+    let key = match aegyra_core::ensure_template_key(user) {
+        Ok(k) => k,
+        Err(e) => return Response::Error { message: format!("template key: {e}") },
+    };
+
+    // Load existing encrypted embeddings (if appending).
+    let mut all_raw = if reset {
+        Vec::new()
+    } else {
+        match aegyra_core::load_encrypted_embedding(user, &key) {
+            Ok(existing) => existing.to_vec(),
+            Err(_) => Vec::new(), // no enrollment yet
+        }
+    };
+    all_raw.extend_from_slice(&raw);
+
+    // Encrypt and persist.
+    if let Err(e) = aegyra_core::save_encrypted_embedding(user, &all_raw, &key) {
+        return Response::Error { message: format!("save enrollment: {e}") };
     }
+    let samples = all_raw.len() / (aegyra_biometrics::enroll::EMBEDDING_DIM * 4);
+    Response::Enrolled { samples }
+}
+
+fn embedding_to_bytes(vec: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for f in vec {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    bytes
 }
 
 fn do_verify(user: &str) -> Response {
-    match aegyra_biometrics::authenticate_user(user) {
-        Ok(r) => Response::Verified {
-            matched: r.matched,
-            score: r.score,
-        },
-        Err(e) => Response::Error {
-            message: e.to_string(),
-        },
+    // Try encrypted path first; fall back to legacy unencrypted.
+    let samples = match load_user_samples(user) {
+        Ok(s) => s,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+    let live = match aegyra_biometrics::capture_and_embed() {
+        Ok(v) => v,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+    let r = aegyra_biometrics::match_against(&live, &samples);
+    Response::Verified {
+        matched: r.matched,
+        score: r.score,
     }
 }
 
+/// Load enrolled samples, preferring encrypted storage. Falls back to
+/// legacy `embedding.bin` (auto-migrates to encrypted if TPM available).
+fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
+    // If a template-key envelope exists, use encrypted path.
+    if let Ok(key) = aegyra_core::unseal_template_key(user) {
+        let raw = aegyra_core::load_encrypted_embedding(user, &key)
+            .map_err(|e| e.to_string())?;
+        return aegyra_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string());
+    }
+    // Legacy fallback: read unencrypted embedding.bin directly.
+    aegyra_biometrics::enroll::load_embeddings(user).map_err(|e| e.to_string())
+}
+
 fn do_unseal(user: &str) -> Response {
-    match aegyra_biometrics::authenticate_user(user) {
-        Ok(r) if r.matched => match aegyra_core::unseal_keyring_secret() {
-            Ok(secret) => Response::Unsealed {
-                secret: secret.to_vec(),
-            },
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
-        },
-        Ok(r) => Response::Error {
+    let samples = match load_user_samples(user) {
+        Ok(s) => s,
+        Err(e) => return Response::Error { message: e },
+    };
+    let live = match aegyra_biometrics::capture_and_embed() {
+        Ok(v) => v,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+    let r = aegyra_biometrics::match_against(&live, &samples);
+    if !r.matched {
+        return Response::Error {
             message: format!("face mismatch (score {:.4})", r.score),
+        };
+    }
+    match aegyra_core::unseal_keyring_secret() {
+        Ok(secret) => Response::Unsealed {
+            secret: secret.to_vec(),
         },
         Err(e) => Response::Error {
             message: e.to_string(),
@@ -305,17 +356,23 @@ fn do_seal_password(user: &str, password: Vec<u8>) -> Response {
 }
 
 fn do_unseal_password(user: &str) -> Response {
-    match aegyra_biometrics::authenticate_user(user) {
-        Ok(r) if r.matched => match aegyra_core::unseal_password(user) {
-            Ok(secret) => Response::PasswordUnsealed {
-                secret: secret.to_vec(),
-            },
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
-        },
-        Ok(r) => Response::Error {
+    let samples = match load_user_samples(user) {
+        Ok(s) => s,
+        Err(e) => return Response::Error { message: e },
+    };
+    let live = match aegyra_biometrics::capture_and_embed() {
+        Ok(v) => v,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+    let r = aegyra_biometrics::match_against(&live, &samples);
+    if !r.matched {
+        return Response::Error {
             message: format!("face mismatch (score {:.4})", r.score),
+        };
+    }
+    match aegyra_core::unseal_password(user) {
+        Ok(secret) => Response::PasswordUnsealed {
+            secret: secret.to_vec(),
         },
         Err(e) => Response::Error {
             message: e.to_string(),

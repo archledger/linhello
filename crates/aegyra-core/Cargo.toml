@@ -18,4 +18,5 @@ tracing.workspace = true
 tss-esapi = "7.5"
 rand = "0.8"
 base64 = "0.22"
+aes-gcm = "0.10"
 libc = "0.2"
