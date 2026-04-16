@@ -40,18 +40,15 @@ pub struct LivenessConfig {
 
 impl LivenessConfig {
     /// Build from environment: `AEGYRA_ANTISPOOF_MODEL`, `AEGYRA_SPOOF_THRESHOLD`,
-    /// `AEGYRA_REQUIRE_ANTISPOOF`. Falls back to `/etc/aegyra/antispoof.onnx`
-    /// iff that file exists.
+    /// `AEGYRA_REQUIRE_ANTISPOOF`. Always resolves to a concrete path (env
+    /// override or default); `LivenessEvaluator::new` then surfaces a
+    /// path-specific error if the file is missing.
     pub fn from_env() -> Self {
-        let env_path = std::env::var_os("AEGYRA_ANTISPOOF_MODEL").map(PathBuf::from);
-        let default_path = PathBuf::from(DEFAULT_ANTISPOOF_MODEL);
-        let antispoof_model = env_path.or_else(|| {
-            if default_path.exists() {
-                Some(default_path)
-            } else {
-                None
-            }
-        });
+        let antispoof_model = Some(
+            std::env::var_os("AEGYRA_ANTISPOOF_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_ANTISPOOF_MODEL)),
+        );
 
         let spoof_threshold = std::env::var("AEGYRA_SPOOF_THRESHOLD")
             .ok()
