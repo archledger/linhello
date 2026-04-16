@@ -191,6 +191,9 @@ pub struct LivenessEvaluator {
     antispoof: Option<antispoof::AntiSpoofModel>,
 }
 
+static CACHED: std::sync::OnceLock<std::result::Result<LivenessEvaluator, String>> =
+    std::sync::OnceLock::new();
+
 impl LivenessEvaluator {
     pub fn new(config: LivenessConfig) -> Result<Self> {
         // Build the ensemble. Primary (2.7×) is mandatory when require_antispoof
@@ -247,6 +250,13 @@ impl LivenessEvaluator {
 
     pub fn from_env() -> Result<Self> {
         Self::new(LivenessConfig::from_env())
+    }
+
+    pub fn cached() -> Result<&'static LivenessEvaluator> {
+        CACHED
+            .get_or_init(|| Self::from_env().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| AegyraError::Biometrics(e.clone()))
     }
 
     /// Evaluate liveness for `frame` with a detected face at `bbox`

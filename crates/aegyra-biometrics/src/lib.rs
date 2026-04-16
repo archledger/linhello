@@ -24,18 +24,22 @@ pub struct AuthResult {
 /// Returns the frame + face on success; errors (with a human-readable reason)
 /// when no face is visible or liveness rejects.
 fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
+    // Parallel RGB + IR capture: IR warmup (~530ms) runs in a background
+    // thread while RGB capture + face detection happen in the foreground.
+    // Saves ~500ms vs. sequential.
+    let ir_handle = std::thread::spawn(|| camera::capture_ir_frame().ok().flatten());
+
     let frame = camera::capture_frame()?;
-    let detector = detect::Detector::load_default()?;
+    let detector = detect::Detector::cached()?;
     let faces = detector.detect(&frame)?;
     let face = faces
         .into_iter()
         .next()
         .ok_or_else(|| bio_err("no face detected"))?;
 
-    let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
-    // Opportunistic IR capture. Missing sensor ⇒ IR signals are absent,
-    // not an error — laptops without a WBF-class IR cam are supported.
-    let ir = camera::capture_ir_frame().ok().flatten();
+    let ir = ir_handle.join().unwrap_or(None);
+
+    let evaluator = aegyra_liveness::LivenessEvaluator::cached()?;
     let report = evaluator.evaluate(
         &frame, face.bbox, &face.landmarks, camera::DEFAULT_DEVICE, ir.as_ref(),
     )?;
@@ -57,7 +61,7 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
 pub fn capture_and_embed() -> Result<Vec<f32>> {
     let (frame, face) = capture_detect_live()?;
     let aligned = align::align(&frame, &face)?;
-    let embedder = embed::Embedder::load_default()?;
+    let embedder = embed::Embedder::cached()?;
     embedder.embed(&aligned)
 }
 
@@ -65,15 +69,16 @@ pub fn capture_and_embed() -> Result<Vec<f32>> {
 /// runs detection + liveness, and returns the raw report. Never touches
 /// enrollment data or embeddings.
 pub fn run_liveness_test() -> Result<aegyra_liveness::LivenessReport> {
+    let ir_handle = std::thread::spawn(|| camera::capture_ir_frame().ok().flatten());
     let frame = camera::capture_frame()?;
-    let detector = detect::Detector::load_default()?;
+    let detector = detect::Detector::cached()?;
     let faces = detector.detect(&frame)?;
     let face = faces
         .into_iter()
         .next()
         .ok_or_else(|| bio_err("no face detected"))?;
-    let evaluator = aegyra_liveness::LivenessEvaluator::from_env()?;
-    let ir = camera::capture_ir_frame().ok().flatten();
+    let ir = ir_handle.join().unwrap_or(None);
+    let evaluator = aegyra_liveness::LivenessEvaluator::cached()?;
     evaluator.evaluate(&frame, face.bbox, &face.landmarks, camera::DEFAULT_DEVICE, ir.as_ref())
 }
 

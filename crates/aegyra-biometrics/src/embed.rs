@@ -21,7 +21,17 @@ pub struct Embedder {
     session: Mutex<Session>,
 }
 
+static CACHED: std::sync::OnceLock<std::result::Result<Embedder, String>> =
+    std::sync::OnceLock::new();
+
 impl Embedder {
+    pub fn cached() -> Result<&'static Embedder> {
+        CACHED
+            .get_or_init(|| Self::load_default().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| bio_err(e.clone()))
+    }
+
     pub fn load_default() -> Result<Self> {
         let path = std::env::var_os("AEGYRA_MODEL_PATH")
             .map(PathBuf::from)

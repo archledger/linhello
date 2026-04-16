@@ -35,7 +35,17 @@ pub struct Detector {
     session: Mutex<Session>,
 }
 
+static CACHED: std::sync::OnceLock<std::result::Result<Detector, String>> =
+    std::sync::OnceLock::new();
+
 impl Detector {
+    pub fn cached() -> Result<&'static Detector> {
+        CACHED
+            .get_or_init(|| Self::load_default().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| bio_err(e.clone()))
+    }
+
     pub fn load_default() -> Result<Self> {
         let path = std::env::var_os("AEGYRA_DET_MODEL")
             .map(PathBuf::from)
