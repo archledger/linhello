@@ -48,7 +48,7 @@ pub const MIN_FACE_FRAC: f32 = 0.20;
 /// 30%+ brighter than surroundings because the emitter concentrates on
 /// it). A flat photo of a face on a wall has ratio ~1.0 (same surface,
 /// same ambient illumination). This signal is AE-gain-invariant.
-const MIN_FACE_BG_RATIO: f32 = 1.3;
+const MIN_FACE_BG_RATIO: f32 = 1.2;
 
 /// Highlight fraction is a bonus-confidence signal — eye glints only
 /// appear at very close range (~40 cm). We use it as a soft signal:
