@@ -41,7 +41,7 @@ use image::GrayImage;
 /// Minimum face width / frame width before IR signals are trustworthy.
 /// Below this, reject with "move closer" — IR returns fall off as 1/r²
 /// so a real face at arm's length can score the same as a wall photo.
-pub const MIN_FACE_FRAC: f32 = 0.25;
+pub const MIN_FACE_FRAC: f32 = 0.20;
 
 /// Minimum face/background IR intensity ratio. A real face under the
 /// emitter at normal laptop distance should have ratio ≥ 1.3 (face is
