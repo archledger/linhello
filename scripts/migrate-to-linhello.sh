@@ -69,17 +69,24 @@ auth     sufficient   pam_linhello.so
 auth     required     pam_deny.so
 account  required     pam_permit.so
 EOF
+PAM_OK=0
 if command -v pamtester >/dev/null 2>&1; then
-  if pamtester -v linhello-test "$USER_NAME" authenticate; then
-    echo "pamtester: SUCCESS — pam_linhello.so works"
-    PAM_OK=1
-  else
-    echo "pamtester: FAILED — NOT swapping the live PAM stack (your login is untouched)."
-    PAM_OK=0
-  fi
+  # A single frame misses ~1/3 of the time (borderline liveness / score just
+  # under threshold), so retry — we only need ONE clean success to prove the
+  # module path works end-to-end.
+  for attempt in 1 2 3 4 5 6; do
+    echo "  pamtester attempt $attempt/6 — look at the camera, hold still..."
+    if pamtester linhello-test "$USER_NAME" authenticate; then
+      echo "pamtester: SUCCESS — pam_linhello.so works"
+      PAM_OK=1
+      break
+    fi
+    echo "  miss (liveness/score) — repositioning, retrying"
+    sleep 1
+  done
+  [ "$PAM_OK" = 1 ] || echo "pamtester: all 6 attempts failed — NOT swapping (login untouched)."
 else
   echo "pamtester not installed (yay -S pamtester). Skipping auto-swap."
-  PAM_OK=0
 fi
 
 # --- 6. swap live PAM stack (only if the gate passed) ----------------------
