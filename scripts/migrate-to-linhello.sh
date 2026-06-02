@@ -109,10 +109,10 @@ if [ "${PAM_OK}" = 1 ]; then
 fi
 
 say "done"
-echo "Verify now:"
-echo "  linhello status && linhello diag    # envelopes present, zero drift"
-echo "  linhello test                       # recognizes you"
-echo "  sudo -k && sudo -v                  # face-auth, no password"
+echo "Verify now (socket is root-only, so use sudo for CLI checks):"
+echo "  sudo linhello status && sudo linhello diag   # envelopes present, zero drift"
+echo "  sudo linhello test                           # recognizes you"
+echo "  sudo -k && sudo -v                           # face-auth, no password"
 echo
-echo "Then REBOOT and log in with your FACE ONLY, and run:"
+echo "Then REBOOT and log in with your FACE ONLY, and run (as your normal user):"
 echo "  ~/aegyra/scripts/linhello-keyring-diag"
