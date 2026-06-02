@@ -61,7 +61,12 @@ impl LivenessConfig {
     ///     the file is missing, we downgrade to single-model mode with a
     ///     one-time warning.
     ///   * `AEGYRA_SPOOF_THRESHOLD`    — reject threshold (default 0.5).
-    ///   * `AEGYRA_REQUIRE_ANTISPOOF`  — fail-closed on missing primary.
+    ///   * `AEGYRA_REQUIRE_ANTISPOOF`  — require the primary model.
+    ///     **Defaults to true** (fail-closed): if the model is missing,
+    ///     `LivenessEvaluator::new` errors and the auth path declines rather
+    ///     than silently running without ML anti-spoof. Set to
+    ///     `0`/`false`/`no`/`off` to explicitly opt out (e.g. for bring-up on a
+    ///     box without the model).
     pub fn from_env() -> Self {
         let antispoof_model = Some(
             std::env::var_os("AEGYRA_ANTISPOOF_MODEL")
@@ -79,11 +84,13 @@ impl LivenessConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_SPOOF_THRESHOLD);
 
+        // Fail-closed by default: only an explicit falsey value disables the
+        // requirement. A missing/empty env var keeps anti-spoof mandatory.
         let require_antispoof = std::env::var("AEGYRA_REQUIRE_ANTISPOOF")
             .ok()
             .as_deref()
-            .map(|v| matches!(v, "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .map(|v| !matches!(v, "0" | "false" | "no" | "off" | ""))
+            .unwrap_or(true);
 
         LivenessConfig {
             antispoof_model,

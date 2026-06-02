@@ -6,7 +6,7 @@
 //! boundary for longer than this call.
 
 use aegyra_common::client;
-use aegyra_common::ipc::{Request, Response};
+use aegyra_common::ipc::{Request, Response, SecretBytes};
 use std::ffi::CStr;
 use std::slice;
 
@@ -33,11 +33,13 @@ pub unsafe extern "C" fn faceauth_unseal_keyring(
 
     match client::request(&Request::UnsealPassword { user }) {
         Ok(Response::PasswordUnsealed { secret }) => {
-            if secret.len() > dst.len() {
+            let bytes = secret.expose();
+            if bytes.len() > dst.len() {
                 return -1;
             }
-            dst[..secret.len()].copy_from_slice(&secret);
-            secret.len() as i32
+            dst[..bytes.len()].copy_from_slice(bytes);
+            bytes.len() as i32
+            // `secret` (SecretBytes) is wiped on drop at end of scope.
         }
         _ => -1,
     }
@@ -70,14 +72,14 @@ pub unsafe extern "C" fn faceauth_reseal_password(
     // Copy into an owned Vec that will be zeroized on drop, then zero the
     // caller's buffer immediately so the plaintext never lingers at two sites.
     let src = slice::from_raw_parts_mut(password, len);
-    let pw = zeroize::Zeroizing::new(src.to_vec());
+    let pw = SecretBytes::new(src.to_vec());
     for b in src.iter_mut() {
         std::ptr::write_volatile(b, 0);
     }
 
     match client::request(&Request::SealPassword {
         user: user_str,
-        password: pw.to_vec(),
+        password: pw,
     }) {
         Ok(Response::PasswordSealed) => 0,
         _ => -1,

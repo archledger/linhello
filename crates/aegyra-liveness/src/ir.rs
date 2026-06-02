@@ -8,10 +8,20 @@
 //! That geometry is the single strongest defeater of the print-attack
 //! class that RGB-only anti-spoof struggles with.
 //!
-//! Current implementation is a **raw heuristic** — we compute summary
-//! statistics on the IR frame and surface them as `ir_score` without
-//! gating. That lets the operator tune a threshold against their actual
-//! rig before we promote the signal to a hard gate.
+//! On real hardware both IR cues — the face/background intensity ratio and the
+//! near-saturated "glint" fraction — proved too rig/lighting/pose-dependent to
+//! hard-gate on. A 2026-06-02 bring-up on Ben's ASUS rig saw a live user
+//! rejected on glints ~75% of the time, and the face/bg ratio straddling 1.0
+//! (face often *darker* than background) with a ~3× darker IR frame than the
+//! original calibration — so the ratio gate vetoed the user, and worse, did so
+//! *before* the trained ML anti-spoof ever ran.
+//!
+//! Therefore **IR is advisory**: its statistics fold into `ir_score` for
+//! telemetry/confidence but do not reject on their own. The liveness gate is
+//! the **mandatory ML anti-spoof model + virtual-camera (device-trust) +
+//! head-orientation** checks. The only IR-derived hard outcome kept is the
+//! framing hint `TooFar` (face too small to recognise reliably). All raw IR
+//! stats remain in the `ir_*` signals for auditing and future re-tuning.
 //!
 //! Signals extracted:
 //!   * `mean_face`        — mean intensity in the bbox region mapped
@@ -29,19 +39,20 @@
 //!   real face @ 70 cm : mean  68, std 23, hi-frac 0.000  ← reject as "move closer"
 //!   wall photo (2 m)  : mean  84, std 36, hi-frac 0.000  ← reject
 //!
-//! Pure mean is ambiguous (real-far and photo overlap). `hi-frac` is
-//! decisive — eye glints + illumination hotspots only appear on a live
-//! 3D face close enough to the emitter for specular returns. We require
-//! the face to fill ≥25% of the RGB frame before trusting IR at all;
-//! below that, reject with "move closer" rather than accepting a weak
-//! signal (same UX constraint Windows Hello lives with).
+//! These per-distance numbers are why IR is advisory (see above). The only
+//! framing requirement we keep is that the face fill ≥`MIN_FACE_FRAC` (0.15) of
+//! the RGB frame — below that it's too small to recognise reliably, so we
+//! return "move closer" (the same UX constraint Windows Hello lives with).
 
 use image::GrayImage;
 
-/// Minimum face width / frame width before IR signals are trustworthy.
-/// Below this, reject with "move closer" — IR returns fall off as 1/r²
-/// so a real face at arm's length can score the same as a wall photo.
-pub const MIN_FACE_FRAC: f32 = 0.20;
+/// Minimum face width / frame width before we accept the frame for
+/// recognition. Below this the face is too small to recognise reliably, so we
+/// return `TooFar` ("move closer"). Set to 0.15 after on-hardware testing:
+/// a normal laptop-on-desk sitting distance lands at ~0.19–0.25, and 0.20 was
+/// occasionally tripping the prompt; 0.15 gives comfortable margin while still
+/// rejecting genuinely-too-far framing.
+pub const MIN_FACE_FRAC: f32 = 0.15;
 
 /// Minimum face/background IR intensity ratio. A real face under the
 /// emitter at normal laptop distance should have ratio ≥ 1.3 (face is
@@ -50,10 +61,9 @@ pub const MIN_FACE_FRAC: f32 = 0.20;
 /// same ambient illumination). This signal is AE-gain-invariant.
 const MIN_FACE_BG_RATIO: f32 = 1.2;
 
-/// Highlight fraction is a bonus-confidence signal — eye glints only
-/// appear at very close range (~40 cm). We use it as a soft signal:
-/// hi_frac > 0.08 → full confidence; < 0.08 → score still depends on
-/// face_bg_ratio alone. Not a hard gate.
+/// Soft-confidence threshold for the highlight fraction used in `ir_score`:
+/// hi_frac ≥ 0.08 → full confidence; below it the score leans on
+/// face_bg_ratio. Glints are *not* a hard gate — see the module docs for why.
 const MIN_HIGHLIGHT_FRAC: f32 = 0.08;
 
 #[derive(Debug, Clone)]
@@ -85,16 +95,18 @@ pub enum IrVerdict {
 /// Given the computed signals and the RGB face coverage, produce a
 /// verdict. Kept separate from `evaluate` so the gating policy is
 /// auditable independently of the image processing.
-pub fn classify(s: &IrSignals, face_frac: f32) -> IrVerdict {
+pub fn classify(_s: &IrSignals, face_frac: f32) -> IrVerdict {
     if face_frac < MIN_FACE_FRAC {
+        // The one hard IR-derived outcome we keep: a face too small in frame
+        // can't be recognised reliably. This is a framing hint, not a spoof
+        // verdict — the caller turns it into "move closer".
         return IrVerdict::TooFar;
     }
-    if s.face_bg_ratio < MIN_FACE_BG_RATIO {
-        return IrVerdict::Reject(
-            "face not brighter than background under IR emitter \
-             (characteristic of flat surface at ambient distance)",
-        );
-    }
+    // IR ratio and glints are advisory only (folded into `ir_score` by
+    // `evaluate`): on real hardware the emitter's differential illumination is
+    // too rig/lighting-dependent to hard-gate on without false-rejecting live
+    // users. The liveness gate is the mandatory ML anti-spoof + virtual-camera
+    // + orientation checks. See the module docs.
     IrVerdict::Real
 }
 
@@ -186,5 +198,47 @@ fn empty_signals() -> IrSignals {
         mean_bg: 0.0,
         face_bg_ratio: 0.0,
         ir_score: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig(face_bg_ratio: f32, highlight_frac: f32) -> IrSignals {
+        IrSignals {
+            mean_face: 180.0,
+            std_face: 60.0,
+            highlight_frac,
+            mean_bg: 100.0,
+            face_bg_ratio,
+            ir_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn live_face_passes() {
+        // Ben's calibrated real-face values: ratio well above 1.2, glints 0.416.
+        assert_eq!(classify(&sig(1.8, 0.416), 0.45), IrVerdict::Real);
+    }
+
+    #[test]
+    fn too_far_when_face_small() {
+        assert_eq!(classify(&sig(1.8, 0.416), 0.10), IrVerdict::TooFar);
+    }
+
+    #[test]
+    fn low_ratio_no_longer_hard_rejects() {
+        // IR ratio is advisory now: a low ratio (which on real hardware also
+        // occurs for live users with a dark IR frame) must NOT reject. The
+        // print/screen defense is the mandatory ML anti-spoof, not this.
+        assert_eq!(classify(&sig(1.0, 0.4), 0.45), IrVerdict::Real);
+        assert_eq!(classify(&sig(0.85, 0.006), 0.24), IrVerdict::Real); // Ben's live rig
+    }
+
+    #[test]
+    fn glintless_face_passes_ir_gate() {
+        // Glints are advisory too — a frame without glints still passes IR.
+        assert_eq!(classify(&sig(1.5, 0.0), 0.45), IrVerdict::Real);
     }
 }

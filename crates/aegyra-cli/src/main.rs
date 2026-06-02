@@ -2,7 +2,7 @@
 //! daemon over /run/aegyra.sock; the CLI itself holds no secrets.
 
 use aegyra_common::client;
-use aegyra_common::ipc::{Request, Response};
+use aegyra_common::ipc::{CapabilityStatus, Request, Response, SecretBytes};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::process::Command;
@@ -45,6 +45,9 @@ enum Cmd {
         action: SbAction,
     },
     Diag,
+    /// Probe this machine for the hardware/software Aegyra needs (TPM, Secure
+    /// Boot, RGB/IR cameras, ONNX runtime, models) and report readiness.
+    Doctor,
     /// Capture one frame and print raw liveness signals (ML spoof score,
     /// camera trust). Use to tune `AEGYRA_SPOOF_THRESHOLD` or diagnose
     /// false rejects.
@@ -308,11 +311,12 @@ fn main() -> Result<()> {
                 pw.zeroize();
                 bail!("passwords do not match");
             }
-            // IPC request takes ownership of the password buffer; the
-            // daemon wraps it in Zeroizing before passing to tpm::seal.
+            // IPC request takes ownership of the password buffer inside a
+            // zeroizing `SecretBytes`, which wipes it on drop (and the client
+            // wipes the serialized JSON after the write).
             let resp = send(Request::SealPassword {
                 user: user.clone(),
-                password: std::mem::take(&mut pw),
+                password: SecretBytes::new(std::mem::take(&mut pw)),
             });
             pw.zeroize(); // belt-and-suspenders; take() already emptied it
             match resp? {
@@ -523,6 +527,30 @@ fn main() -> Result<()> {
                     if let Some(e) = tpm_error {
                         println!("tpm error      : {e}");
                     }
+                }
+            }
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response: {other:?}"),
+        },
+        Cmd::Doctor => match send(Request::Probe)? {
+            Response::Capabilities { report } => {
+                for c in &report.checks {
+                    let tag = match c.status {
+                        CapabilityStatus::Ok => "[ OK ]",
+                        CapabilityStatus::Warn => "[WARN]",
+                        CapabilityStatus::Missing if c.required => "[FAIL]",
+                        CapabilityStatus::Missing => "[ -- ]",
+                    };
+                    println!("{tag} {:<20} {}", c.name, c.detail);
+                }
+                println!();
+                if !report.can_run() {
+                    println!("verdict: CANNOT RUN — a required capability is missing (see [FAIL]).");
+                    std::process::exit(1);
+                } else if report.degraded() {
+                    println!("verdict: READY (degraded) — reduced security/features; see [WARN].");
+                } else {
+                    println!("verdict: READY — all required capabilities present.");
                 }
             }
             Response::Error { message } => bail!(message),

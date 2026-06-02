@@ -20,3 +20,6 @@ rand = "0.8"
 base64 = "0.22"
 aes-gcm = "0.10"
 libc = "0.2"
+# Parse the systemd PCR-policy public key (SPKI PEM) for TPM2 LoadExternal.
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"

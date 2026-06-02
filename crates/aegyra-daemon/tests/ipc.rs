@@ -10,7 +10,7 @@
 //! Reseal, LivenessTest.
 
 use aegyra_common::client;
-use aegyra_common::ipc::{Request, Response};
+use aegyra_common::ipc::{Request, Response, SecretBytes};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -130,7 +130,7 @@ fn privileged_op_from_non_root_is_forbidden() {
         },
         Request::SealPassword {
             user: "nobody".into(),
-            password: vec![1, 2, 3],
+            password: SecretBytes::new(vec![1, 2, 3]),
         },
     ] {
         match d.request(&req) {

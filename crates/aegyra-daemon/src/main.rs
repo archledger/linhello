@@ -1,9 +1,16 @@
 //! Root-privileged service: enrollment, TPM sealing, and IPC over /run/aegyra.sock.
 
-use aegyra_common::ipc::{LivenessSummary, Request, Response};
+use aegyra_common::ipc::{LivenessSummary, Request, Response, SecretBytes};
 use aegyra_liveness::device_binding::{CameraBinding, DeviceIdentity};
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+mod capabilities;
+mod users;
+
+/// Unix group whose members may reach the socket for unprivileged ops
+/// (status / verify / liveness-test). Privileged ops still require uid 0.
+const SOCKET_GROUP: &str = "aegyra";
 
 static TEMPLATE_KEY_CACHE: std::sync::OnceLock<Mutex<HashMap<String, zeroize::Zeroizing<Vec<u8>>>>> =
     std::sync::OnceLock::new();
@@ -52,10 +59,29 @@ async fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("binding {}", socket.display()))?;
-    // 0660 would be ideal with an `aegyra` group; until we ship that group
-    // assignment, use 0666 and rely on the per-op uid check for privileged ops.
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
-        .with_context(|| format!("chmod {}", socket.display()))?;
+    // Prefer `0660 root:aegyra` so only group members can reach the socket.
+    // If the `aegyra` group doesn't exist yet, fall back to `0660` root-only
+    // (privileged callers are root anyway) rather than a world-writable 0666 —
+    // a world-writable socket lets any local process drive the camera and probe
+    // the verifier. Operators who want unprivileged CLI access create the group
+    // and add their user to it.
+    match users::gid_for_group(SOCKET_GROUP) {
+        Some(gid) => {
+            if let Err(e) = users::chown(&socket, Some(0), Some(gid)) {
+                tracing::warn!(error = %e, "could not chown socket to {SOCKET_GROUP}");
+            }
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))
+                .with_context(|| format!("chmod {}", socket.display()))?;
+        }
+        None => {
+            tracing::warn!(
+                "group '{SOCKET_GROUP}' not found — socket restricted to root (0660). \
+                 Create the group and add your user for unprivileged CLI access."
+            );
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))
+                .with_context(|| format!("chmod {}", socket.display()))?;
+        }
+    }
 
     tracing::info!("aegyrad listening on {}", socket.display());
 
@@ -76,7 +102,7 @@ async fn main() -> Result<()> {
 }
 
 async fn handle(stream: UnixStream) -> Result<()> {
-    let peer_uid = stream.peer_cred().ok().and_then(|c| Some(c.uid()));
+    let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut line = String::new();
@@ -97,6 +123,12 @@ async fn handle(stream: UnixStream) -> Result<()> {
     out.push(b'\n');
     write.write_all(&out).await?;
     write.flush().await?;
+    // The request line may hold a password (SealPassword) and the response may
+    // hold an unsealed secret (Unsealed/PasswordUnsealed); wipe both serialized
+    // buffers so no plaintext lingers on this task's heap.
+    use zeroize::Zeroize;
+    out.zeroize();
+    line.zeroize();
     Ok(())
 }
 
@@ -107,16 +139,34 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
             if !is_root(peer_uid) {
                 return forbidden("enroll");
             }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
             task::spawn_blocking(move || do_enroll(&user, reset))
                 .await
                 .unwrap_or_else(err)
         }
-        Request::Verify { user } => task::spawn_blocking(move || do_verify(&user))
-            .await
-            .unwrap_or_else(err),
+        Request::Verify { user } => {
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            // Scope to the caller's own account: root may verify anyone, but an
+            // unprivileged caller may only verify itself. This closes the
+            // cross-user score oracle (probing a victim's template to tune a
+            // spoof) and limits camera use to one's own session.
+            if !users::peer_may_act_as(peer_uid, &user) {
+                return forbidden("verify (only your own account, or run as root)");
+            }
+            task::spawn_blocking(move || do_verify(&user))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::Unseal { user } => {
             if !is_root(peer_uid) {
                 return forbidden("unseal");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
             }
             task::spawn_blocking(move || do_unseal(&user))
                 .await
@@ -132,6 +182,9 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
             if !is_root(peer_uid) {
                 return forbidden("seal_password");
             }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
             task::spawn_blocking(move || do_seal_password(&user, password))
                 .await
                 .unwrap_or_else(err)
@@ -140,15 +193,26 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
             if !is_root(peer_uid) {
                 return forbidden("unseal_password");
             }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
             task::spawn_blocking(move || do_unseal_password(&user))
                 .await
                 .unwrap_or_else(err)
         }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
+        Request::Probe => task::spawn_blocking(|| Response::Capabilities {
+            report: capabilities::probe(),
+        })
+        .await
+        .unwrap_or_else(err),
         Request::LivenessTest => task::spawn_blocking(do_liveness_test).await.unwrap_or_else(err),
         Request::ResealUserEnvelopes { user } => {
             if !is_root(peer_uid) {
                 return forbidden("reseal_user_envelopes");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
             }
             task::spawn_blocking(move || do_reseal_user_envelopes(&user))
                 .await
@@ -159,6 +223,15 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
 
 fn is_root(uid: Option<u32>) -> bool {
     matches!(uid, Some(0))
+}
+
+/// Returns `Some(error_response)` if the request's `user` field is not a safe
+/// single path component, else `None`. Checked before `user` is ever used to
+/// build a path — defence-in-depth on top of `aegyra-core`'s path builders.
+fn validate_user(user: &str) -> Option<Response> {
+    aegyra_core::validate_user(user).err().map(|e| Response::Error {
+        message: e.to_string(),
+    })
 }
 
 fn parse_socket_arg() -> Option<PathBuf> {
@@ -239,14 +312,16 @@ fn camera_binding_path(user: &str) -> std::path::PathBuf {
 }
 
 fn snapshot_camera_binding() -> CameraBinding {
-    use aegyra_biometrics::camera::{DEFAULT_DEVICE, DEFAULT_IR_DEVICE};
+    let rgb_path = aegyra_biometrics::camera::rgb_device();
+    let ir_path = aegyra_biometrics::camera::ir_device();
     CameraBinding {
-        rgb: DeviceIdentity::from_device(DEFAULT_DEVICE)
-            .unwrap_or_else(|| DeviceIdentity {
-                vid: String::new(), pid: String::new(),
-                serial: String::new(), name: "unknown".into(),
-            }),
-        ir: DeviceIdentity::from_device(DEFAULT_IR_DEVICE),
+        rgb: DeviceIdentity::from_device(&rgb_path).unwrap_or_else(|| DeviceIdentity {
+            vid: String::new(),
+            pid: String::new(),
+            serial: String::new(),
+            name: "unknown".into(),
+        }),
+        ir: ir_path.and_then(|p| DeviceIdentity::from_device(&p)),
     }
 }
 
@@ -299,24 +374,20 @@ fn do_verify(user: &str) -> Response {
     }
 }
 
-/// Load enrolled samples, preferring encrypted storage. If the user has
-/// a legacy `embedding.bin` and no encrypted store yet, auto-migrates:
-/// generates + TPM-seals an AES key, encrypts the embeddings, deletes
-/// the plaintext file. Falls back to legacy only if TPM is unreachable.
+/// Load enrolled samples from encrypted (AES-256-GCM, TPM-sealed-key) storage.
+///
+/// Fails **closed**: if the template key cannot be unsealed (TPM unreachable,
+/// PCR drift, corrupt envelope) we return an error rather than falling back to
+/// an unauthenticated plaintext template. The auth path then declines and PAM
+/// falls through to password — we never match a face against at-rest data that
+/// the TPM hasn't vouched for.
 fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
     check_camera_binding(user)?;
 
-    match cached_template_key(user) {
-        Ok(key) => {
-            let raw = aegyra_core::load_encrypted_embedding(user, &key)
-                .map_err(|e| e.to_string())?;
-            aegyra_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string())
-        }
-        Err(e) => {
-            tracing::warn!("template key unavailable ({e}), using legacy storage");
-            aegyra_biometrics::enroll::load_embeddings(user).map_err(|e| e.to_string())
-        }
-    }
+    let key = cached_template_key(user)
+        .map_err(|e| format!("template key unavailable ({e}); refusing plaintext fallback"))?;
+    let raw = aegyra_core::load_encrypted_embedding(user, &key).map_err(|e| e.to_string())?;
+    aegyra_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string())
 }
 
 fn do_unseal(user: &str) -> Response {
@@ -336,7 +407,7 @@ fn do_unseal(user: &str) -> Response {
     }
     match aegyra_core::unseal_keyring_secret() {
         Ok(secret) => Response::Unsealed {
-            secret: secret.to_vec(),
+            secret: SecretBytes::new(secret.to_vec()),
         },
         Err(e) => Response::Error {
             message: e.to_string(),
@@ -446,8 +517,7 @@ fn do_reseal_user_envelopes(user: &str) -> Response {
     // Template-key envelope: unseal → reseal.
     match aegyra_core::unseal_template_key(user) {
         Ok(key) => {
-            let level = aegyra_core::detect_security_level();
-            match aegyra_core::tpm::seal(&key, level) {
+            match aegyra_core::tpm::seal_secret(&key) {
                 Ok(env) => {
                     if let Ok(path) = aegyra_core::template_key_path_pub(user) {
                         match env.save(&path) {
@@ -475,11 +545,9 @@ fn do_reseal_user_envelopes(user: &str) -> Response {
     }
 }
 
-fn do_seal_password(user: &str, password: Vec<u8>) -> Response {
-    // Wrap incoming bytes in Zeroizing so we wipe them regardless of which
-    // branch returns.
-    let password = zeroize::Zeroizing::new(password);
-    match aegyra_core::seal_password(user, &password) {
+fn do_seal_password(user: &str, password: SecretBytes) -> Response {
+    // `password` zeroizes its buffer on drop, covering every return path.
+    match aegyra_core::seal_password(user, password.expose()) {
         Ok(()) => Response::PasswordSealed,
         Err(e) => Response::Error {
             message: e.to_string(),
@@ -504,7 +572,7 @@ fn do_unseal_password(user: &str) -> Response {
     }
     match aegyra_core::unseal_password(user) {
         Ok(secret) => Response::PasswordUnsealed {
-            secret: secret.to_vec(),
+            secret: SecretBytes::new(secret.to_vec()),
         },
         Err(e) => Response::Error {
             message: e.to_string(),

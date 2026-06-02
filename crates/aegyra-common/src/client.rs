@@ -33,10 +33,14 @@ pub fn request_at(path: &Path, req: &Request, timeout: Duration) -> Result<Respo
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
+    use zeroize::Zeroize;
+
     let mut line = serde_json::to_vec(req).map_err(|e| AegyraError::Serde(e.to_string()))?;
     line.push(b'\n');
     stream.write_all(&line)?;
     stream.flush()?;
+    // The request may carry a password (SealPassword); wipe the serialized form.
+    line.zeroize();
 
     let mut reader = BufReader::new(stream);
     let mut buf = String::new();
@@ -47,5 +51,9 @@ pub fn request_at(path: &Path, req: &Request, timeout: Duration) -> Result<Respo
             "daemon closed connection without responding",
         )));
     }
-    serde_json::from_str(&buf).map_err(|e| AegyraError::Serde(e.to_string()))
+    let parsed = serde_json::from_str(&buf).map_err(|e| AegyraError::Serde(e.to_string()));
+    // The response may carry an unsealed secret; wipe the raw JSON now that the
+    // bytes live inside a zeroizing `SecretBytes` in the parsed value.
+    buf.zeroize();
+    parsed
 }

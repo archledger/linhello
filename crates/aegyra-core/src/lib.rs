@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 pub mod crypto;
 pub mod envelope;
 pub mod memlock;
+pub mod pcrsig;
 pub mod policy;
 pub mod tpm;
 
@@ -14,10 +15,26 @@ pub fn envelope_path() -> PathBuf {
     PathBuf::from(CONFIG_ROOT).join("tpm_envelope.json")
 }
 
-pub fn password_envelope_path(user: &str) -> Result<PathBuf> {
-    if user.is_empty() || user.contains('/') || user.contains('\0') {
+/// Validate that `user` is a safe single path component before it is ever
+/// joined onto `CONFIG_ROOT`. Rejects empty names, path separators, NUL, and
+/// the traversal names `.`/`..`. Because `/` is rejected, no multi-segment or
+/// absolute path can form, so `CONFIG_ROOT.join(user)` always stays one level
+/// under the config root. Does **not** verify the account exists.
+pub fn validate_user(user: &str) -> Result<()> {
+    if user.is_empty()
+        || user == "."
+        || user == ".."
+        || user.contains('/')
+        || user.contains('\\')
+        || user.contains('\0')
+    {
         return Err(AegyraError::Policy("invalid user name".into()));
     }
+    Ok(())
+}
+
+pub fn password_envelope_path(user: &str) -> Result<PathBuf> {
+    validate_user(user)?;
     Ok(PathBuf::from(CONFIG_ROOT)
         .join(user)
         .join("password_envelope.json"))
@@ -34,8 +51,7 @@ pub fn reseal_random_secret() -> Result<Zeroizing<Vec<u8>>> {
     use rand::RngCore;
     let mut buf = Zeroizing::new(vec![0u8; 32]);
     rand::thread_rng().fill_bytes(&mut buf);
-    let level = detect_security_level();
-    let env = tpm::seal(&buf, level)?;
+    let env = tpm::seal_secret(&buf)?;
     env.save(&envelope_path())?;
     Ok(buf)
 }
@@ -45,8 +61,7 @@ pub fn reseal_secret(secret: &[u8]) -> Result<()> {
     if secret.is_empty() {
         return Err(AegyraError::Policy("empty secret".into()));
     }
-    let level = detect_security_level();
-    let env = tpm::seal(secret, level)?;
+    let env = tpm::seal_secret(secret)?;
     env.save(&envelope_path())?;
     Ok(())
 }
@@ -67,8 +82,7 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
         return Err(AegyraError::Policy("empty password".into()));
     }
     let path = password_envelope_path(user)?;
-    let level = detect_security_level();
-    let env = tpm::seal(password, level)?;
+    let env = tpm::seal_secret(password)?;
     env.save(&path)?;
     // Restrict to root — the envelope doesn't leak plaintext, but enforcing
     // 0600 matches the enrollment file's posture.
@@ -93,27 +107,21 @@ pub fn template_key_path_pub(user: &str) -> Result<PathBuf> {
 }
 
 fn template_key_path(user: &str) -> Result<PathBuf> {
-    if user.is_empty() || user.contains('/') || user.contains('\0') {
-        return Err(AegyraError::Policy("invalid user name".into()));
-    }
+    validate_user(user)?;
     Ok(PathBuf::from(CONFIG_ROOT)
         .join(user)
         .join("template_key_envelope.json"))
 }
 
 fn encrypted_embedding_path(user: &str) -> Result<PathBuf> {
-    if user.is_empty() || user.contains('/') || user.contains('\0') {
-        return Err(AegyraError::Policy("invalid user name".into()));
-    }
+    validate_user(user)?;
     Ok(PathBuf::from(CONFIG_ROOT)
         .join(user)
         .join("embedding.enc"))
 }
 
 fn legacy_embedding_path(user: &str) -> Result<PathBuf> {
-    if user.is_empty() || user.contains('/') || user.contains('\0') {
-        return Err(AegyraError::Policy("invalid user name".into()));
-    }
+    validate_user(user)?;
     Ok(PathBuf::from(CONFIG_ROOT)
         .join(user)
         .join("embedding.bin"))
@@ -128,8 +136,7 @@ pub fn ensure_template_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         return unseal_template_key(user);
     }
     let key = crypto::generate_key();
-    let level = detect_security_level();
-    let env = tpm::seal(&key, level)?;
+    let env = tpm::seal_secret(&key)?;
     env.save(&kp)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600))?;
@@ -162,17 +169,30 @@ pub fn save_encrypted_embedding(user: &str, raw: &[u8], key: &[u8]) -> Result<()
 }
 
 /// Load and decrypt the user's face embeddings. Returns the raw bytes
-/// (caller parses into f32 vectors). Falls back to legacy `embedding.bin`
-/// and auto-migrates: encrypts in place and deletes the plaintext file.
+/// (caller parses into f32 vectors).
+///
+/// Encrypted storage (`embedding.enc`) is authenticated (AES-256-GCM), so a
+/// tampered template is rejected on decrypt. A legacy plaintext `embedding.bin`
+/// is **not** trusted by default: a one-time migration is only performed when
+/// `AEGYRA_ALLOW_LEGACY_MIGRATION` is set, because a plaintext template carries
+/// no integrity guarantee (a root-written or tampered file would otherwise be
+/// adopted as the enrolled face). Fresh installs never produce `embedding.bin`.
 pub fn load_encrypted_embedding(user: &str, key: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let enc_path = encrypted_embedding_path(user)?;
     if enc_path.exists() {
         let blob = std::fs::read(&enc_path)?;
         return crypto::decrypt(key, &blob);
     }
-    // Migration: read legacy, encrypt, save encrypted, delete legacy.
     let legacy = legacy_embedding_path(user)?;
     if legacy.exists() {
+        if !legacy_migration_allowed() {
+            return Err(AegyraError::Biometrics(format!(
+                "found legacy plaintext template for '{user}' but migration is \
+                 disabled (unauthenticated at rest). Re-enroll, or set \
+                 AEGYRA_ALLOW_LEGACY_MIGRATION=1 for a one-time upgrade."
+            )));
+        }
+        // One-time, opt-in migration: read legacy, encrypt, save, delete.
         tracing::info!("migrating {} to encrypted storage", legacy.display());
         let raw = std::fs::read(&legacy)?;
         save_encrypted_embedding(user, &raw, key)?;
@@ -182,4 +202,44 @@ pub fn load_encrypted_embedding(user: &str, key: &[u8]) -> Result<Zeroizing<Vec<
     Err(AegyraError::Biometrics(format!(
         "no enrollment found for user '{user}'"
     )))
+}
+
+fn legacy_migration_allowed() -> bool {
+    std::env::var("AEGYRA_ALLOW_LEGACY_MIGRATION")
+        .ok()
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn validate_user_accepts_plain_names() {
+        for ok in ["ben", "root", "user1", "a.b", "Jean-Luc"] {
+            assert!(validate_user(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn validate_user_rejects_traversal_and_separators() {
+        for bad in ["", ".", "..", "../etc", "a/b", "/etc", "a\\b", "a\0b", "..\0"] {
+            assert!(validate_user(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn user_paths_stay_under_config_root() {
+        // Any accepted user must produce a path exactly one level below
+        // CONFIG_ROOT — no traversal can escape.
+        let p = password_envelope_path("ben").unwrap();
+        assert_eq!(p.parent().unwrap(), Path::new(CONFIG_ROOT).join("ben"));
+        // A traversal attempt never yields a path at all.
+        assert!(password_envelope_path("..").is_err());
+        assert!(template_key_path("../../root").is_err());
+        assert!(encrypted_embedding_path("a/b").is_err());
+    }
 }

@@ -1,68 +1,73 @@
 #!/bin/bash
-# Pacman post-transaction hook: reseal Aegyra TPM envelopes after a
-# kernel/bootloader/Secure-Boot update.
+# Pacman post-transaction hook: keep Aegyra TPM envelopes valid across
+# kernel / bootloader / Secure-Boot updates.
 #
-# Context: Aegyra seals secrets under PCR 7 (Secure Boot state) and
-# PCR 11 (UKI cmdline). A kernel update with the same cmdline doesn't
-# change these PCRs, so reseal is a harmless no-op. If Secure Boot keys
-# were rotated (sbctl), PCR 7 changes IMMEDIATELY (efivars) and reseal
-# captures the new value. If the UKI cmdline changed, the new PCR 11
-# value only takes effect after reboot — we can't predict it, so we
-# warn and rely on password fallback for the first post-reboot login.
+# Binding model (post signed-PCR-policy work — see docs/design/signed-pcr-policy.md):
 #
-# The hook reseals:
-#   1. Global envelope (/etc/aegyra/tpm_envelope.json)
-#   2. Per-user password envelopes (unseal current → reseal)
-#   3. Per-user template-key envelopes (unseal current → reseal)
+#   * Authorized tier  — PolicyAuthorize over PCR 7+11, signed by the systemd
+#     PCR key. Each new UKI ships a fresh signature, so a KERNEL UPDATE NEEDS
+#     NO RESEAL: the new PCR 11 is already authorized after reboot. Resealing
+#     here is a harmless refresh against the still-current (pre-reboot) state.
 #
-# If the daemon isn't running, we skip silently — the user hasn't set
-# up face auth yet.
+#   * Literal(PCR 7) tier — plain PolicyPCR over PCR 7 only. PCR 7 does NOT
+#     change on a kernel/initrd update, so again no reseal is required for
+#     kernel bumps. It DOES change when Secure Boot keys are rotated (sbctl),
+#     and that takes effect immediately in efivars — which is the one case this
+#     hook genuinely repairs by unsealing (old PCR 7 still current) → resealing.
+#
+# So unlike the old PCR-11-literal design, a routine kernel update no longer
+# risks locking out face auth. This hook refreshes envelopes and reports; it no
+# longer emits a scary "PCR drift after reboot" warning for kernel updates.
+#
+# If the daemon isn't running, exit silently — face auth isn't set up yet.
 
 set -euo pipefail
 
 AEGYRA=/usr/local/bin/aegyra
 CONF=/etc/aegyra
 
-# Drain stdin (NeedsTargets pipes package list, we don't use it).
+# Drain stdin (NeedsTargets pipes the package list; we don't use it).
 cat > /dev/null
 
 if ! systemctl is-active --quiet aegyrad 2>/dev/null; then
     exit 0
 fi
 
-echo "  → resealing global TPM envelope"
+echo "  → refreshing Aegyra TPM envelopes (handles Secure Boot key changes;"
+echo "    kernel updates are covered by signed/PCR-7 policy and need no reseal)"
+
 "$AEGYRA" reseal 2>/dev/null || true
 
 resealed=0
 failed=0
-
 for user_dir in "$CONF"/*/; do
     [ -d "$user_dir" ] || continue
     user=$(basename "$user_dir")
+    [ -f "$user_dir/password_envelope.json" ] || \
+        [ -f "$user_dir/template_key_envelope.json" ] || continue
 
-    # Password envelope: unseal (current PCRs) → reseal.
-    if [ -f "$user_dir/password_envelope.json" ]; then
-        if "$AEGYRA" reseal-user-envelopes --user "$user" 2>/dev/null; then
-            resealed=$((resealed + 1))
-        else
-            failed=$((failed + 1))
-        fi
+    if "$AEGYRA" reseal-user-envelopes --user "$user" 2>/dev/null; then
+        resealed=$((resealed + 1))
+    else
+        # Not necessarily a problem: under signed/PCR-7 policy the envelopes
+        # remain valid even if this opportunistic reseal couldn't run.
+        failed=$((failed + 1))
     fi
 done
 
-if [ "$resealed" -gt 0 ]; then
-    echo "  → resealed envelopes for $resealed user(s)"
-fi
+[ "$resealed" -gt 0 ] && echo "  → refreshed envelopes for $resealed user(s)"
 if [ "$failed" -gt 0 ]; then
-    echo "  → WARNING: $failed user(s) failed to reseal — run 'aegyra diag' after reboot"
+    echo "  → note: $failed user(s) not refreshed now; existing envelopes still"
+    echo "    apply. Verify after reboot with 'aegyra diag' / 'aegyra doctor'."
 fi
 
-echo "  → verifying current PCR state..."
+# Report state. Drift on the PCR-7/Authorized tiers is unexpected for a kernel
+# update; surface it only if it actually occurred.
 diag_out=$("$AEGYRA" diag 2>&1) || true
 if echo "$diag_out" | grep -q "CHANGED"; then
-    echo "  → WARNING: PCR drift detected — envelopes may fail after reboot"
+    echo "  → NOTE: PCR drift reported — if face auth fails after reboot, run"
+    echo "    'sudo aegyra reseal-user-envelopes --user <you>' (or re-enroll):"
     echo "$diag_out" | sed 's/^/    /'
-    echo "  → run 'aegyra diag' again after rebooting"
 else
-    echo "  → PCR state: no drift"
+    echo "  → PCR state OK"
 fi

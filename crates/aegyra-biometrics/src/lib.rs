@@ -41,7 +41,7 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
 
     let evaluator = aegyra_liveness::LivenessEvaluator::cached()?;
     let report = evaluator.evaluate(
-        &frame, face.bbox, &face.landmarks, camera::DEFAULT_DEVICE, ir.as_ref(),
+        &frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref(),
     )?;
     if matches!(report.decision, aegyra_liveness::LivenessDecision::Spoof) {
         return Err(bio_err(format!(
@@ -79,14 +79,13 @@ pub fn run_liveness_test() -> Result<aegyra_liveness::LivenessReport> {
         .ok_or_else(|| bio_err("no face detected"))?;
     let ir = ir_handle.join().unwrap_or(None);
     let evaluator = aegyra_liveness::LivenessEvaluator::cached()?;
-    evaluator.evaluate(&frame, face.bbox, &face.landmarks, camera::DEFAULT_DEVICE, ir.as_ref())
+    evaluator.evaluate(&frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref())
 }
 
-pub fn authenticate_user(user: &str) -> Result<AuthResult> {
-    let samples = enroll::load_embeddings(user)?;
-    let live = capture_and_embed()?;
-    Ok(match_against(&live, &samples))
-}
+// NOTE: the former `authenticate_user` helper (which matched against the
+// plaintext `embedding.bin` directly) was removed — it bypassed the encrypted,
+// TPM-keyed template store. The daemon authenticates via `load_user_samples`
+// (encrypted, fail-closed) + `capture_and_embed` + `match_against`.
 
 /// Match a live embedding against stored samples. Separated out so the
 /// daemon can call this with pre-decrypted embeddings from the encrypted
