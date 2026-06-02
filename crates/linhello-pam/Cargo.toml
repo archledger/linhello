@@ -1,0 +1,17 @@
+[package]
+name = "linhello-pam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "linhello_pam"
+crate-type = ["cdylib"]
+
+[dependencies]
+linhello-common.workspace = true
+libc = "0.2"
+zeroize.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

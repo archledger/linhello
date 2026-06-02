@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# linhello-keyring-diag — capture evidence about whether the GNOME login keyring
+# actually unlocked on THIS boot's (face-driven) login.
+#
+# Usage: reboot, log in with FACE ONLY (do not type your password), open a
+# terminal, and run:   ./scripts/linhello-keyring-diag
+# Paste the whole output back.
+set -uo pipefail
+
+sep() { printf '\n===== %s =====\n' "$1"; }
+
+sep "boot / login timing"
+who -b 2>/dev/null
+echo "uptime: $(uptime -p 2>/dev/null)"
+echo "current user: $USER (uid $(id -u))"
+
+sep "gkr-pam / gnome-keyring / face-auth — THIS boot"
+# Name-agnostic: matches both the old (aegyrad/pam_faceauth) and new
+# (linhellod/pam_linhello) naming, plus the IPC op that releases the password.
+journalctl -b 0 2>/dev/null \
+  | grep -iE 'gkr-pam|gnome-keyring-daemon|pam_(faceauth|linhello)|UnsealPassword|aegyrad|linhellod' \
+  | grep -ivE 'register item|X-GNOME-Autostart|Setenv interface|Secret Service was already' \
+  | tail -40
+
+sep "decisive line — did the login keyring unlock this boot?"
+if journalctl -b 0 2>/dev/null | grep -qi 'gkr-pam: unlocked login keyring'; then
+  echo "FOUND: 'unlocked login keyring' present this boot."
+  journalctl -b 0 2>/dev/null | grep -i 'gkr-pam:' | tail -8
+else
+  echo "NOT FOUND: no 'unlocked login keyring' this boot -> keyring stayed LOCKED."
+fi
+
+sep "is the keyring actually usable right now? (secret-tool round-trip)"
+if command -v secret-tool >/dev/null 2>&1; then
+  if secret-tool store --label='linhello-diag' linhello diag 2>/dev/null <<<'diag-secret-value'; then
+    got=$(secret-tool lookup linhello diag 2>/dev/null)
+    if [ "$got" = "diag-secret-value" ]; then
+      echo "OK: stored+read a secret -> login keyring is UNLOCKED and usable."
+      secret-tool clear linhello diag 2>/dev/null
+    else
+      echo "PARTIAL: store succeeded but read mismatch ('$got')."
+    fi
+  else
+    echo "BLOCKED: secret-tool store failed -> keyring is LOCKED (a prompt likely appeared)."
+  fi
+else
+  echo "secret-tool not installed (pkg: libsecret). Skipping live check."
+fi
+
+sep "daemon + socket state"
+for svc in linhellod aegyrad; do
+  if systemctl list-unit-files "$svc.service" >/dev/null 2>&1; then
+    echo "$svc: $(systemctl is-active "$svc" 2>/dev/null) / $(systemctl is-enabled "$svc" 2>/dev/null)"
+  fi
+done
+for s in /run/linhello.sock /run/aegyra.sock; do
+  [ -S "$s" ] && echo "socket present: $s ($(stat -c '%A %U:%G' "$s" 2>/dev/null))"
+done
+
+sep "keyring files"
+ls -la "$HOME/.local/share/keyrings/" 2>/dev/null
+
+sep "interpretation hint"
+cat <<'EOF'
+- 'unlocked login keyring' FOUND + secret-tool OK  -> keyring works on this login.
+    If you logged in with FACE ONLY, the after-reboot bug is RESOLVED (Case 4).
+- 'unlocked login keyring' FOUND but you actually TYPED your password to get in
+    -> face auth failed at cold boot; keyring was unlocked by the typed pw (Case 1:
+    boot-timing / daemon-not-warm, not a keyring bug).
+- NOT FOUND + secret-tool BLOCKED -> face login succeeded but stashed password did
+    not match the keyring (Case 2: keyring needs re-keying) OR UnsealPassword failed
+    at boot (Case 3). Check the daemon lines above for an UnsealPassword error.
+EOF

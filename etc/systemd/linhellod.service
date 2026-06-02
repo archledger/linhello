@@ -1,0 +1,57 @@
+[Unit]
+Description=LinuxHello face-auth daemon
+Documentation=https://github.com/archledger/linhello
+After=systemd-tmpfiles-setup.service
+RequiresMountsFor=/run /etc/linhello
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/linhellod
+Restart=on-failure
+RestartSec=2s
+
+# Fail-closed liveness: if /etc/linhello/antispoof.onnx is missing, refuse to
+# verify rather than silently falling back to the device-trust-only gate.
+# Override in a drop-in (/etc/systemd/system/linhellod.service.d/) if you need
+# to run without the anti-spoof model during early bring-up.
+Environment=LINHELLO_REQUIRE_ANTISPOOF=1
+
+# Needs root: TPM (/dev/tpmrm0), camera (/dev/video*), /run/linhello.sock,
+# and read access to /etc/linhello for sealed envelope + models.
+User=root
+Group=root
+
+# Hardening. Keep CAP_SYS_ADMIN off; we only need DAC/device access.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run /etc/linhello
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# @resources is needed by onnxruntime's thread pool (sched_setaffinity);
+# keep @privileged stripped so bpf/kexec/init_module stay denied.
+SystemCallFilter=~@privileged
+
+# Devices: TPM resource manager + V4L cameras.
+DeviceAllow=/dev/tpmrm0 rw
+DeviceAllow=char-video4linux rw
+PrivateDevices=no
+
+# The socket is created by the daemon itself at /run/linhello.sock (chmod 0666
+# with per-op uid enforcement). A future revision will switch to 0660 with an
+# `linhello` group and socket activation.
+
+[Install]
+WantedBy=multi-user.target

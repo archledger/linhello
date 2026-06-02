@@ -1,0 +1,32 @@
+#%PAM-1.0
+#
+# linhello-auth — face-auth stack fragment. Include from other PAM configs:
+#
+#   auth   sufficient   pam_linhello.so
+#
+# or via `@include linhello-auth` from /etc/pam.d/<service>. When pam_linhello
+# succeeds it sets PAM_AUTHTOK to the TPM-unsealed secret so that the keyring
+# module (pam_gnome_keyring.so with `use_authtok`) can unlock the login
+# keyring without a second prompt.
+#
+# This file itself is NOT a complete stack — it only declares the auth step.
+# Hook it into the service stacks you want to protect:
+#
+#   /etc/pam.d/gdm-password    (GNOME greeter login)
+#   /etc/pam.d/sudo            (optional: face-auth instead of password for sudo)
+#   /etc/pam.d/system-login    (TTY login)
+#   /etc/pam.d/gnome-keyring   (screen unlock via gnome-screensaver)
+#
+# Always leave a password fallback — if the camera or TPM is unavailable the
+# stack must still authenticate.
+
+auth    sufficient   pam_linhello.so
+
+# Keep the TPM-sealed password envelope in sync with the real login password.
+# MUST be listed AFTER the module that actually updates the password (pam_unix)
+# and MUST be `optional` so a reseal failure doesn't block the change itself.
+# Typical usage inside a full password stack:
+#
+#   password  required   pam_unix.so    sha512 shadow use_authtok
+#   password  optional   pam_linhello.so
+password optional   pam_linhello.so

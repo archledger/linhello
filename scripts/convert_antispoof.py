@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert the upstream MiniFASNet .pth weights to ONNX files that
-aegyra-liveness can consume.
+linhello-liveness can consume.
 
 Why a conversion step? The minivision-ai/Silent-Face-Anti-Spoofing repo
 ships PyTorch `.pth` checkpoints, not ONNX. For a security-critical gate
@@ -13,7 +13,7 @@ Exports BOTH models used by upstream's `test.py`:
     2.7_80x80_MiniFASNetV2.pth   → antispoof.onnx     (primary,   2.7× crop)
     4_0_0_80x80_MiniFASNetV1SE.pth → antispoof_4.onnx (secondary, 4.0× crop)
 
-aegyra-liveness runs both and averages their softmax outputs (dual-model
+linhello-liveness runs both and averages their softmax outputs (dual-model
 fusion). Single-model MiniFASNet is known to pass printed-photo attacks
 at any usable threshold — the ensemble gives genuine separation.
 
@@ -21,18 +21,18 @@ Usage:
     # one-time: install conversion deps (~2.5 GB on Arch)
     sudo pacman -S python-pytorch python-onnxscript git
 
-    # run from the aegyra repo root
+    # run from the linhello repo root
     python3 scripts/convert_antispoof.py
 
     # install both
-    sudo install -m 0644 antispoof.onnx   /etc/aegyra/antispoof.onnx
-    sudo install -m 0644 antispoof_4.onnx /etc/aegyra/antispoof_4.onnx
+    sudo install -m 0644 antispoof.onnx   /etc/linhello/antispoof.onnx
+    sudo install -m 0644 antispoof_4.onnx /etc/linhello/antispoof_4.onnx
 
 Both ONNX files share the same input convention:
     input  : [1, 3, 80, 80] BGR float32, raw 0-255 (no mean/std)
     output : [1, 3] logits  (class 1 = real)
 They differ in the pre-crop scale applied to the face bbox (2.7 vs 4.0);
-that's hardcoded per-model in aegyra-liveness.
+that's hardcoded per-model in linhello-liveness.
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def main() -> int:
         print("  sudo pacman -S python-pytorch python-onnxscript", file=sys.stderr)
         return 2
 
-    with tempfile.TemporaryDirectory(prefix="aegyra-antispoof-") as td:
+    with tempfile.TemporaryDirectory(prefix="linhello-antispoof-") as td:
         td_path = Path(td)
         repo_dir = td_path / "repo"
         print(f"==> cloning {UPSTREAM_REPO} @ {UPSTREAM_REF}")
@@ -118,10 +118,10 @@ def main() -> int:
 
     print()
     print("next:")
-    print("  sudo install -m 0644 antispoof.onnx   /etc/aegyra/antispoof.onnx")
-    print("  sudo install -m 0644 antispoof_4.onnx /etc/aegyra/antispoof_4.onnx")
-    print("  sudo systemctl restart aegyrad")
-    print("  aegyra liveness-test   # dual-model spoof_prob")
+    print("  sudo install -m 0644 antispoof.onnx   /etc/linhello/antispoof.onnx")
+    print("  sudo install -m 0644 antispoof_4.onnx /etc/linhello/antispoof_4.onnx")
+    print("  sudo systemctl restart linhellod")
+    print("  linhello liveness-test   # dual-model spoof_prob")
     return 0
 
 

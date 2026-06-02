@@ -1,0 +1,10 @@
+[package]
+name = "linhello-secureboot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+linhello-common.workspace = true
+tracing.workspace = true

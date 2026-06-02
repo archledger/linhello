@@ -1,22 +1,22 @@
 # Maintainer: Ben <archledger236@gmail.com>
-pkgname=aegyra
+pkgname=linhello
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="TPM-backed facial authentication and PAM keyring unlock for Linux"
 arch=('x86_64')
-url="https://github.com/archledger/aegyra"
+url="https://github.com/archledger/linhello"
 license=('GPL3')
 depends=('tpm2-tss' 'pam' 'v4l-utils' 'onnxruntime' 'gcc-libs' 'glibc')
 makedepends=('rust' 'cargo' 'clang')
-optdepends=('sbctl: secure-boot key enrollment via `aegyra secureboot setup`')
-install=aegyra.install
+optdepends=('sbctl: secure-boot key enrollment via `linhello secureboot setup`')
+install=linhello.install
 
 # Clean-chroot-compatible source: we consume a tarball that lives next to
 # this PKGBUILD. Produce it from the repo root with:
 #
 #     make dist
 #
-# which invokes `git archive` into packaging/arch/aegyra-${pkgver}.tar.gz.
+# which invokes `git archive` into packaging/arch/linhello-${pkgver}.tar.gz.
 # `extra-x86_64-build` copies this tarball into the chroot alongside the
 # PKGBUILD, so the build no longer reaches outside $srcdir.
 source=("${pkgname}-${pkgver}.tar.gz")
@@ -44,6 +44,6 @@ package() {
 
     # Models are not packaged — user installs their own InsightFace buffalo_l
     # weights. Ship an empty config dir and the models README as docs.
-    install -dm755 "$pkgdir/etc/aegyra"
+    install -dm755 "$pkgdir/etc/linhello"
     install -Dm644 models/README.md "$pkgdir/usr/share/doc/$pkgname/models.md"
 }

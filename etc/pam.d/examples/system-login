@@ -1,6 +1,6 @@
 #%PAM-1.0
 #
-# Example /etc/pam.d/system-login with aegyra face-auth (TTY login).
+# Example /etc/pam.d/system-login with linhello face-auth (TTY login).
 #
 # Face-auth runs first; on success the user is logged in without
 # typing a password. Falls through to the normal password flow on
@@ -8,9 +8,9 @@
 #
 # Install:
 #   sudo cp /etc/pam.d/system-login /etc/pam.d/system-login.bak
-#   sudo cp /usr/share/aegyra/pam.d/examples/system-login /etc/pam.d/system-login
+#   sudo cp /usr/share/linhello/pam.d/examples/system-login /etc/pam.d/system-login
 
-auth       sufficient   pam_faceauth.so
+auth       sufficient   pam_linhello.so
 -auth      [success=2 default=ignore]  pam_systemd_home.so
 auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok
 auth       [default=die]               pam_faillock.so      authfail
@@ -25,7 +25,7 @@ account    required                    pam_time.so
 
 -password  [success=1 default=ignore]  pam_systemd_home.so
 password   required                    pam_unix.so          try_first_pass nullok shadow
-password   optional                    pam_faceauth.so
+password   optional                    pam_linhello.so
 password   optional                    pam_permit.so
 
 -session   optional                    pam_systemd_home.so

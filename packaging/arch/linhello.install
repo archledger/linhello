@@ -1,0 +1,29 @@
+post_install() {
+    systemctl daemon-reload || true
+    cat <<'EOF'
+
+LinuxHello installed. Next steps:
+
+  1. Install InsightFace buffalo_l weights into /etc/linhello:
+         cp det_10g.onnx     /etc/linhello/det_10g.onnx
+         cp w600k_r50.onnx   /etc/linhello/face.onnx
+
+  2. Enable the daemon:
+         systemctl enable --now linhellod
+
+  3. Enroll your face:
+         sudo linhello enroll --user $USER
+
+  4. Review `linhello status` and `linhello diag` before wiring into PAM.
+
+EOF
+}
+
+post_upgrade() {
+    systemctl daemon-reload || true
+    systemctl try-restart linhellod || true
+}
+
+post_remove() {
+    systemctl daemon-reload || true
+}

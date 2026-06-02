@@ -1,0 +1,24 @@
+[Trigger]
+Type = Package
+Operation = Upgrade
+Target = linux
+Target = linux-lts
+Target = linux-zen
+Target = linux-hardened
+Target = systemd
+Target = mkinitcpio
+Target = sbctl
+
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = boot/EFI/Linux/*
+Target = boot/vmlinuz-*
+Target = efi/EFI/Linux/*
+
+[Action]
+Description = Resealing LinuxHello TPM envelopes for updated boot components...
+When = PostTransaction
+Exec = /usr/local/bin/linhello-reseal-hook
+NeedsTargets

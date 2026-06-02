@@ -1,9 +1,9 @@
-# Aegyra: Update-Resilient TPM Binding via Signed PCR Policy
+# LinuxHello: Update-Resilient TPM Binding via Signed PCR Policy
 
 **Status:** Scoping / design proposal
-**Author:** Aegyra maintainers
+**Author:** LinuxHello maintainers
 **Date:** 2026-06-02
-**Goal:** Make Aegyra a Windows-Hello-class facial unlock for Linux that survives
+**Goal:** Make LinuxHello a Windows-Hello-class facial unlock for Linux that survives
 kernel, initrd, microcode, and systemd-stub updates **without breaking face auth
 or requiring biometric re-enrollment.**
 
@@ -11,7 +11,7 @@ or requiring biometric re-enrollment.**
 
 ## 1. Problem statement
 
-Aegyra seals two per-user secrets in the TPM:
+LinuxHello seals two per-user secrets in the TPM:
 
 - the **template key** (`template_key_envelope.json`) — the AES-256-GCM key that
   encrypts the face embedding at rest (`embedding.enc`);
@@ -19,7 +19,7 @@ Aegyra seals two per-user secrets in the TPM:
   to unlock the GNOME/KWallet keyring (Design B).
 
 Both are sealed with an **unsigned `PolicyPCR`** binding to PCR 7 (Secure Boot
-state) + PCR 11 (UKI measurement) — see `crates/aegyra-core/src/tpm.rs:224-288`
+state) + PCR 11 (UKI measurement) — see `crates/linhello-core/src/tpm.rs:224-288`
 and `policy.rs:19-25`.
 
 `PolicyPCR` bakes the *literal* PCR digest into the sealed object's `authPolicy`.
@@ -36,7 +36,7 @@ When that happens today:
    random and TPM-only, **so it is unrecoverable** → the face must be re-enrolled.
 
 This is exactly what happened on the `systemd 260.1 → 260.2` update that prompted
-this work. The existing reseal pacman hook (`scripts/aegyra-reseal-hook`) cannot
+this work. The existing reseal pacman hook (`scripts/linhello-reseal-hook`) cannot
 fix it: it runs `PostTransaction` and reseals against the *currently booted* (old)
 PCR 11, which is stale the moment the new UKI boots. Its own comment admits this.
 
@@ -85,23 +85,23 @@ adopt.
 |---|---|---|---|---|
 | **A. PCR 7 only** | Secure Boot state | ✅ (PCR 7 stable) | Coarse (any db-signed kernel) | None — already exists as `SecurityLevel::Medium` |
 | **B. Signed PCR 11, reuse systemd keys** | PolicyAuthorize(systemd pcr key) + PCR 7 | ✅ (fresh signature per UKI) | Per-UKI (exact kernel+initrd+cmdline) | Enable PCR signing in UKI build; consume `/run/systemd/*` |
-| **C. Signed PCR 11, own key + own hook** | PolicyAuthorize(Aegyra key) + PCR 7 | ✅ (own reseal hook re-signs) | Per-UKI | Own signing key + `systemd-measure sign` hook |
+| **C. Signed PCR 11, own key + own hook** | PolicyAuthorize(LinuxHello key) + PCR 7 | ✅ (own reseal hook re-signs) | Per-UKI | Own signing key + `systemd-measure sign` hook |
 
 ### Recommendation: **B**, with **A as an automatic fallback tier.**
 
 - **B** rides the infrastructure the distro already regenerates on every kernel
-  update. Aegyra becomes a peer consumer of the same `tpm2-pcr-signature.json`
+  update. LinuxHello becomes a peer consumer of the same `tpm2-pcr-signature.json`
   that systemd-cryptenroll uses — no parallel signing pipeline to maintain, and
   it's the design with the most upstream scrutiny.
 - It requires one-time setup: the UKI must be built with PCR signing keys
   (`ukify --pcr-private-key`), which Arch does **not** do by default. Ben's box
   is the ideal first target (Secure Boot ON, sbctl, UKI already).
 - Where signed policy is unavailable (no `.pcrsig`, legacy boot, signing not
-  configured), Aegyra degrades to **A (PCR 7 only)** — still update-resilient,
+  configured), LinuxHello degrades to **A (PCR 7 only)** — still update-resilient,
   just coarser — instead of the current brittle PCR 11 literal binding. This
   becomes the new `SecurityLevel` ladder.
 - **C** is the fallback-of-the-fallback if the user refuses to touch their UKI
-  build: Aegyra ships its own key (sealed under PCR 7) and re-signs the predicted
+  build: LinuxHello ships its own key (sealed under PCR 7) and re-signs the predicted
   PCR 11 in a pacman hook. More moving parts; defer unless requested.
 
 ### New `SecurityLevel` ladder
@@ -126,12 +126,12 @@ All `tss-esapi` 7.x methods below are confirmed present on `Context`
 ### Phase 0 — Recover the current machine (unblock Ben today)
 Independent of the redesign. See `docs/runbook-pcr-drift-recovery.md` (to be
 written) / the commands already provided:
-- `aegyra seal-password ben` (re-bind password to current PCR 11)
-- `aegyra enroll --user ben --reset` (template key is lost → re-enroll)
-- `aegyra diag` → no drift; `aegyra verify` → match.
+- `linhello seal-password ben` (re-bind password to current PCR 11)
+- `linhello enroll --user ben --reset` (template key is lost → re-enroll)
+- `linhello diag` → no drift; `linhello verify` → match.
 
 ### Phase 1 — TPM core: PolicyAuthorize seal/unseal
-`crates/aegyra-core/src/tpm.rs`, `policy.rs`, `envelope.rs`.
+`crates/linhello-core/src/tpm.rs`, `policy.rs`, `envelope.rs`.
 
 1. **`envelope.rs`** — extend `SealedEnvelope` with a `PolicyKind` enum:
    - `PcrLiteral { pcrs }` (existing, kept for `Medium`/PCR-7 tier and migration)
@@ -167,17 +167,17 @@ written) / the commands already provided:
    own signature file byte-compatibly.
 
 ### Phase 2 — Signature-file plumbing
-New module `crates/aegyra-core/src/pcrsig.rs`:
+New module `crates/linhello-core/src/pcrsig.rs`:
 - Parse `/run/systemd/tpm2-pcr-signature.json` (auto-discover order:
   `/etc/systemd/`, `/run/systemd/`, `/usr/lib/systemd/`, matching cryptenroll).
   Schema: top-level keyed by bank (`"sha256"`) → array of
   `{ pcrs:[int], pkfp:hex, pol:hex, sig:base64 }`.
 - Load `/run/systemd/tpm2-pcr-public-key.pem`.
 - Given a computed approved-policy digest, find the entry whose `pol` matches.
-- `from_env()` overrides for testing (`AEGYRA_PCR_SIGNATURE`, `AEGYRA_PCR_PUBKEY`).
+- `from_env()` overrides for testing (`LINHELLO_PCR_SIGNATURE`, `LINHELLO_PCR_PUBKEY`).
 
 ### Phase 3 — `SecurityLevel` detection rework
-`crates/aegyra-core/src/policy.rs`:
+`crates/linhello-core/src/policy.rs`:
 - `detect()` returns `Full` only when SB on + UKI + a usable signature file +
   pubkey are present; else `Medium` (PCR 7 only); else `Basic`.
 - `Medium` becomes the safety net that *also survives kernel updates* (PCR 7 is
@@ -194,7 +194,7 @@ New module `crates/aegyra-core/src/pcrsig.rs`:
   `*-ucode`/initramfs changes, so the signature regenerates per update for free.
 
 ### Phase 5 — Reseal hook semantics fix
-`scripts/aegyra-reseal-hook` + `etc/pacman.d/hooks/aegyra-reseal.hook`:
+`scripts/linhello-reseal-hook` + `etc/pacman.d/hooks/linhello-reseal.hook`:
 - For the **authorized** envelopes, the hook becomes a **no-op** for kernel
   updates (the signature ships in the UKI; nothing to reseal). It should only
   reseal on **PCR 7 changes** (sbctl key rotation — effective immediately in
@@ -217,7 +217,7 @@ New module `crates/aegyra-core/src/pcrsig.rs`:
 
 Full review in `docs/design/security-review-2026-06.md` (companion). The
 must-fix items below are **independent of the redesign** and several are
-prerequisites for calling Aegyra "Windows-Hello-class security." Verified against
+prerequisites for calling LinuxHello "Windows-Hello-class security." Verified against
 source.
 
 ### Critical / High — fix before further feature work
@@ -243,7 +243,7 @@ source.
 4. **Socket 0666 + ungated `Verify`/`LivenessTest` + raw `score` leak (C3)** —
    `main.rs:57` is world-writable; any local process can drive the camera and
    read back the similarity `score` as a threshold-tuning oracle, and DoS the
-   single ORT/v4l mutex. Move to `0660` + `aegyra` group, scope `Verify` to the
+   single ORT/v4l mutex. Move to `0660` + `linhello` group, scope `Verify` to the
    caller's own uid, return only `matched` (not `score`) to non-root, rate-limit.
 5. **Anti-spoof fail-open default (H5)** — `LivenessConfig::from_env` defaults
    `require_antispoof=false`; only the shipped unit sets `=1`. Default to
@@ -277,10 +277,10 @@ buffer bounds, null checks, and volatile zeroing fail closed.
 ## 6. Acceptance criteria (definition of done)
 
 1. After enabling signed PCR policy, a `linux`/`systemd` update + reboot leaves
-   `aegyra verify` working with **no reseal and no re-enroll**.
-2. `aegyra diag` reports the policy kind and whether a valid signature exists for
+   `linhello verify` working with **no reseal and no re-enroll**.
+2. `linhello diag` reports the policy kind and whether a valid signature exists for
    the *next* boot (pre-flight), not just current drift.
-3. If signed policy is unavailable, Aegyra runs at `Medium` (PCR 7) and still
+3. If signed policy is unavailable, LinuxHello runs at `Medium` (PCR 7) and still
    survives kernel updates.
 4. Security must-fix items 1–6 above are closed, with tests for the auth path.
 5. v1 envelopes migrate transparently; password fallback never hard-fails.
@@ -290,7 +290,7 @@ buffer bounds, null checks, and volatile zeroing fail closed.
 ## 7. Open decisions (need Ben's input)
 
 1. **Strategy B vs C** — willing to enable PCR signing in the UKI build (B,
-   recommended), or want Aegyra fully self-contained with its own key + hook (C)?
+   recommended), or want LinuxHello fully self-contained with its own key + hook (C)?
 2. **PCR 7 AND-gate** — also bind PCR 7 alongside signed PCR 11 (defense in
    depth, but reseal needed on sbctl key rotation), or PCR 11 signed policy alone?
 3. **Match threshold (L4)** — keep `0.60`, or measure FAR/FRR and make it

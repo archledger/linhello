@@ -1,6 +1,6 @@
 #%PAM-1.0
 #
-# Example /etc/pam.d/lightdm with aegyra face-auth.
+# Example /etc/pam.d/lightdm with linhello face-auth.
 #
 # Face-auth runs first; on success PAM_AUTHTOK holds the TPM-unsealed
 # login password. Falls through to system-login (pam_unix) on failure.
@@ -9,10 +9,10 @@
 # lines as shown in the gdm-password example.
 #
 # Install:
-#   sudo cp /usr/share/aegyra/pam.d/examples/lightdm /etc/pam.d/lightdm
+#   sudo cp /usr/share/linhello/pam.d/examples/lightdm /etc/pam.d/lightdm
 #   sudo cp /etc/pam.d/lightdm /etc/pam.d/lightdm.bak   # backup first!
 
-auth       sufficient   pam_faceauth.so
+auth       sufficient   pam_linhello.so
 auth       include      system-login
 
 account    include      system-login

@@ -1,16 +1,16 @@
 #%PAM-1.0
 #
-# Example /etc/pam.d/sddm with aegyra face-auth (KDE/Plasma).
+# Example /etc/pam.d/sddm with linhello face-auth (KDE/Plasma).
 #
 # Face-auth runs first; on success PAM_AUTHTOK holds the TPM-unsealed
 # login password. pam_kwallet5 picks that up via `auto_start` and
 # unlocks the KDE Wallet without a second prompt.
 #
 # Install:
-#   sudo cp /usr/share/aegyra/pam.d/examples/sddm /etc/pam.d/sddm
+#   sudo cp /usr/share/linhello/pam.d/examples/sddm /etc/pam.d/sddm
 #   sudo cp /etc/pam.d/sddm /etc/pam.d/sddm.bak   # backup first!
 
-auth       sufficient   pam_faceauth.so
+auth       sufficient   pam_linhello.so
 auth       include      system-login
 auth       optional     pam_kwallet5.so
 

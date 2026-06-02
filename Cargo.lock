@@ -19,120 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aegyra-biometrics"
-version = "0.1.0"
-dependencies = [
- "aegyra-common",
- "aegyra-liveness",
- "anyhow",
- "image",
- "ndarray",
- "ort",
- "serde",
- "thiserror",
- "tracing",
- "v4l",
-]
-
-[[package]]
-name = "aegyra-cli"
-version = "0.1.0"
-dependencies = [
- "aegyra-biometrics",
- "aegyra-common",
- "aegyra-core",
- "aegyra-secureboot",
- "anyhow",
- "clap",
- "libc",
- "rpassword",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "aegyra-common"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "aegyra-core"
-version = "0.1.0"
-dependencies = [
- "aegyra-common",
- "aegyra-secureboot",
- "aes-gcm",
- "anyhow",
- "base64 0.22.1",
- "libc",
- "rand",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tracing",
- "tss-esapi",
- "zeroize",
-]
-
-[[package]]
-name = "aegyra-daemon"
-version = "0.1.0"
-dependencies = [
- "aegyra-biometrics",
- "aegyra-common",
- "aegyra-core",
- "aegyra-liveness",
- "aegyra-secureboot",
- "anyhow",
- "libc",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "aegyra-liveness"
-version = "0.1.0"
-dependencies = [
- "aegyra-common",
- "image",
- "ndarray",
- "ort",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "aegyra-pam"
-version = "0.1.0"
-dependencies = [
- "aegyra-common",
- "libc",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "aegyra-secureboot"
-version = "0.1.0"
-dependencies = [
- "aegyra-common",
- "tracing",
-]
-
-[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,6 +533,120 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "linhello-biometrics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "linhello-common",
+ "linhello-liveness",
+ "ndarray",
+ "ort",
+ "serde",
+ "thiserror",
+ "tracing",
+ "v4l",
+]
+
+[[package]]
+name = "linhello-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "linhello-biometrics",
+ "linhello-common",
+ "linhello-core",
+ "linhello-secureboot",
+ "rpassword",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "linhello-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "linhello-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64 0.22.1",
+ "libc",
+ "linhello-common",
+ "linhello-secureboot",
+ "rand",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tracing",
+ "tss-esapi",
+ "zeroize",
+]
+
+[[package]]
+name = "linhello-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "linhello-biometrics",
+ "linhello-common",
+ "linhello-core",
+ "linhello-liveness",
+ "linhello-secureboot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "linhello-liveness"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "linhello-common",
+ "ndarray",
+ "ort",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "linhello-pam"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "linhello-common",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "linhello-secureboot"
+version = "0.1.0"
+dependencies = [
+ "linhello-common",
+ "tracing",
+]
 
 [[package]]
 name = "linux-raw-sys"

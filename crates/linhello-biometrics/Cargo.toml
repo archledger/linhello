@@ -1,0 +1,22 @@
+[package]
+name = "linhello-biometrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+linhello-common.workspace = true
+linhello-liveness.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+
+v4l = "0.14"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ndarray = "0.16"
+
+# ONNX Runtime bindings — load the system libonnxruntime at runtime
+# (install: `sudo pacman -S onnxruntime-cpu`). Set ORT_DYLIB_PATH to override.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }

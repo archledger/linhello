@@ -1,14 +1,14 @@
 #%PAM-1.0
 #
-# Example /etc/pam.d/sudo with aegyra face-auth.
+# Example /etc/pam.d/sudo with linhello face-auth.
 #
 # Face-auth is sufficient (skips the password prompt on success). If the
 # camera fails or no face matches, falls through to the normal sudo stack.
 #
-# WARNING: only deploy this after you have verified `aegyra verify --user
+# WARNING: only deploy this after you have verified `linhello verify --user
 # $USER` works reliably. A broken face-auth path makes sudo painful.
 
-auth       sufficient   pam_faceauth.so
+auth       sufficient   pam_linhello.so
 auth       include      system-auth
 
 account    include      system-auth

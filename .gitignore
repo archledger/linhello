@@ -2,11 +2,11 @@
 **/*.rs.bk
 Cargo.lock.bak
 *.onnx
-/etc/aegyra/*/embedding.bin
-/etc/aegyra/*/tpm_envelope.json
+/etc/linhello/*/embedding.bin
+/etc/linhello/*/tpm_envelope.json
 
 # Build artifacts
-/pam/pam_faceauth.so
+/pam/pam_linhello.so
 
 # Arch packaging artifacts
 /packaging/arch/src/

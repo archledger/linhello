@@ -1,4 +1,4 @@
-# Aegyra install layout.
+# LinuxHello install layout.
 #
 # Paths are tuned for Arch-style distros (PAM modules under /usr/lib/security,
 # systemd units under /etc/systemd/system). Override any of the *DIR vars for
@@ -6,7 +6,7 @@
 #
 # Targets:
 #   make               — build everything (release)
-#   make pam           — build just pam_faceauth.so
+#   make pam           — build just pam_linhello.so
 #   make install       — install binaries, PAM module, systemd unit, config dir
 #   make check         — cargo check + clippy
 
@@ -15,23 +15,23 @@ PREFIX       ?= /usr/local
 BINDIR       ?= $(PREFIX)/bin
 PAMDIR       ?= /usr/lib/security
 SYSTEMDDIR   ?= /etc/systemd/system
-CONFDIR      ?= /etc/aegyra
+CONFDIR      ?= /etc/linhello
 CARGO        ?= cargo
 CC           ?= cc
 CFLAGS       ?= -O2 -fPIC -Wall -Wextra
 CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
 TARGET_DIR   ?= $(CARGO_TARGET_DIR)/release
-PAM_SO       := pam/pam_faceauth.so
+PAM_SO       := pam/pam_linhello.so
 
-# aegyra-pam ships as libaegyra_pam.so (cdylib). pam_faceauth.so dlopens it.
-RUST_PAM_LIB := $(TARGET_DIR)/libaegyra_pam.so
+# linhello-pam ships as liblinhello_pam.so (cdylib). pam_linhello.so dlopens it.
+RUST_PAM_LIB := $(TARGET_DIR)/liblinhello_pam.so
 
 .PHONY: all build pam install check clean dist
 
 # Version must match pkgver in packaging/arch/PKGBUILD.
 DIST_VERSION ?= 0.1.0
-DIST_PREFIX  := aegyra-$(DIST_VERSION)
+DIST_PREFIX  := linhello-$(DIST_VERSION)
 DIST_TARBALL := packaging/arch/$(DIST_PREFIX).tar.gz
 
 all: build pam
@@ -41,12 +41,12 @@ build:
 
 pam: $(PAM_SO)
 
-# -rpath pins libaegyra_pam.so next to pam_faceauth.so inside $(PAMDIR) so the
+# -rpath pins liblinhello_pam.so next to pam_linhello.so inside $(PAMDIR) so the
 # dynamic linker finds it at PAM load time (that directory isn't on the default
 # search path).
-$(PAM_SO): pam/pam_faceauth.c $(RUST_PAM_LIB)
+$(PAM_SO): pam/pam_linhello.c $(RUST_PAM_LIB)
 	$(CC) $(CFLAGS) -shared -o $@ $< \
-	    -L$(TARGET_DIR) -l:libaegyra_pam.so -lpam \
+	    -L$(TARGET_DIR) -l:liblinhello_pam.so -lpam \
 	    -Wl,-rpath,$(PAMDIR)
 
 $(RUST_PAM_LIB): build
@@ -56,36 +56,36 @@ check:
 	$(CARGO) clippy --workspace --no-deps -- -D warnings
 
 install: all
-	install -Dm755 $(TARGET_DIR)/aegyrad    $(DESTDIR)$(BINDIR)/aegyrad
-	install -Dm755 $(TARGET_DIR)/aegyra     $(DESTDIR)$(BINDIR)/aegyra
-	install -Dm755 $(RUST_PAM_LIB)          $(DESTDIR)$(PAMDIR)/libaegyra_pam.so
-	install -Dm755 $(PAM_SO)                $(DESTDIR)$(PAMDIR)/pam_faceauth.so
-	install -Dm644 etc/systemd/aegyrad.service \
-	    $(DESTDIR)$(SYSTEMDDIR)/aegyrad.service
-	install -Dm644 etc/pam.d/aegyra-auth \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/aegyra-auth
+	install -Dm755 $(TARGET_DIR)/linhellod    $(DESTDIR)$(BINDIR)/linhellod
+	install -Dm755 $(TARGET_DIR)/linhello     $(DESTDIR)$(BINDIR)/linhello
+	install -Dm755 $(RUST_PAM_LIB)          $(DESTDIR)$(PAMDIR)/liblinhello_pam.so
+	install -Dm755 $(PAM_SO)                $(DESTDIR)$(PAMDIR)/pam_linhello.so
+	install -Dm644 etc/systemd/linhellod.service \
+	    $(DESTDIR)$(SYSTEMDDIR)/linhellod.service
+	install -Dm644 etc/pam.d/linhello-auth \
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/linhello-auth
 	install -Dm644 etc/pam.d/examples/gdm-password \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/gdm-password
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/gdm-password
 	install -Dm644 etc/pam.d/examples/sudo \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/sudo
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/sudo
 	install -Dm644 etc/pam.d/examples/sddm \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/sddm
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/sddm
 	install -Dm644 etc/pam.d/examples/lightdm \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/lightdm
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/lightdm
 	install -Dm644 etc/pam.d/examples/system-login \
-	    $(DESTDIR)$(PREFIX)/share/aegyra/pam.d/examples/system-login
-	install -Dm755 scripts/aegyra-reseal-hook \
-	    $(DESTDIR)$(BINDIR)/aegyra-reseal-hook
-	install -Dm644 etc/pacman.d/hooks/aegyra-reseal.hook \
-	    $(DESTDIR)/etc/pacman.d/hooks/aegyra-reseal.hook
+	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/system-login
+	install -Dm755 scripts/linhello-reseal-hook \
+	    $(DESTDIR)$(BINDIR)/linhello-reseal-hook
+	install -Dm644 etc/pacman.d/hooks/linhello-reseal.hook \
+	    $(DESTDIR)/etc/pacman.d/hooks/linhello-reseal.hook
 	install -dm755 $(DESTDIR)$(CONFDIR)
 	@echo
 	@echo "Installed. Next:"
-	@echo "  systemctl daemon-reload && systemctl enable --now aegyrad"
+	@echo "  systemctl daemon-reload && systemctl enable --now linhellod"
 	@echo "  cp /path/to/det_10g.onnx  $(CONFDIR)/det_10g.onnx"
 	@echo "  cp /path/to/w600k_r50.onnx $(CONFDIR)/face.onnx"
-	@echo "  aegyra enroll --user \$$USER"
-	@echo "  PAM examples in $(PREFIX)/share/aegyra/pam.d/"
+	@echo "  linhello enroll --user \$$USER"
+	@echo "  PAM examples in $(PREFIX)/share/linhello/pam.d/"
 
 clean:
 	$(CARGO) clean

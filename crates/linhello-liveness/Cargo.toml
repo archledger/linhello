@@ -1,0 +1,15 @@
+[package]
+name = "linhello-liveness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+linhello-common.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+
+image = { version = "0.25", default-features = false }
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
