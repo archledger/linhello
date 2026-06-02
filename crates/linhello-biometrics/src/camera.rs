@@ -195,23 +195,22 @@ fn exists(path: String) -> Option<String> {
 /// Read `rgb=`/`ir=` from `/etc/linhello/cameras.conf` (simple `key=value`,
 /// `#` comments). Lets a user pin an external camera across reboots.
 fn conf_device(key: &str) -> Option<String> {
-    let path = std::path::Path::new(linhello_common::CONFIG_ROOT).join("cameras.conf");
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == key {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
+    linhello_common::config::read_kv("cameras.conf", key)
+}
+
+/// Persist the operator's camera choice to `/etc/linhello/cameras.conf` so the
+/// daemon resolves these devices on its next start. `ir = None` clears the IR
+/// pin (auto-detect resumes). Requires write access to `CONFIG_ROOT` (root);
+/// the `linhello setup` wizard calls this. The daemon caches device paths per
+/// process, so a `systemctl restart linhellod` is needed to pick up changes.
+pub fn write_cameras_conf(rgb: &str, ir: Option<&str>) -> Result<()> {
+    linhello_common::config::write_kv("cameras.conf", "rgb", rgb)
+        .map_err(|e| bio_err(format!("writing cameras.conf: {e}")))?;
+    if let Some(ir) = ir {
+        linhello_common::config::write_kv("cameras.conf", "ir", ir)
+            .map_err(|e| bio_err(format!("writing cameras.conf: {e}")))?;
     }
-    None
+    Ok(())
 }
 
 pub fn capture_ir_from(path: &str) -> Result<IrFrame> {

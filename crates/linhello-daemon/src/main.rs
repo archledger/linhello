@@ -371,6 +371,7 @@ fn do_verify(user: &str) -> Response {
     Response::Verified {
         matched: r.matched,
         score: r.score,
+        threshold: linhello_biometrics::match_threshold(),
     }
 }
 

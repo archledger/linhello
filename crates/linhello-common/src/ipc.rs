@@ -8,6 +8,12 @@ use crate::{BootMode, SecurityLevel};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+/// Fallback for `Verified.threshold` when decoding a response from an older
+/// daemon that didn't send the field. Mirrors `DEFAULT_MATCH_THRESHOLD`.
+fn default_threshold() -> f32 {
+    0.60
+}
+
 /// A byte buffer carrying a secret (login password / unsealed keyring secret)
 /// across the wire. Serializes identically to `Vec<u8>` (a JSON array of
 /// integers), but the in-memory buffer is wiped on drop and its `Debug` is
@@ -175,6 +181,10 @@ pub enum Response {
     Verified {
         matched: bool,
         score: f32,
+        /// The cosine threshold the daemon compared against (so clients can
+        /// show "score 0.71 ≥ 0.60" without guessing the daemon's config).
+        #[serde(default = "default_threshold")]
+        threshold: f32,
     },
     Unsealed {
         secret: SecretBytes,

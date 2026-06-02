@@ -11,8 +11,30 @@ pub mod enroll;
 pub mod matcher;
 mod ort_init;
 
-/// Cosine-similarity threshold for a successful match (ArcFace, 512-D, L2).
-pub const MATCH_THRESHOLD: f32 = 0.60;
+/// Default cosine-similarity threshold for a successful match (ArcFace, 512-D,
+/// L2). Override at runtime via the `LINHELLO_MATCH_THRESHOLD` env var or
+/// `match_threshold=` in `/etc/linhello/settings.conf` — the `linhello setup`
+/// wizard writes the latter after calibrating against your live scores.
+pub const DEFAULT_MATCH_THRESHOLD: f32 = 0.60;
+
+/// Resolved match threshold (cached per process): env → `settings.conf` →
+/// default. Clamped to `[0.30, 0.95]` so a malformed/hostile config can neither
+/// disable auth (too low) nor make it impossible (too high).
+pub fn match_threshold() -> f32 {
+    static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LINHELLO_MATCH_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .or_else(|| {
+                linhello_common::config::read_kv("settings.conf", "match_threshold")
+                    .and_then(|s| s.parse::<f32>().ok())
+            })
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.30, 0.95))
+            .unwrap_or(DEFAULT_MATCH_THRESHOLD)
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResult {
@@ -96,7 +118,7 @@ pub fn match_against(live: &[f32], samples: &[Vec<f32>]) -> AuthResult {
         .map(|s| matcher::cosine(live, s))
         .fold(f32::NEG_INFINITY, f32::max);
     AuthResult {
-        matched: score >= MATCH_THRESHOLD,
+        matched: score >= match_threshold(),
         score,
     }
 }

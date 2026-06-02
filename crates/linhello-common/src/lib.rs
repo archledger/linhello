@@ -1,6 +1,7 @@
 //! Shared types, errors, and constants for the LinuxHello workspace.
 
 pub mod client;
+pub mod config;
 pub mod ipc;
 
 use serde::{Deserialize, Serialize};

@@ -2,10 +2,12 @@
 //! daemon over /run/linhello.sock; the CLI itself holds no secrets.
 
 use linhello_common::client;
-use linhello_common::ipc::{CapabilityStatus, Request, Response, SecretBytes};
+use linhello_common::ipc::{CapabilityReport, CapabilityStatus, Request, Response, SecretBytes};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Write as _;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "linhello", version, about = "LinuxHello control CLI")]
@@ -17,15 +19,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Status,
-    /// Capture a face sample. Default appends to any existing samples so you
-    /// can enroll separate frames for glasses-on / glasses-off / etc; auth
-    /// takes the best match across all of them. `--reset` wipes prior
-    /// samples and stores just this one.
+    /// First-run wizard: pick your webcam, calibrate the match threshold against
+    /// your own live scores, and (optionally) enroll. Writes
+    /// /etc/linhello/{cameras.conf,settings.conf} and restarts the daemon, so
+    /// run it with sudo.
+    Setup,
+    /// Look directly at the camera and hold still — captures several face
+    /// samples and saves your encrypted model. Default appends to existing
+    /// samples (enroll glasses-on / glasses-off / varied lighting; auth takes
+    /// the best match). `--reset` wipes prior samples first.
     Enroll {
         #[arg(long)]
         user: Option<String>,
         #[arg(long)]
         reset: bool,
+        /// How many face samples to capture this run.
+        #[arg(long, default_value = "5")]
+        samples: u32,
+    },
+    /// Safe recognition self-test: captures one frame and tells you whether
+    /// LinuxHello recognizes you. It does NOT drive any login prompt and
+    /// cannot lock you out — use it freely after `enroll` or `setup`.
+    Test {
+        #[arg(long)]
+        user: Option<String>,
     },
     Verify {
         #[arg(long)]
@@ -156,8 +173,290 @@ fn require_root(op: &str) -> Result<()> {
     // SAFETY: libc::getuid is a read-only syscall with no preconditions.
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
-        bail!("secureboot {op} must run as root (got uid {uid})");
+        bail!("`{op}` must run as root (got uid {uid}) — re-run with sudo");
     }
+    Ok(())
+}
+
+/// Read one trimmed line from stdin. Empty on EOF.
+fn prompt_line(msg: &str) -> Result<String> {
+    print!("{msg}");
+    std::io::stdout().flush().ok();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).context("reading stdin")?;
+    Ok(s.trim().to_string())
+}
+
+/// y/N confirmation; defaults to false on empty/EOF.
+fn prompt_yes(msg: &str) -> bool {
+    let ans = prompt_line(msg).unwrap_or_default().to_ascii_lowercase();
+    ans == "y" || ans == "yes"
+}
+
+fn print_capability_report(report: &CapabilityReport) {
+    for c in &report.checks {
+        let tag = match c.status {
+            CapabilityStatus::Ok => "[ OK ]",
+            CapabilityStatus::Warn => "[WARN]",
+            CapabilityStatus::Missing if c.required => "[FAIL]",
+            CapabilityStatus::Missing => "[ -- ]",
+        };
+        println!("{tag} {:<20} {}", c.name, c.detail);
+    }
+}
+
+/// Guided face capture: prints instructions and captures `samples` frames,
+/// each a `Request::Enroll`. `reset` wipes prior samples on the first
+/// *successful* capture so a no-face miss doesn't leave the model half-cleared.
+fn enroll_guided(user: &str, reset: bool, samples: u32) -> Result<()> {
+    println!("Enrolling {user}.");
+    println!("Sit at your normal distance, look directly at the camera, and hold still.");
+    if reset {
+        println!("(--reset: your existing samples will be replaced.)");
+    }
+    println!("Capturing {samples} sample(s) — vary pose/expression slightly between each.");
+    println!();
+
+    let mut reset_pending = reset;
+    let mut total = 0usize;
+    let mut captured = 0u32;
+    for i in 1..=samples {
+        if i > 1 {
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        print!("  [{i}/{samples}] capturing... ");
+        std::io::stdout().flush().ok();
+        match send(Request::Enroll {
+            user: user.to_string(),
+            reset: reset_pending,
+        })? {
+            Response::Enrolled { samples: s } => {
+                reset_pending = false;
+                total = s;
+                captured += 1;
+                println!("ok (stored: {s})");
+            }
+            Response::Error { message } => println!("skipped — {message}"),
+            other => bail!("unexpected response: {other:?}"),
+        }
+    }
+    println!();
+    if captured == 0 {
+        bail!("no samples captured — is your face in view and well lit? try again");
+    }
+    println!("Done — {total} sample(s) stored for {user}.");
+    println!("Next: run `linhello test` to confirm recognition.");
+    Ok(())
+}
+
+fn restart_daemon() -> Result<()> {
+    print!("  restarting linhellod... ");
+    std::io::stdout().flush().ok();
+    let status = Command::new("systemctl")
+        .args(["restart", "linhellod"])
+        .status()
+        .context("running systemctl restart linhellod")?;
+    if !status.success() {
+        println!("failed");
+        bail!("systemctl restart linhellod exited with {status}");
+    }
+    // Let the daemon re-bind the socket and warm the ONNX models.
+    std::thread::sleep(Duration::from_secs(2));
+    println!("ok");
+    Ok(())
+}
+
+/// Pick the RGB (and optional IR) camera from the enumerated nodes.
+fn choose_cameras(
+    cams: &[linhello_biometrics::camera::CameraInfo],
+) -> Result<(String, Option<String>)> {
+    use linhello_biometrics::camera::CameraKind;
+    if cams.is_empty() {
+        bail!("no /dev/video* capture devices found");
+    }
+    println!("  detected video devices:");
+    for c in cams {
+        let kind = match c.kind {
+            CameraKind::Rgb => "RGB",
+            CameraKind::Ir => "IR",
+            CameraKind::Unknown => "?",
+        };
+        let trust = if c.trusted { "" } else { "  (untrusted/virtual)" };
+        println!(
+            "    {:<14} {:<4} {}{}  [{}]",
+            c.path,
+            kind,
+            c.name.as_deref().unwrap_or("?"),
+            trust,
+            c.fourccs.join(",")
+        );
+    }
+    println!();
+
+    let rgb_candidates: Vec<&linhello_biometrics::camera::CameraInfo> = cams
+        .iter()
+        .filter(|c| c.kind == CameraKind::Rgb && c.trusted)
+        .collect();
+    let rgb = match rgb_candidates.as_slice() {
+        [] => {
+            let p = prompt_line("  no trusted RGB camera auto-detected. Enter RGB device path: ")?;
+            if p.is_empty() {
+                bail!("no RGB camera selected");
+            }
+            p
+        }
+        [only] => {
+            println!(
+                "  RGB camera: {} ({})",
+                only.path,
+                only.name.as_deref().unwrap_or("?")
+            );
+            only.path.clone()
+        }
+        many => {
+            for (i, c) in many.iter().enumerate() {
+                println!("    {}) {} ({})", i + 1, c.path, c.name.as_deref().unwrap_or("?"));
+            }
+            let sel = prompt_line(&format!("  pick RGB camera [1-{}] (default 1): ", many.len()))?;
+            let idx = sel.parse::<usize>().unwrap_or(1).clamp(1, many.len()) - 1;
+            many[idx].path.clone()
+        }
+    };
+
+    let ir_candidates: Vec<&linhello_biometrics::camera::CameraInfo> =
+        cams.iter().filter(|c| c.kind == CameraKind::Ir).collect();
+    let ir = match ir_candidates.as_slice() {
+        [] => {
+            println!("  IR camera: none (liveness uses the RGB anti-spoof model)");
+            None
+        }
+        [only] => {
+            println!("  IR camera: {}", only.path);
+            Some(only.path.clone())
+        }
+        many => {
+            for (i, c) in many.iter().enumerate() {
+                println!("    {}) {}", i + 1, c.path);
+            }
+            let sel = prompt_line(&format!(
+                "  pick IR camera [1-{}] (default 1, 0=none): ",
+                many.len()
+            ))?;
+            match sel.parse::<usize>().unwrap_or(1) {
+                0 => None,
+                n => Some(many[n.clamp(1, many.len()) - 1].path.clone()),
+            }
+        }
+    };
+    Ok((rgb, ir))
+}
+
+/// Capture a handful of genuine matches and recommend a threshold below the
+/// weakest one, then persist it to settings.conf.
+fn calibrate_threshold(user: &str) -> Result<()> {
+    const N: u32 = 8;
+    println!("  Capturing {N} samples to measure your genuine match scores.");
+    println!("  Look at the camera and stay roughly still; small movements are fine.");
+    let mut scores: Vec<f32> = Vec::new();
+    for i in 1..=N {
+        if i > 1 {
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        print!("    [{i}/{N}] ");
+        std::io::stdout().flush().ok();
+        match send(Request::Verify { user: user.to_string() }) {
+            Ok(Response::Verified { score, .. }) => {
+                println!("score {score:.3}");
+                scores.push(score);
+            }
+            Ok(Response::Error { message }) => println!("skip — {message}"),
+            Ok(other) => bail!("unexpected response: {other:?}"),
+            Err(e) => println!("skip — {e}"),
+        }
+    }
+    if scores.len() < 3 {
+        println!("  Not enough good captures to recommend a threshold; keeping current value.");
+        return Ok(());
+    }
+    let min = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+    let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+    let rec = (min - 0.05).clamp(0.45, 0.75);
+    println!();
+    println!("  genuine scores: min {min:.3}, mean {mean:.3}  (n={})", scores.len());
+    println!("  recommended threshold: {rec:.2}  (a margin below your weakest genuine match)");
+    let ans = prompt_line(&format!(
+        "  accept {rec:.2}? [Y/n], or type a value 0.45-0.85: "
+    ))?;
+    let chosen = if ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
+    {
+        rec
+    } else if let Ok(v) = ans.parse::<f32>() {
+        v.clamp(0.30, 0.95)
+    } else {
+        println!("  not understood; using recommended {rec:.2}");
+        rec
+    };
+    linhello_common::config::write_kv("settings.conf", "match_threshold", &format!("{chosen:.2}"))
+        .map_err(|e| anyhow::anyhow!("writing settings.conf: {e}"))?;
+    println!("  saved match_threshold={chosen:.2} to /etc/linhello/settings.conf");
+    Ok(())
+}
+
+fn run_setup() -> Result<()> {
+    require_root("setup")?;
+    println!("LinuxHello setup");
+    println!("================\n");
+
+    // Step 1 — readiness (reuse the daemon's capability report).
+    println!("Step 1/4 — checking hardware & software readiness");
+    match send(Request::Probe) {
+        Ok(Response::Capabilities { report }) => {
+            print_capability_report(&report);
+            if !report.can_run() {
+                bail!("a required capability is missing (see [FAIL]) — fix it and re-run setup");
+            }
+        }
+        Ok(Response::Error { message }) => bail!(message),
+        Ok(other) => bail!("unexpected response: {other:?}"),
+        Err(e) => bail!("cannot reach linhellod ({e}) — check `systemctl status linhellod`"),
+    }
+    println!();
+
+    // Step 2 — camera selection, persisted to cameras.conf.
+    println!("Step 2/4 — choose your camera");
+    let cams = linhello_biometrics::camera::enumerate();
+    let (rgb, ir) = choose_cameras(&cams)?;
+    linhello_biometrics::camera::write_cameras_conf(&rgb, ir.as_deref())?;
+    println!(
+        "  saved: rgb={rgb}{}",
+        ir.as_deref().map(|p| format!(", ir={p}")).unwrap_or_default()
+    );
+    restart_daemon()?; // bind the chosen devices before calibrating
+    println!();
+
+    // Step 3 — threshold calibration (needs an existing enrollment to score
+    // against; if none, we skip and let enrollment happen first).
+    let user = current_user()?;
+    println!("Step 3/4 — calibrate the match threshold");
+    if prompt_yes(&format!(
+        "  calibrate against {user}'s enrolled face now? (skip if not enrolled yet) [y/N] "
+    )) {
+        calibrate_threshold(&user)?;
+        restart_daemon()?;
+    } else {
+        println!("  skipped — using default/current threshold. Re-run setup after enrolling to tune.");
+    }
+    println!();
+
+    // Step 4 — optional enrollment.
+    println!("Step 4/4 — enrollment");
+    if prompt_yes(&format!("  enroll {user}'s face now? [y/N] ")) {
+        enroll_guided(&user, false, 5)?;
+    } else {
+        println!("  skipped — run `linhello enroll` when ready.");
+    }
+
+    println!("\nSetup complete. Try `linhello test`.");
     Ok(())
 }
 
@@ -252,6 +551,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Setup => run_setup()?,
         Cmd::Status => match send(Request::Status)? {
             Response::Status {
                 security_level,
@@ -268,30 +568,47 @@ fn main() -> Result<()> {
             }
             other => bail!("unexpected response: {other:?}"),
         },
-        Cmd::Enroll { user, reset } => {
+        Cmd::Enroll { user, reset, samples } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
-            match send(Request::Enroll {
-                user: user.clone(),
-                reset,
-            })? {
-                Response::Enrolled { samples } => {
-                    println!("enrolled: {user} ({samples} sample{})",
-                        if samples == 1 { "" } else { "s" });
-                }
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {other:?}"),
-            }
+            enroll_guided(&user, reset, samples.max(1))?;
         }
         Cmd::Verify { user } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
             match send(Request::Verify { user })? {
-                Response::Verified { matched, score } => {
-                    println!("match: {matched}  score: {score:.4}");
+                Response::Verified { matched, score, threshold } => {
+                    println!("match: {matched}  score: {score:.4}  threshold: {threshold:.4}");
                     if !matched {
                         std::process::exit(1);
                     }
                 }
                 Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        Cmd::Test { user } => {
+            let user = user.map(Ok).unwrap_or_else(current_user)?;
+            println!("Looking for your face — this is a safe test and cannot lock you out.");
+            match send(Request::Verify { user: user.clone() })? {
+                Response::Verified { matched, score, threshold } => {
+                    if matched {
+                        println!(
+                            "\u{2713} Recognized you, {user}  (score {score:.2} \u{2265} threshold {threshold:.2})"
+                        );
+                    } else {
+                        println!(
+                            "\u{2717} Did not recognize you  (score {score:.2} < threshold {threshold:.2})"
+                        );
+                        println!("  Login is unaffected. Sit at your usual distance and try again,");
+                        println!("  run `linhello enroll` to add samples, or `linhello setup` to retune.");
+                        std::process::exit(1);
+                    }
+                }
+                Response::Error { message } => {
+                    // A capture/liveness miss is a normal test outcome, not a crash.
+                    println!("\u{2717} {message}");
+                    println!("  (This is only a test — your login is unaffected.)");
+                    std::process::exit(1);
+                }
                 other => bail!("unexpected response: {other:?}"),
             }
         }
@@ -421,7 +738,7 @@ fn main() -> Result<()> {
                 latencies.push(elapsed);
 
                 match resp {
-                    Ok(Response::Verified { matched, score }) => {
+                    Ok(Response::Verified { matched, score, .. }) => {
                         if matched {
                             passed += 1;
                             scores.push(score);
@@ -534,15 +851,7 @@ fn main() -> Result<()> {
         },
         Cmd::Doctor => match send(Request::Probe)? {
             Response::Capabilities { report } => {
-                for c in &report.checks {
-                    let tag = match c.status {
-                        CapabilityStatus::Ok => "[ OK ]",
-                        CapabilityStatus::Warn => "[WARN]",
-                        CapabilityStatus::Missing if c.required => "[FAIL]",
-                        CapabilityStatus::Missing => "[ -- ]",
-                    };
-                    println!("{tag} {:<20} {}", c.name, c.detail);
-                }
+                print_capability_report(&report);
                 println!();
                 if !report.can_run() {
                     println!("verdict: CANNOT RUN — a required capability is missing (see [FAIL]).");
