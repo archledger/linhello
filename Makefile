@@ -60,8 +60,8 @@ install: all
 	install -Dm755 $(TARGET_DIR)/linhello     $(DESTDIR)$(BINDIR)/linhello
 	install -Dm755 $(RUST_PAM_LIB)          $(DESTDIR)$(PAMDIR)/liblinhello_pam.so
 	install -Dm755 $(PAM_SO)                $(DESTDIR)$(PAMDIR)/pam_linhello.so
-	install -Dm644 etc/systemd/linhellod.service \
-	    $(DESTDIR)$(SYSTEMDDIR)/linhellod.service
+	sed 's|/usr/local/bin|$(BINDIR)|g' etc/systemd/linhellod.service \
+	    | install -Dm644 /dev/stdin $(DESTDIR)$(SYSTEMDDIR)/linhellod.service
 	install -Dm644 etc/pam.d/linhello-auth \
 	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/linhello-auth
 	install -Dm644 etc/pam.d/examples/gdm-password \
@@ -76,8 +76,8 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/system-login
 	install -Dm755 scripts/linhello-reseal-hook \
 	    $(DESTDIR)$(BINDIR)/linhello-reseal-hook
-	install -Dm644 etc/pacman.d/hooks/linhello-reseal.hook \
-	    $(DESTDIR)/etc/pacman.d/hooks/linhello-reseal.hook
+	sed 's|/usr/local/bin|$(BINDIR)|g' etc/pacman.d/hooks/linhello-reseal.hook \
+	    | install -Dm644 /dev/stdin $(DESTDIR)/etc/pacman.d/hooks/linhello-reseal.hook
 	install -dm755 $(DESTDIR)$(CONFDIR)
 	@echo
 	@echo "Installed. Next:"

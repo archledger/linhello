@@ -3,6 +3,7 @@
 use crate::bio_err;
 use linhello_common::Result;
 use image::{ImageBuffer, Rgb};
+use std::sync::OnceLock;
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream;
 use v4l::io::traits::CaptureStream;
@@ -26,10 +27,17 @@ const IR_CAPTURE_HEIGHT: u32 = 400;
 /// RGB warmup: 5 frames at 30fps = 167ms. RGB face detection is
 /// lighting-invariant enough that AE doesn't need full convergence.
 const AE_WARMUP_RGB: usize = 5;
-/// IR warmup: 8 frames at 15fps = 533ms. The active NIR emitter needs
+/// IR warmup: default 8 frames at 15fps = 533ms. The active NIR emitter needs
 /// time to reach steady-state, and the face/bg ratio requires stable
-/// absolute intensity within the frame. 5 frames caused 100% FRR.
-const AE_WARMUP_IR: usize = 8;
+/// absolute intensity within the frame. 5 frames caused 100% FRR. Tunable via
+/// `LINHELLO_IR_WARMUP` for diagnosing emitter/exposure behaviour on a given
+/// camera.
+fn ae_warmup_ir() -> usize {
+    std::env::var("LINHELLO_IR_WARMUP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+}
 
 /// Capture a single frame from the selected RGB camera. Blocks until one
 /// frame is delivered or the device errors out.
@@ -37,15 +45,38 @@ pub fn capture_frame() -> Result<Frame> {
     capture_from(&rgb_device())
 }
 
-/// Capture a single frame from the selected IR companion sensor. Returns
-/// `Ok(None)` (not an error) if no IR device is present — laptops/cameras
-/// without a Windows-Hello-class IR sensor are supported, the IR signal just
-/// never contributes.
+/// Frames grabbed per IR capture; the NIR emitter strobes (frames alternate
+/// illuminated / ambient), so we keep the brightest = the emitter-on phase.
+const IR_BURST: usize = 6;
+
+/// Capture a frame from the IR companion sensor, or `Ok(None)` if there is no
+/// IR device. A brief one-shot — open → warm → short burst → brightest → close.
+/// Brief so it does NOT continuously contend with the RGB camera on shared-USB
+/// Windows-Hello modules (a persistent IR stream starved RGB capture), and
+/// burst-select so it lands on the emitter-on strobe phase rather than a dark
+/// ambient frame. The IR signal is advisory — a miss is just "no IR this sample".
 pub fn capture_ir_frame() -> Result<Option<IrFrame>> {
     match ir_device() {
         Some(path) => capture_ir_from(&path).map(Some),
         None => Ok(None),
     }
+}
+
+/// Cheap sampled mean luma of an IR frame — used to pick the bright strobe phase.
+fn ir_mean_luma(img: &IrFrame) -> f32 {
+    let data = img.as_raw();
+    if data.is_empty() {
+        return 0.0;
+    }
+    let step = (data.len() / 4096).max(1);
+    let (mut sum, mut n) = (0u64, 0u64);
+    let mut i = 0;
+    while i < data.len() {
+        sum += data[i] as u64;
+        n += 1;
+        i += step;
+    }
+    sum as f32 / n.max(1) as f32
 }
 
 // ── Camera discovery & selection ────────────────────────────────────────
@@ -57,8 +88,6 @@ pub fn capture_ir_frame() -> Result<Option<IrFrame>> {
 // by precedence: explicit env var → /etc/linhello/cameras.conf → auto-detect →
 // built-in default. The choice is cached for the process; re-plugging a camera
 // needs a daemon restart.
-
-use std::sync::OnceLock;
 
 /// What a video node is good for in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,18 +252,6 @@ pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
     let fmt = dev
         .set_format(&fmt)
         .map_err(|e| bio_err(format!("set format: {e}")))?;
-
-    let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
-        .map_err(|e| bio_err(format!("stream init: {e}")))?;
-    for _ in 0..AE_WARMUP_IR {
-        stream
-            .next()
-            .map_err(|e| bio_err(format!("IR warmup: {e}")))?;
-    }
-    let (buf, _meta) = stream
-        .next()
-        .map_err(|e| bio_err(format!("stream next: {e}")))?;
-
     if &fmt.fourcc.repr != b"GREY" {
         return Err(bio_err(format!(
             "unexpected IR pixel format: {:?}",
@@ -243,16 +260,34 @@ pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
     }
     let (w, h) = (fmt.width, fmt.height);
     let expected = (w * h) as usize;
-    if buf.len() < expected {
-        return Err(bio_err(format!(
-            "short IR buffer: got {}, expected {}",
-            buf.len(),
-            expected
-        )));
+
+    let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| bio_err(format!("stream init: {e}")))?;
+    for _ in 0..ae_warmup_ir() {
+        stream
+            .next()
+            .map_err(|e| bio_err(format!("IR warmup: {e}")))?;
     }
-    let img = ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, buf[..expected].to_vec())
-        .ok_or_else(|| bio_err("IR buffer dimensions mismatch"))?;
-    Ok(img)
+    // Grab a short burst and keep the brightest (emitter-on strobe phase).
+    let mut best: Option<(f32, IrFrame)> = None;
+    for _ in 0..IR_BURST {
+        let (buf, _meta) = stream
+            .next()
+            .map_err(|e| bio_err(format!("stream next: {e}")))?;
+        if buf.len() < expected {
+            continue;
+        }
+        if let Some(img) =
+            ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, buf[..expected].to_vec())
+        {
+            let m = ir_mean_luma(&img);
+            if best.as_ref().map(|(bm, _)| m > *bm).unwrap_or(true) {
+                best = Some((m, img));
+            }
+        }
+    }
+    best.map(|(_, img)| img)
+        .ok_or_else(|| bio_err("no IR frame captured"))
 }
 
 pub fn capture_from(path: &str) -> Result<Frame> {

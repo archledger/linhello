@@ -17,6 +17,9 @@ linhello-secureboot.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+# TUI setup wizard. Use ratatui's re-exported crossterm (`ratatui::crossterm`)
+# rather than a separate crossterm dep to avoid a backend version skew.
+ratatui = "0.29"
 rpassword = "7"
 zeroize.workspace = true
 tracing.workspace = true

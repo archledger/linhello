@@ -20,6 +20,7 @@ fn check(name: &str, status: CapabilityStatus, required: bool, detail: impl Into
 pub fn probe() -> CapabilityReport {
     let (rgb, ir) = camera_checks();
     let mut checks = vec![
+        platform_check(),
         tpm_check(),
         secure_boot_check(),
         boot_mode_check(),
@@ -158,23 +159,27 @@ fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
     (rgb_check, ir_check)
 }
 
+fn platform_check() -> CapabilityCheck {
+    use linhello_common::platform;
+    let detail = format!(
+        "{} · PAM modules: {} · initramfs: {}",
+        platform::distro_family().as_str(),
+        platform::pam_module_dir(),
+        platform::initramfs_tool(),
+    );
+    check("Platform", CapabilityStatus::Ok, false, detail)
+}
+
 fn onnxruntime_check() -> CapabilityCheck {
-    // pyke `ort` (load-dynamic) dlopens libonnxruntime.so at runtime.
+    // pyke `ort` (load-dynamic) dlopens libonnxruntime.so at runtime. Honour an
+    // explicit override, else resolve via the shared per-distro candidate list.
     if let Some(p) = std::env::var_os("ORT_DYLIB_PATH") {
         if Path::new(&p).exists() {
             return check("ONNX runtime", CapabilityStatus::Ok, true, p.to_string_lossy());
         }
     }
-    let candidates = [
-        "/usr/lib/libonnxruntime.so",
-        "/usr/lib64/libonnxruntime.so",
-        "/usr/local/lib/libonnxruntime.so",
-        "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
-    ];
-    for c in candidates {
-        if glob_exists(c) {
-            return check("ONNX runtime", CapabilityStatus::Ok, true, c);
-        }
+    if let Some(p) = linhello_common::platform::onnxruntime_dylib() {
+        return check("ONNX runtime", CapabilityStatus::Ok, true, p);
     }
     check(
         "ONNX runtime",
@@ -182,25 +187,6 @@ fn onnxruntime_check() -> CapabilityCheck {
         true,
         "libonnxruntime.so not found — install the `onnxruntime` package",
     )
-}
-
-/// True if `path` exists, or a versioned sibling (`path.1.x.y`) does.
-fn glob_exists(path: &str) -> bool {
-    if Path::new(path).exists() {
-        return true;
-    }
-    let p = Path::new(path);
-    let (Some(dir), Some(file)) = (p.parent(), p.file_name().and_then(|f| f.to_str())) else {
-        return false;
-    };
-    let prefix = format!("{file}.");
-    std::fs::read_dir(dir)
-        .ok()
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        })
-        .unwrap_or(false)
 }
 
 fn model_path(env: &str, default: &str) -> String {

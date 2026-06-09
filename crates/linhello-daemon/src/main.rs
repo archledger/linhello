@@ -44,8 +44,14 @@ use tokio::task;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to an `info` floor so the auth-decision trail (UnsealPassword
+    // outcomes, denials) lands in the journal without needing RUST_LOG set;
+    // RUST_LOG still overrides for deeper debugging.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let socket: PathBuf = parse_socket_arg().unwrap_or_else(socket_path);
@@ -207,6 +213,12 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
         .await
         .unwrap_or_else(err),
         Request::LivenessTest => task::spawn_blocking(do_liveness_test).await.unwrap_or_else(err),
+        // Detection-only geometry for the enrollment positioning guide. No
+        // secret, score, or pixels — unprivileged, like LivenessTest. Polled at
+        // a few Hz by the CLI, so it must stay cheap (no embed/IR/anti-spoof).
+        Request::PositionSample => {
+            task::spawn_blocking(do_position_sample).await.unwrap_or_else(err)
+        }
         Request::ResealUserEnvelopes { user } => {
             if !is_root(peer_uid) {
                 return forbidden("reseal_user_envelopes");
@@ -480,6 +492,7 @@ fn do_liveness_test() -> Response {
                     ir_std: report.signals.ir_std,
                     ir_highlight_frac: report.signals.ir_highlight_frac,
                     ir_face_bg_ratio: report.signals.ir_face_bg_ratio,
+                    ir_eye_glint: report.signals.ir_eye_glint,
                     face_frac: report.signals.face_frac,
                     yaw_deg: report.signals.yaw_deg,
                     pitch_deg: report.signals.pitch_deg,
@@ -487,6 +500,15 @@ fn do_liveness_test() -> Response {
                 },
             }
         }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_position_sample() -> Response {
+    match linhello_biometrics::capture_position_sample() {
+        Ok(report) => Response::Position { report },
         Err(e) => Response::Error {
             message: e.to_string(),
         },
@@ -557,26 +579,56 @@ fn do_seal_password(user: &str, password: SecretBytes) -> Response {
 }
 
 fn do_unseal_password(user: &str) -> Response {
+    // Audit trail for the PAM keyring-unlock path. Every line carries the
+    // "UnsealPassword" token so `scripts/linhello-keyring-diag` can prove a
+    // face-driven login (vs a typed-password fallback) after a reboot. We log
+    // the cosine score (not secret) but never the password or its length.
+    tracing::info!("UnsealPassword: attempt for user '{user}'");
     let samples = match load_user_samples(user) {
         Ok(s) => s,
-        Err(e) => return Response::Error { message: e },
+        Err(e) => {
+            tracing::warn!("UnsealPassword: no usable enrollment for '{user}': {e}");
+            return Response::Error { message: e };
+        }
     };
     let live = match linhello_biometrics::capture_and_embed() {
         Ok(v) => v,
-        Err(e) => return Response::Error { message: e.to_string() },
+        Err(e) => {
+            tracing::warn!("UnsealPassword: capture/liveness failed for '{user}': {e}");
+            return Response::Error { message: e.to_string() };
+        }
     };
     let r = linhello_biometrics::match_against(&live, &samples);
     if !r.matched {
+        tracing::warn!(
+            "UnsealPassword: face did not match for '{user}' (score {:.4}) -> denied",
+            r.score
+        );
         return Response::Error {
             message: format!("face mismatch (score {:.4})", r.score),
         };
     }
     match linhello_core::unseal_password(user) {
-        Ok(secret) => Response::PasswordUnsealed {
-            secret: SecretBytes::new(secret.to_vec()),
-        },
-        Err(e) => Response::Error {
-            message: e.to_string(),
-        },
+        Ok(secret) => {
+            tracing::info!(
+                "UnsealPassword: OK for '{user}', face matched (score {:.4}), password unsealed",
+                r.score
+            );
+            Response::PasswordUnsealed {
+                secret: SecretBytes::new(secret.to_vec()),
+            }
+        }
+        // Case 3: biometrics passed but the TPM could not release the secret
+        // (e.g. PCR drift). This is the line that explains a face login that
+        // nonetheless leaves the keyring locked.
+        Err(e) => {
+            tracing::error!(
+                "UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}",
+                r.score
+            );
+            Response::Error {
+                message: e.to_string(),
+            }
+        }
     }
 }

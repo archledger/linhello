@@ -98,6 +98,52 @@ pub enum Request {
     /// Probe the host for the hardware/software LinuxHello needs (TPM, Secure
     /// Boot, RGB/IR cameras, ONNX runtime, models). Unprivileged.
     Probe,
+    /// Capture one frame and return live framing geometry (face presence,
+    /// size, orientation, centering) for the enrollment positioning guide.
+    /// Detection-only: no embedding, match score, or image pixels leave the
+    /// daemon. Unprivileged; intended to be polled at a few Hz while the user
+    /// frames their face.
+    PositionSample,
+}
+
+/// Live framing geometry for the enrollment positioning guide
+/// ([`Request::PositionSample`]). Carries only detector geometry — never image
+/// pixels — so it is safe to send over the socket and to poll repeatedly. The
+/// gates that set `well_framed` mirror the auth path (`MIN_FACE_FRAC`,
+/// `MAX_ANGLE_DEG`), so "well framed" here implies enrollment will accept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionReport {
+    /// Number of faces detected in the frame.
+    pub face_count: u32,
+    pub frame_w: u32,
+    pub frame_h: u32,
+    /// Primary face bounding box `[x1, y1, x2, y2]` in frame pixels, if any.
+    pub bbox: Option<[f32; 4]>,
+    /// Face width / frame width (framing/distance signal).
+    pub face_frac: Option<f32>,
+    pub yaw_deg: Option<f32>,
+    pub pitch_deg: Option<f32>,
+    /// Mean luma (0–255) of the face region — lighting signal.
+    pub brightness: Option<f32>,
+    /// Relative sharpness of the face region (gradient energy); higher = crisper.
+    /// Camera-relative, not an absolute scale — used for blur/motion hints.
+    pub sharpness: Option<f32>,
+    /// Composite framing quality, 0–100, from size/centering/pose/lighting (+IR).
+    pub quality: u8,
+    /// An IR companion sensor is present and produced a frame this sample.
+    pub ir_present: bool,
+    /// Mean IR intensity over the face region (emitter illumination signal).
+    pub ir_brightness: Option<f32>,
+    /// IR face/background ratio — a real, emitter-lit face is brighter than its
+    /// surroundings (>1). The "IR can see your face" / liveness-ready signal.
+    pub ir_face_bg: Option<f32>,
+    /// True when RGB couldn't find the face but IR could — too dark for an RGB
+    /// enrollment capture, even though the IR camera sees you.
+    pub low_light: bool,
+    /// All framing gates pass — safe to capture an enrollment sample.
+    pub well_framed: bool,
+    /// One-line human guidance ("Move closer", "Hold still — ready to capture").
+    pub guidance: String,
 }
 
 /// Result of a single capability check in [`CapabilityReport`].
@@ -160,6 +206,8 @@ pub struct LivenessSummary {
     pub ir_std: Option<f32>,
     pub ir_highlight_frac: Option<f32>,
     pub ir_face_bg_ratio: Option<f32>,
+    /// Specular IR eye-glint strength (Phase 2 active-IR liveness probe).
+    pub ir_eye_glint: Option<f32>,
     pub face_frac: Option<f32>,
     pub yaw_deg: Option<f32>,
     pub pitch_deg: Option<f32>,
@@ -214,6 +262,9 @@ pub enum Response {
     },
     Capabilities {
         report: CapabilityReport,
+    },
+    Position {
+        report: PositionReport,
     },
     Error {
         message: String,

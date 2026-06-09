@@ -142,6 +142,9 @@ pub struct LivenessSignals {
     /// signal: a real face under the emitter is brighter than surroundings;
     /// a flat photo on a wall is not.
     pub ir_face_bg_ratio: Option<f32>,
+    /// Weaker-eye specular IR glint strength (Phase 2). High for a real cornea
+    /// reflecting the active emitter, low for a flat photo/screen.
+    pub ir_eye_glint: Option<f32>,
     /// Face bbox width / frame width. Gates the IR signal: we only
     /// trust IR when face_frac ≥ `ir::MIN_FACE_FRAC` (25%), otherwise
     /// the user is too far for active-NIR to discriminate a live face
@@ -174,6 +177,7 @@ impl LivenessSignals {
             ir_std: None,
             ir_highlight_frac: None,
             ir_face_bg_ratio: None,
+            ir_eye_glint: None,
             face_frac: None,
             yaw_deg: None,
             pitch_deg: None,
@@ -329,12 +333,13 @@ impl LivenessEvaluator {
         // for thresholds and rationale.
         if let Some(ir_frame) = ir {
             let rgb_size = (frame.width(), frame.height());
-            let s = ir::evaluate(ir_frame, bbox, rgb_size);
+            let s = ir::evaluate(ir_frame, bbox, rgb_size, landmarks);
             signals.ir_score = Some(s.ir_score);
             signals.ir_mean = Some(s.mean_face);
             signals.ir_std = Some(s.std_face);
             signals.ir_highlight_frac = Some(s.highlight_frac);
             signals.ir_face_bg_ratio = Some(s.face_bg_ratio);
+            signals.ir_eye_glint = Some(s.eye_glint);
 
             match ir::classify(&s, face_frac) {
                 ir::IrVerdict::Real => { /* IR passes; fall through to ML */ }

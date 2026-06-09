@@ -79,6 +79,12 @@ pub struct IrSignals {
     /// area reflects the same ambient IR as the surrounding surface.
     /// AE-gain-invariant — the main advantage over absolute thresholds.
     pub face_bg_ratio: f32,
+    /// Strength of the weaker eye's specular IR glint (brightest pixel minus
+    /// local mean in a small window at each eye landmark, min of the two). The
+    /// active emitter reflects off a real 3D cornea as a sharp highlight; a flat
+    /// photo/screen produces little or diffuse reflection. A strong active-IR
+    /// liveness cue — see Phase 2. Advisory until calibrated on hardware.
+    pub eye_glint: f32,
     pub ir_score: f32,
 }
 
@@ -116,8 +122,14 @@ pub fn classify(_s: &IrSignals, face_frac: f32) -> IrVerdict {
 /// to a few percent — close enough for a statistical signal. For a
 /// hard-gate-grade signal we'd cross-calibrate with a checkerboard.
 ///
-/// `rgb_size` is `(rgb_width, rgb_height)` in pixels.
-pub fn evaluate(ir: &GrayImage, rgb_bbox: [f32; 4], rgb_size: (u32, u32)) -> IrSignals {
+/// `rgb_size` is `(rgb_width, rgb_height)` in pixels. `landmarks` are the 5
+/// SCRFD points (RGB pixels) — eyes [0],[1] are used for the glint probe.
+pub fn evaluate(
+    ir: &GrayImage,
+    rgb_bbox: [f32; 4],
+    rgb_size: (u32, u32),
+    landmarks: &[[f32; 2]; 5],
+) -> IrSignals {
     let (rw, rh) = (rgb_size.0 as f32, rgb_size.1 as f32);
     let (iw, ih) = (ir.width() as f32, ir.height() as f32);
 
@@ -180,14 +192,46 @@ pub fn evaluate(ir: &GrayImage, rgb_bbox: [f32; 4], rgb_size: (u32, u32)) -> IrS
     let hi_ok = (hi_frac / MIN_HIGHLIGHT_FRAC).min(1.0);
     let ir_score = ratio_ok.min(hi_ok.max(0.5));
 
+    // Eye glints: search a window at each eye landmark (rescaled to IR) for the
+    // specular spike (brightest pixel − window mean), and require both eyes by
+    // taking the weaker. The window is generous (~1/8 of face width) because the
+    // RGB and IR sensors are parallax-offset, so the mapped eye point is only
+    // approximate; a tight window would miss the cornea.
+    let glint_r = (((x2 - x1) as i32) / 8).clamp(8, 28);
+    let eye_px = |lm: [f32; 2]| ((lm[0] * sx) as i32, (lm[1] * sy) as i32);
+    let (lx, ly) = eye_px(landmarks[0]);
+    let (rx, ry) = eye_px(landmarks[1]);
+    let eye_glint = eye_glint_at(ir, lx, ly, glint_r).min(eye_glint_at(ir, rx, ry, glint_r));
+
     IrSignals {
         mean_face: mean,
         std_face: std,
         highlight_frac: hi_frac,
         mean_bg,
         face_bg_ratio,
+        eye_glint,
         ir_score,
     }
+}
+
+/// Specular-glint strength in a window centred at `(cx, cy)`: brightest pixel
+/// minus the window mean. A sharp corneal reflection spikes well above the
+/// local baseline; a flat surface barely does.
+fn eye_glint_at(ir: &GrayImage, cx: i32, cy: i32, r: i32) -> f32 {
+    let (w, h) = (ir.width() as i32, ir.height() as i32);
+    let (mut sum, mut n, mut maxv) = (0u64, 0u64, 0u8);
+    for y in (cy - r).max(0)..=(cy + r).min(h - 1) {
+        for x in (cx - r).max(0)..=(cx + r).min(w - 1) {
+            let v = ir.get_pixel(x as u32, y as u32).0[0];
+            sum += v as u64;
+            n += 1;
+            maxv = maxv.max(v);
+        }
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    (maxv as f32 - sum as f32 / n as f32).max(0.0)
 }
 
 fn empty_signals() -> IrSignals {
@@ -197,6 +241,7 @@ fn empty_signals() -> IrSignals {
         highlight_frac: 0.0,
         mean_bg: 0.0,
         face_bg_ratio: 0.0,
+        eye_glint: 0.0,
         ir_score: 0.0,
     }
 }
@@ -212,8 +257,21 @@ mod tests {
             highlight_frac,
             mean_bg: 100.0,
             face_bg_ratio,
+            eye_glint: 0.0,
             ir_score: 0.0,
         }
+    }
+
+    #[test]
+    fn eye_glint_detects_specular_spike() {
+        use image::{GrayImage, Luma};
+        // Flat grey image → no glint.
+        let flat = GrayImage::from_pixel(64, 64, Luma([90]));
+        assert_eq!(super::eye_glint_at(&flat, 32, 32, 5), 0.0);
+        // Add a bright specular spot at (32,32) → glint spikes.
+        let mut spot = GrayImage::from_pixel(64, 64, Luma([90]));
+        spot.put_pixel(32, 32, Luma([255]));
+        assert!(super::eye_glint_at(&spot, 32, 32, 5) > 100.0);
     }
 
     #[test]

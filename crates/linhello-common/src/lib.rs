@@ -3,6 +3,7 @@
 pub mod client;
 pub mod config;
 pub mod ipc;
+pub mod platform;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

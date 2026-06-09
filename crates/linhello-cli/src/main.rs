@@ -9,6 +9,10 @@ use std::io::Write as _;
 use std::process::Command;
 use std::time::Duration;
 
+mod install;
+mod pamwire;
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "linhello", version, about = "LinuxHello control CLI")]
 struct Cli {
@@ -19,6 +23,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Status,
+    /// Detect whether LinuxHello is already installed and set up on this host
+    /// (binaries, daemon, models, camera, enrolled users, login wiring). Local
+    /// and read-only — needs no daemon and no root. Exit status: 0 = already
+    /// configured, 10 = installed but not enrolled, 20 = nothing installed.
+    Detect,
     /// First-run wizard: pick your webcam, calibrate the match threshold against
     /// your own live scores, and (optionally) enroll. Writes
     /// /etc/linhello/{cameras.conf,settings.conf} and restarts the daemon, so
@@ -65,6 +74,25 @@ enum Cmd {
     /// Probe this machine for the hardware/software LinuxHello needs (TPM, Secure
     /// Boot, RGB/IR cameras, ONNX runtime, models) and report readiness.
     Doctor,
+    /// Full-screen setup wizard (TUI). Same steps as `setup`, but interactive.
+    /// Requires a terminal; falls back to `linhello setup` when piped.
+    Tui,
+    /// Wire face login into the system PAM stacks (per distro), or report/remove
+    /// it. Edits /etc/pam.d on Arch (with backups); prints the pam-auth-update /
+    /// authselect steps on Debian/Fedora. The password + TTY escape always stay.
+    Pam {
+        #[command(subcommand)]
+        action: PamAction,
+    },
+    /// Live face-framing guide: shows whether the camera sees your face and
+    /// guides you into position (distance, centering, head angle) before you
+    /// enroll — so you don't have to open a separate camera app first. Polls
+    /// the daemon a few times a second; press Ctrl-C to stop. `--once` prints a
+    /// single reading and exits (useful for scripting/tests).
+    Position {
+        #[arg(long)]
+        once: bool,
+    },
     /// Capture one frame and print raw liveness signals (ML spoof score,
     /// camera trust). Use to tune `LINHELLO_SPOOF_THRESHOLD` or diagnose
     /// false rejects.
@@ -115,6 +143,26 @@ enum SbAction {
     Verify,
     /// Run `sbctl list-files` — show the sbctl signing record.
     List,
+}
+
+#[derive(Subcommand)]
+enum PamAction {
+    /// Show which PAM services currently have face-auth wired in.
+    Status,
+    /// Wire face-auth into the graphical greeter (and optionally sudo).
+    Enable {
+        /// Also wire face-auth into `sudo`.
+        #[arg(long)]
+        sudo: bool,
+        /// Show what would change without editing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove face-auth from the PAM stacks.
+    Disable {
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn current_user() -> Result<String> {
@@ -176,6 +224,26 @@ fn require_root(op: &str) -> Result<()> {
         bail!("`{op}` must run as root (got uid {uid}) — re-run with sudo");
     }
     Ok(())
+}
+
+/// Print the host's LinuxHello install/configuration state and exit with a
+/// machine-readable status code (0 configured / 10 installed-not-enrolled /
+/// 20 not installed). Read-only; no daemon or root required.
+fn detect_cmd() -> ! {
+    let st = install::InstallState::detect();
+    println!("{}", st.headline());
+    println!();
+    for line in st.detail_lines() {
+        println!("  {line}");
+    }
+    let code = if st.is_configured() {
+        0
+    } else if st.is_installed() {
+        10
+    } else {
+        20
+    };
+    std::process::exit(code);
 }
 
 /// Read one trimmed line from stdin. Empty on EOF.
@@ -552,6 +620,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Setup => run_setup()?,
+        Cmd::Detect => detect_cmd(),
         Cmd::Status => match send(Request::Status)? {
             Response::Status {
                 security_level,
@@ -679,6 +748,7 @@ fn main() -> Result<()> {
                     fmt_opt_n(summary.ir_std, 1),
                     fmt_opt_n(summary.ir_highlight_frac, 3),
                 );
+                println!("IR eye-glint   : {}", fmt_opt_n(summary.ir_eye_glint, 1));
                 println!(
                     "face coverage  : {}",
                     summary
@@ -865,6 +935,131 @@ fn main() -> Result<()> {
             Response::Error { message } => bail!(message),
             other => bail!("unexpected response: {other:?}"),
         },
+        Cmd::Position { once } => run_position(once)?,
+        Cmd::Tui => {
+            require_root("tui")?;
+            let user = current_user().unwrap_or_default();
+            tui::run(user)?;
+        }
+        Cmd::Pam { action } => match action {
+            PamAction::Status => pam_status_cmd(),
+            PamAction::Enable { sudo, dry_run } => pam_enable_cmd(sudo, dry_run)?,
+            PamAction::Disable { dry_run } => pam_disable_cmd(dry_run)?,
+        },
+    }
+    Ok(())
+}
+
+fn pam_status_cmd() {
+    let status = pamwire::status();
+    if status.is_empty() {
+        println!("no greeter/sudo PAM services found under /etc/pam.d");
+        return;
+    }
+    println!("face-auth PAM wiring:");
+    for s in status {
+        println!("  [{}] {}", if s.wired { "on " } else { "off" }, s.path.display());
+    }
+}
+
+fn pam_enable_cmd(sudo: bool, dry_run: bool) -> Result<()> {
+    if !dry_run {
+        require_root("pam enable")?;
+    }
+    for c in pamwire::enable(sudo, dry_run)? {
+        println!("  {}", c.describe());
+    }
+    if !dry_run {
+        println!();
+        println!("Escape hatch preserved: face-auth is a fallback — if the camera or TPM");
+        println!("is unavailable you can still type your password, and the TTY login");
+        println!("(Ctrl+Alt+F2) is left untouched. `linhello pam disable` reverts this.");
+    }
+    Ok(())
+}
+
+fn pam_disable_cmd(dry_run: bool) -> Result<()> {
+    if !dry_run {
+        require_root("pam disable")?;
+    }
+    for c in pamwire::disable(dry_run)? {
+        println!("  {}", c.describe());
+    }
+    Ok(())
+}
+
+/// Live framing guide. Polls `PositionSample` and renders one-line guidance.
+/// Exits after the framing has been good for a short streak (or immediately
+/// with `--once`).
+fn run_position(once: bool) -> Result<()> {
+    use linhello_common::ipc::PositionReport;
+    use std::io::Write;
+
+    let render = |r: &PositionReport| -> String {
+        let ir = if r.ir_present {
+            format!(
+                "ir {:>3.0}/{:.1}",
+                r.ir_brightness.unwrap_or(0.0),
+                r.ir_face_bg.unwrap_or(0.0)
+            )
+        } else {
+            "ir --".to_string()
+        };
+        let nums = match (r.face_frac, r.yaw_deg, r.pitch_deg) {
+            (Some(f), Some(y), Some(p)) => format!(
+                "q{:>3}%  face {:>3.0}%  yaw {:>+5.1}  pitch {:>+5.1}  lum {:>3.0}  {ir}",
+                r.quality,
+                f * 100.0,
+                y,
+                p,
+                r.brightness.unwrap_or(0.0),
+            ),
+            _ => format!("faces: {}  {ir}", r.face_count),
+        };
+        let mark = if r.well_framed { "OK " } else { "..." };
+        // Pad to a fixed width so the carriage-return overwrite leaves no
+        // stale characters when the message shrinks.
+        format!("[{mark}] {:<46} {:<46}", r.guidance, nums)
+    };
+
+    if once {
+        match send(Request::PositionSample)? {
+            Response::Position { report } => {
+                println!("{}", render(&report).trim_end());
+                if !report.well_framed {
+                    std::process::exit(1);
+                }
+            }
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response: {other:?}"),
+        }
+        return Ok(());
+    }
+
+    println!("Live framing guide — position your face; press Ctrl-C when done.\n");
+    let mut good_streak = 0u32;
+    loop {
+        match send(Request::PositionSample) {
+            Ok(Response::Position { report }) => {
+                print!("\r{}", render(&report));
+                let _ = std::io::stdout().flush();
+                good_streak = if report.well_framed { good_streak + 1 } else { 0 };
+                if good_streak >= 5 {
+                    println!("\n\nWell framed for a moment — you're set. Run `linhello enroll` to capture.");
+                    break;
+                }
+            }
+            Ok(Response::Error { message }) => {
+                print!("\r[err] {message:<74}");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(other) => bail!("unexpected response: {other:?}"),
+            Err(e) => {
+                eprintln!("\ndaemon: {e}");
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
     }
     Ok(())
 }

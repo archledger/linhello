@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
+#include <syslog.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,12 +31,20 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     uint8_t buf[512];
     int n = linhello_unseal_keyring(user, buf, sizeof(buf));
     if (n <= 0) {
+        /* Face verify / TPM unseal declined. The daemon journal (linhellod,
+         * "UnsealPassword: ...") carries the precise reason; here we just record
+         * that this login fell through to the next module. */
+        pam_syslog(pamh, LOG_NOTICE,
+                   "face auth declined for user '%s'; deferring to next auth module",
+                   user);
         linhello_zero_buf(buf, sizeof(buf));
         return PAM_AUTH_ERR;
     }
 
     /* PAM_AUTHTOK must be a NUL-terminated string */
     if ((size_t)n >= sizeof(buf)) {
+        pam_syslog(pamh, LOG_ERR,
+                   "unsealed secret too large for buffer for user '%s'", user);
         linhello_zero_buf(buf, sizeof(buf));
         return PAM_AUTH_ERR;
     }
@@ -44,7 +53,20 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     int rc = pam_set_item(pamh, PAM_AUTHTOK, (const void *)buf);
     linhello_zero_buf(buf, sizeof(buf));
 
-    return (rc == PAM_SUCCESS) ? PAM_SUCCESS : PAM_AUTH_ERR;
+    if (rc != PAM_SUCCESS) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "face matched but pam_set_item(PAM_AUTHTOK) failed for user '%s'",
+                   user);
+        return PAM_AUTH_ERR;
+    }
+
+    /* Success: AUTHTOK now holds the unsealed login password so a downstream
+     * pam_gnome_keyring `use_authtok` can unlock the login keyring. This is the
+     * decisive "a face login happened in this transaction" line. */
+    pam_syslog(pamh, LOG_NOTICE,
+               "face auth succeeded for user '%s'; PAM_AUTHTOK set for keyring unlock",
+               user);
+    return PAM_SUCCESS;
 }
 
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,
@@ -99,7 +121,17 @@ PAM_EXTERN int pam_sm_chauthtok(pam_handle_t *pamh, int flags,
     int rc = linhello_reseal_password(user, buf, n);
     linhello_zero_buf(buf, sizeof(buf));
 
-    /* `optional` module: never fail the password change itself. */
-    (void)rc;
+    /* `optional` module: never fail the password change itself, but leave a
+     * breadcrumb so a silently-stale envelope is diagnosable. */
+    if (rc == 0) {
+        pam_syslog(pamh, LOG_NOTICE,
+                   "resealed password envelope for user '%s' after password change",
+                   user);
+    } else {
+        pam_syslog(pamh, LOG_WARNING,
+                   "could not reseal password envelope for user '%s' (rc=%d); "
+                   "run 'linhello seal-password' to re-sync face auth",
+                   user, rc);
+    }
     return PAM_SUCCESS;
 }

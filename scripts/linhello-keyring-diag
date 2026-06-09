@@ -9,6 +9,14 @@ set -uo pipefail
 
 sep() { printf '\n===== %s =====\n' "$1"; }
 
+# Read this boot's journal ONCE. Every check below greps this snapshot instead
+# of re-invoking journalctl, so the verdict can't disagree with the log it
+# prints (the old script read journalctl twice and turned the second read's
+# exit status into a hard yes/no — fragile while a cold boot is still flushing
+# its runtime->persistent journal, which produced false "keyring LOCKED" calls).
+JB="$(journalctl -b 0 2>/dev/null || true)"
+jgrep() { printf '%s\n' "$JB" | grep "$@"; }
+
 sep "boot / login timing"
 who -b 2>/dev/null
 echo "uptime: $(uptime -p 2>/dev/null)"
@@ -17,35 +25,47 @@ echo "current user: $USER (uid $(id -u))"
 sep "gkr-pam / gnome-keyring / face-auth — THIS boot"
 # Name-agnostic: matches both the old (aegyrad/pam_faceauth) and new
 # (linhellod/pam_linhello) naming, plus the IPC op that releases the password.
-journalctl -b 0 2>/dev/null \
-  | grep -iE 'gkr-pam|gnome-keyring-daemon|pam_(faceauth|linhello)|UnsealPassword|aegyrad|linhellod' \
+jgrep -iE 'gkr-pam|gnome-keyring-daemon|pam_(faceauth|linhello)|UnsealPassword|aegyrad|linhellod' \
   | grep -ivE 'register item|X-GNOME-Autostart|Setenv interface|Secret Service was already' \
   | tail -40
 
-sep "decisive line — did the login keyring unlock this boot?"
-if journalctl -b 0 2>/dev/null | grep -qi 'gkr-pam: unlocked login keyring'; then
-  echo "FOUND: 'unlocked login keyring' present this boot."
-  journalctl -b 0 2>/dev/null | grep -i 'gkr-pam:' | tail -8
-else
-  echo "NOT FOUND: no 'unlocked login keyring' this boot -> keyring stayed LOCKED."
-fi
+# --- gather the three independent signals -----------------------------------
 
+# (1) live, authoritative signal: can we actually use the keyring right now?
+KEYRING_USABLE=unknown   # yes | no | unknown
 sep "is the keyring actually usable right now? (secret-tool round-trip)"
 if command -v secret-tool >/dev/null 2>&1; then
   if secret-tool store --label='linhello-diag' linhello diag 2>/dev/null <<<'diag-secret-value'; then
     got=$(secret-tool lookup linhello diag 2>/dev/null)
     if [ "$got" = "diag-secret-value" ]; then
       echo "OK: stored+read a secret -> login keyring is UNLOCKED and usable."
+      KEYRING_USABLE=yes
       secret-tool clear linhello diag 2>/dev/null
     else
       echo "PARTIAL: store succeeded but read mismatch ('$got')."
     fi
   else
     echo "BLOCKED: secret-tool store failed -> keyring is LOCKED (a prompt likely appeared)."
+    KEYRING_USABLE=no
   fi
 else
   echo "secret-tool not installed (pkg: libsecret). Skipping live check."
 fi
+
+# NOTE: do not use `grep -q` on the consuming side of these pipes. With
+# `set -o pipefail`, grep -q exits on first match and closes the pipe; the
+# upstream `printf "$JB"` then gets EPIPE and the pipeline reports failure even
+# though it matched. Drain fully into $(...) and test for non-empty instead.
+
+# (2) log corroboration: did gkr-pam report unlocking the login keyring?
+LOG_UNLOCK=no
+[ -n "$(jgrep -i 'gkr-pam: unlocked login keyring')" ] && LOG_UNLOCK=yes
+
+# (3) did the linhello / face path leave ANY trace this boot? This is what
+# distinguishes a face login (Case 4) from a typed-password login (Case 1).
+# Today linhello can succeed silently, so absence is inconclusive, not proof.
+LINHELLO_TRACE=no
+[ -n "$(jgrep -iE 'pam_(faceauth|linhello)|UnsealPassword|linhellod(\[[0-9]+\])?:|face (auth|match)')" ] && LINHELLO_TRACE=yes
 
 sep "daemon + socket state"
 for svc in linhellod aegyrad; do
@@ -60,14 +80,40 @@ done
 sep "keyring files"
 ls -la "$HOME/.local/share/keyrings/" 2>/dev/null
 
+# --- decisive verdict: live test wins; log + trace explain WHY ---------------
+sep "decisive verdict"
+echo "signals: keyring_usable=$KEYRING_USABLE  log_unlock=$LOG_UNLOCK  linhello_trace=$LINHELLO_TRACE"
+echo
+if [ "$KEYRING_USABLE" = yes ]; then
+  echo "RESULT: login keyring is UNLOCKED and usable this boot."
+  [ "$LOG_UNLOCK" = yes ] \
+    && echo "  corroborated by journal: 'gkr-pam: unlocked login keyring'." \
+    || echo "  note: secret-tool says unlocked but no gkr-pam unlock line was found"
+  echo "        -> the live test is authoritative; trust it over the log."
+  if [ "$LINHELLO_TRACE" = no ]; then
+    echo "  caveat: NO linhello/face/UnsealPassword trace this boot, so this script"
+    echo "          cannot itself prove the unlock came from a FACE login vs a typed"
+    echo "          password. If you logged in FACE-ONLY, this is Case 4: RESOLVED."
+  fi
+elif [ "$KEYRING_USABLE" = no ]; then
+  echo "RESULT: login keyring is LOCKED right now."
+  echo "  -> Case 2 (stashed password didn't match the keyring) or Case 3"
+  echo "     (UnsealPassword failed at boot). Check the gkr-pam/UnsealPassword"
+  echo "     lines in the face-auth section above."
+else
+  echo "RESULT: inconclusive (could not run the live secret-tool test)."
+  echo "  log_unlock=$LOG_UNLOCK is the only signal; install libsecret to disambiguate."
+fi
+
 sep "interpretation hint"
 cat <<'EOF'
-- 'unlocked login keyring' FOUND + secret-tool OK  -> keyring works on this login.
-    If you logged in with FACE ONLY, the after-reboot bug is RESOLVED (Case 4).
-- 'unlocked login keyring' FOUND but you actually TYPED your password to get in
+- keyring_usable=yes + you logged in FACE-ONLY -> after-reboot bug RESOLVED (Case 4).
+- keyring_usable=yes but you actually TYPED your password to get in
     -> face auth failed at cold boot; keyring was unlocked by the typed pw (Case 1:
     boot-timing / daemon-not-warm, not a keyring bug).
-- NOT FOUND + secret-tool BLOCKED -> face login succeeded but stashed password did
-    not match the keyring (Case 2: keyring needs re-keying) OR UnsealPassword failed
-    at boot (Case 3). Check the daemon lines above for an UnsealPassword error.
+- keyring_usable=no -> face login succeeded but stashed password did not match the
+    keyring (Case 2: keyring needs re-keying) OR UnsealPassword failed at boot
+    (Case 3). Check the daemon/UnsealPassword lines above.
+- linhello_trace=no means linhello unlocked silently; add a log line at its PAM
+    UnsealPassword + auth-decision points so future runs prove face-vs-password.
 EOF
