@@ -28,6 +28,21 @@ enum Cmd {
     /// and read-only — needs no daemon and no root. Exit status: 0 = already
     /// configured, 10 = installed but not enrolled, 20 = nothing installed.
     Detect,
+    /// List the enrolled profiles (identities with a stored face), their
+    /// friendly names, sample counts, and whether they can unlock a keyring.
+    Profiles,
+    /// Look at the camera: identify which enrolled profile your face matches
+    /// (1:N). Tells you "this face belongs to <profile>" with the score, or
+    /// reports no match. Root-only (it reveals identity).
+    Identify,
+    /// Give an enrolled profile a friendly name (e.g. "Ben — work"). An empty
+    /// name clears it. Root-only.
+    ProfileName {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        name: String,
+    },
     /// First-run wizard: pick your webcam, calibrate the match threshold against
     /// your own live scores, and (optionally) enroll. Writes
     /// /etc/linhello/{cameras.conf,settings.conf} and restarts the daemon, so
@@ -244,6 +259,92 @@ fn detect_cmd() -> ! {
         20
     };
     std::process::exit(code);
+}
+
+/// `linhello profiles` — list enrolled identities.
+fn profiles_cmd() -> Result<()> {
+    match send(Request::ListProfiles)? {
+        Response::Profiles { profiles } => {
+            if profiles.is_empty() {
+                println!("no enrolled profiles yet — run `linhello enroll` or `linhello setup`");
+                return Ok(());
+            }
+            println!("{:<16} {:<22} {:>7}  keyring", "profile", "name", "samples");
+            for p in profiles {
+                println!(
+                    "{:<16} {:<22} {:>7}  {}",
+                    p.user,
+                    p.name.as_deref().unwrap_or("—"),
+                    p.samples,
+                    if p.has_password { "yes" } else { "no" },
+                );
+            }
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// `linhello identify` — 1:N "which face is this".
+fn identify_cmd() -> Result<()> {
+    println!("Look at the camera…");
+    match send(Request::Identify)? {
+        Response::Identified {
+            best,
+            threshold,
+            candidates,
+        } => {
+            match &best {
+                Some(c) => {
+                    let label = c.name.clone().unwrap_or_else(|| c.user.clone());
+                    println!(
+                        "This face belongs to: {label} (profile '{}', score {:.3} ≥ {:.2})",
+                        c.user, c.score, threshold
+                    );
+                }
+                None => {
+                    let top = candidates.first();
+                    match top {
+                        Some(c) => println!(
+                            "No match — closest was '{}' at {:.3} (need {:.2}).",
+                            c.user, c.score, threshold
+                        ),
+                        None => println!("No match."),
+                    }
+                }
+            }
+            if candidates.len() > 1 {
+                println!("\nall candidates (best first):");
+                for c in &candidates {
+                    let nm = c.name.as_deref().unwrap_or("—");
+                    println!("  {:<16} {:<20} {:.3}", c.user, nm, c.score);
+                }
+            }
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// `linhello profile-name --user U --name N` — set/clear a friendly name.
+fn profile_name_cmd(user: &str, name: &str) -> Result<()> {
+    match send(Request::SetProfileName {
+        user: user.to_string(),
+        name: name.to_string(),
+    })? {
+        Response::ProfileNameSet => {
+            if name.trim().is_empty() {
+                println!("cleared name for profile '{user}'");
+            } else {
+                println!("profile '{user}' is now named \"{}\"", name.trim());
+            }
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
 }
 
 /// Read one trimmed line from stdin. Empty on EOF.
@@ -621,6 +722,9 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Setup => run_setup()?,
         Cmd::Detect => detect_cmd(),
+        Cmd::Profiles => profiles_cmd()?,
+        Cmd::Identify => identify_cmd()?,
+        Cmd::ProfileName { user, name } => profile_name_cmd(&user, &name)?,
         Cmd::Status => match send(Request::Status)? {
             Response::Status {
                 security_level,

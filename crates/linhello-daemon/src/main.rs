@@ -1,6 +1,8 @@
 //! Root-privileged service: enrollment, TPM sealing, and IPC over /run/linhello.sock.
 
-use linhello_common::ipc::{LivenessSummary, Request, Response, SecretBytes};
+use linhello_common::ipc::{
+    IdentifyCandidate, LivenessSummary, ProfileInfo, Request, Response, SecretBytes,
+};
 use linhello_liveness::device_binding::{CameraBinding, DeviceIdentity};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -230,6 +232,29 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        // Metadata only (names, sample counts) — no biometrics, unprivileged.
+        Request::ListProfiles => {
+            task::spawn_blocking(do_list_profiles).await.unwrap_or_else(err)
+        }
+        // 1:N identification is an identity oracle, so it is root-only —
+        // an administrative/setup operation, like Enroll.
+        Request::Identify => {
+            if !is_root(peer_uid) {
+                return forbidden("identify");
+            }
+            task::spawn_blocking(do_identify).await.unwrap_or_else(err)
+        }
+        Request::SetProfileName { user, name } => {
+            if !is_root(peer_uid) {
+                return forbidden("set_profile_name");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            task::spawn_blocking(move || do_set_profile_name(&user, &name))
+                .await
+                .unwrap_or_else(err)
+        }
     }
 }
 
@@ -401,6 +426,167 @@ fn load_user_samples(user: &str) -> std::result::Result<Vec<Vec<f32>>, String> {
         .map_err(|e| format!("template key unavailable ({e}); refusing plaintext fallback"))?;
     let raw = linhello_core::load_encrypted_embedding(user, &key).map_err(|e| e.to_string())?;
     linhello_biometrics::parse_embeddings(&raw).map_err(|e| e.to_string())
+}
+
+/// Per-profile friendly-name file. Not secret (it's a label), so 0644 — the
+/// template and envelopes alongside it stay 0600.
+fn profile_name_path(user: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+        .join(user)
+        .join("display_name")
+}
+
+fn read_profile_name(user: &str) -> Option<String> {
+    std::fs::read_to_string(profile_name_path(user))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Enrolled profiles: directories under `CONFIG_ROOT` holding a face template
+/// (`embedding.enc`, or legacy `embedding.bin`). Sorted for stable output.
+fn enrolled_profiles() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(linhello_common::CONFIG_ROOT) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir = ent.path();
+        if dir.join("embedding.enc").exists() || dir.join("embedding.bin").exists() {
+            if let Some(name) = ent.file_name().to_str() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Best-effort sample count from the encrypted template's size, without
+/// decrypting: layout is `[12B nonce][ciphertext + 16B GCM tag]` and the
+/// plaintext is `samples × EMBEDDING_DIM × 4` (see `core::crypto`).
+fn profile_sample_count(user: &str) -> usize {
+    let stride = linhello_biometrics::enroll::EMBEDDING_DIM * 4;
+    let enc = std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+        .join(user)
+        .join("embedding.enc");
+    if let Ok(meta) = std::fs::metadata(&enc) {
+        let overhead = 12 + 16;
+        return (meta.len() as usize).saturating_sub(overhead) / stride;
+    }
+    // Legacy plaintext template: size is an exact multiple of the stride.
+    let legacy = std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+        .join(user)
+        .join("embedding.bin");
+    std::fs::metadata(&legacy)
+        .map(|m| m.len() as usize / stride)
+        .unwrap_or(0)
+}
+
+fn do_list_profiles() -> Response {
+    let profiles = enrolled_profiles()
+        .into_iter()
+        .map(|user| {
+            let has_password = std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+                .join(&user)
+                .join("password_envelope.json")
+                .exists();
+            ProfileInfo {
+                name: read_profile_name(&user),
+                samples: profile_sample_count(&user),
+                has_password,
+                user,
+            }
+        })
+        .collect();
+    Response::Profiles { profiles }
+}
+
+fn do_set_profile_name(user: &str, name: &str) -> Response {
+    // Require the profile to exist so a typo doesn't create an orphan label.
+    if !enrolled_profiles().iter().any(|u| u == user) {
+        return Response::Error {
+            message: format!("no enrolled profile '{user}'"),
+        };
+    }
+    let path = profile_name_path(user);
+    let trimmed = name.trim();
+    let result = if trimmed.is_empty() {
+        // Empty name clears the label.
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        std::fs::write(&path, format!("{trimmed}\n")).and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            }
+            #[cfg(not(unix))]
+            Ok(())
+        })
+    };
+    match result {
+        Ok(()) => Response::ProfileNameSet,
+        Err(e) => Response::Error {
+            message: format!("set profile name: {e}"),
+        },
+    }
+}
+
+/// 1:N identification — capture one live face and score it against every
+/// enrolled profile, returning the best match and the full ranked list. Each
+/// profile is loaded through the same fail-closed encrypted path as auth, so a
+/// profile whose template key can't unseal is skipped (logged), not matched.
+fn do_identify() -> Response {
+    let profiles = enrolled_profiles();
+    if profiles.is_empty() {
+        return Response::Error {
+            message: "no enrolled profiles to identify against".into(),
+        };
+    }
+    let live = match linhello_biometrics::capture_and_embed() {
+        Ok(v) => v,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+    let mut candidates: Vec<IdentifyCandidate> = Vec::new();
+    for user in &profiles {
+        match load_user_samples(user) {
+            Ok(samples) => {
+                let r = linhello_biometrics::match_against(&live, &samples);
+                candidates.push(IdentifyCandidate {
+                    name: read_profile_name(user),
+                    user: user.clone(),
+                    score: r.score,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("identify: skipping profile '{user}': {e}");
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Response::Error {
+            message: "no profile templates could be read (TPM/PCR state?)".into(),
+        };
+    }
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let threshold = linhello_biometrics::match_threshold();
+    let best = candidates
+        .first()
+        .filter(|c| c.score >= threshold)
+        .cloned();
+    Response::Identified {
+        best,
+        threshold,
+        candidates,
+    }
 }
 
 fn do_unseal(user: &str) -> Response {

@@ -104,6 +104,40 @@ pub enum Request {
     /// daemon. Unprivileged; intended to be polled at a few Hz while the user
     /// frames their face.
     PositionSample,
+    /// List the enrolled profiles (identities with a stored face template)
+    /// plus their friendly names and sample counts. Metadata only — no
+    /// biometrics. Unprivileged.
+    ListProfiles,
+    /// Capture one frame and identify which enrolled profile it best matches
+    /// (1:N). Returns the best profile and a ranked candidate list. Root-only:
+    /// it is an identity oracle, so it stays an administrative/setup operation.
+    Identify,
+    /// Set (or clear, with an empty name) a profile's friendly display name.
+    /// Root-only.
+    SetProfileName { user: String, name: String },
+}
+
+/// One enrolled identity, as reported by [`Request::ListProfiles`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileInfo {
+    /// Storage name (the directory under `CONFIG_ROOT`, and the PAM user when
+    /// wired into login).
+    pub user: String,
+    /// Friendly display name, if the operator set one.
+    pub name: Option<String>,
+    /// Number of stored face samples.
+    pub samples: usize,
+    /// A sealed login-password envelope exists (so this profile can unlock a
+    /// keyring on login).
+    pub has_password: bool,
+}
+
+/// One scored candidate in an [`Request::Identify`] result, best first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifyCandidate {
+    pub user: String,
+    pub name: Option<String>,
+    pub score: f32,
 }
 
 /// Live framing geometry for the enrollment positioning guide
@@ -266,6 +300,18 @@ pub enum Response {
     Position {
         report: PositionReport,
     },
+    Profiles {
+        profiles: Vec<ProfileInfo>,
+    },
+    /// Result of [`Request::Identify`]. `best` is `None` when no profile cleared
+    /// the threshold; `candidates` is always the full ranked list (best first)
+    /// so the caller can show near-misses.
+    Identified {
+        best: Option<IdentifyCandidate>,
+        threshold: f32,
+        candidates: Vec<IdentifyCandidate>,
+    },
+    ProfileNameSet,
     Error {
         message: String,
     },
