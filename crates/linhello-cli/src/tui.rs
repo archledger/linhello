@@ -17,7 +17,10 @@
 
 use linhello_biometrics::camera::{self, CameraInfo, CameraKind};
 use linhello_common::config;
-use linhello_common::ipc::{CapabilityReport, CapabilityStatus, PositionReport, Request, Response};
+use linhello_common::ipc::{
+    CapabilityReport, CapabilityStatus, IdentifyCandidate, PositionReport, ProfileInfo, Request,
+    Response,
+};
 use linhello_common::platform;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -35,10 +38,14 @@ enum Screen {
     Welcome,
     Doctor,
     Cameras,
+    Profiles,
     Enroll,
     Calibrate,
+    Identify,
     Pam,
     Done,
+    /// Off the wizard path — reached from Welcome with `u`, returns with Esc.
+    Uninstall,
 }
 
 impl Screen {
@@ -47,20 +54,27 @@ impl Screen {
             Screen::Welcome => "Welcome",
             Screen::Doctor => "Host check",
             Screen::Cameras => "Cameras",
+            Screen::Profiles => "Profiles",
             Screen::Enroll => "Enroll",
             Screen::Calibrate => "Calibrate",
+            Screen::Identify => "Identify",
             Screen::Pam => "Login wiring",
             Screen::Done => "Done",
+            Screen::Uninstall => "Uninstall",
         }
     }
 }
 
-const ORDER: [Screen; 7] = [
+/// The linear wizard path. `Uninstall` is intentionally excluded — it is a side
+/// screen, not a step.
+const ORDER: [Screen; 9] = [
     Screen::Welcome,
     Screen::Doctor,
     Screen::Cameras,
+    Screen::Profiles,
     Screen::Enroll,
     Screen::Calibrate,
+    Screen::Identify,
     Screen::Pam,
     Screen::Done,
 ];
@@ -93,6 +107,31 @@ const ENROLL_TARGET: u32 = 5;
 const ENROLL_QUAL_MIN: u8 = 70; // auto-capture quality floor
 const ENROLL_STREAK: u32 = 3; // good frames in a row before the countdown
 
+/// "Which face is this" test on the Identify screen.
+enum IdentifyState {
+    Idle,
+    Running,
+    Done {
+        best: Option<IdentifyCandidate>,
+        threshold: f32,
+        candidates: Vec<IdentifyCandidate>,
+    },
+    Failed(String),
+}
+
+/// Destructive uninstall flow. Two gates: arm with `x`, then type the word to
+/// confirm. `remove_data` decides whether enrolled faces/models under
+/// /etc/linhello are also wiped.
+enum UninstallState {
+    Idle { remove_data: bool },
+    Confirm { remove_data: bool, input: String },
+    Working,
+    Done { log: Vec<String> },
+    Failed(String),
+}
+
+const UNINSTALL_WORD: &str = "REMOVE";
+
 struct App {
     screen: Screen,
     user: String,
@@ -113,6 +152,18 @@ struct App {
     pam: Vec<crate::pamwire::ServiceStatus>,
     /// Result/guidance lines from the last enable/disable action.
     pam_note: Vec<String>,
+    /// Enrolled profiles (refreshed on entering the Profiles screen).
+    profiles: Vec<ProfileInfo>,
+    profile_cursor: usize,
+    /// Which profile the Enroll step targets.
+    active_profile: String,
+    /// When `Some`, the Profiles screen is editing the highlighted profile's name.
+    name_input: Option<String>,
+    identify: IdentifyState,
+    uninstall: UninstallState,
+    /// Set true once the user explicitly saves a camera selection this session
+    /// (or an existing cameras.conf is present) — gates leaving the Cameras step.
+    cameras_saved: bool,
     status: String,
     should_quit: bool,
 }
@@ -134,6 +185,10 @@ impl App {
                 .find(|c| c.kind == CameraKind::Ir)
                 .map(|c| c.path.clone())
         });
+        // An existing cameras.conf means the camera choice is already made, so
+        // the Cameras step is satisfied without forcing a re-save.
+        let cameras_saved = config::config_path("cameras.conf").exists();
+        let active_profile = user.clone();
         App {
             screen: Screen::Welcome,
             user,
@@ -148,6 +203,13 @@ impl App {
             enroll_last: None,
             pam: Vec::new(),
             pam_note: Vec::new(),
+            profiles: Vec::new(),
+            profile_cursor: 0,
+            active_profile,
+            name_input: None,
+            identify: IdentifyState::Idle,
+            uninstall: UninstallState::Idle { remove_data: false },
+            cameras_saved,
             status: String::new(),
             should_quit: false,
         }
@@ -157,7 +219,49 @@ impl App {
         ORDER.iter().position(|s| *s == self.screen).unwrap_or(0)
     }
 
+    /// Whether the current step is complete enough to advance. `Err(reason)`
+    /// blocks `next()` and shows the reason; `Ok(())` allows it. This is the
+    /// phased-progression gate: you can't skip past a step that isn't done.
+    fn gate(&self) -> Result<(), &'static str> {
+        match self.screen {
+            Screen::Doctor => match &self.report {
+                Some(Ok(r)) if r.can_run() => Ok(()),
+                Some(Ok(_)) => Err("host can't run LinuxHello — fix the [FAIL] item first"),
+                _ => Err("probe the host first (press r)"),
+            },
+            Screen::Cameras => {
+                if self.cameras_saved {
+                    Ok(())
+                } else {
+                    Err("pick an RGB camera and press s to save before continuing")
+                }
+            }
+            Screen::Enroll => {
+                if self.active_profile_enrolled() {
+                    Ok(())
+                } else {
+                    Err("enroll at least one face sample first (press Enter)")
+                }
+            }
+            // Welcome / Profiles / Calibrate / Identify / Pam / Done are optional
+            // to advance past.
+            _ => Ok(()),
+        }
+    }
+
+    /// Has the active profile got at least one stored sample (enrolled this
+    /// session, or already enrolled before the wizard started)?
+    fn active_profile_enrolled(&self) -> bool {
+        matches!(self.enroll, EnrollState::Done { .. })
+            || self.profiles.iter().any(|p| p.user == self.active_profile && p.samples > 0)
+            || self.install.enrolled_users.contains(&self.active_profile)
+    }
+
     fn next(&mut self) {
+        if let Err(reason) = self.gate() {
+            self.status = format!("⛔ {reason}");
+            return;
+        }
         let i = self.step_index();
         if i + 1 < ORDER.len() {
             self.screen = ORDER[i + 1];
@@ -181,8 +285,16 @@ impl App {
                 self.cameras = camera::enumerate();
                 self.cam_cursor = self.cam_cursor.min(self.cameras.len().saturating_sub(1));
             }
+            Screen::Profiles => self.refresh_profiles(),
             Screen::Pam => self.pam = crate::pamwire::status(),
             _ => {}
+        }
+    }
+
+    fn refresh_profiles(&mut self) {
+        if let Ok(Response::Profiles { profiles }) = crate::send(Request::ListProfiles) {
+            self.profiles = profiles;
+            self.profile_cursor = self.profile_cursor.min(self.profiles.len().saturating_sub(1));
         }
     }
 
@@ -229,7 +341,18 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
-        // Global keys first.
+        // Text-entry modes swallow keys first, so 'q'/Tab become input or
+        // local actions rather than quitting/navigating.
+        if self.screen == Screen::Profiles && self.name_input.is_some() {
+            self.name_edit_key(code);
+            return;
+        }
+        if self.screen == Screen::Uninstall {
+            self.uninstall_key(code);
+            return;
+        }
+
+        // Global keys.
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -247,9 +370,15 @@ impl App {
         }
         // Screen-specific handling.
         match self.screen {
+            Screen::Welcome if matches!(code, KeyCode::Char('u')) => {
+                self.screen = Screen::Uninstall;
+                self.uninstall = UninstallState::Idle { remove_data: false };
+            }
             Screen::Cameras => self.cameras_key(code),
+            Screen::Profiles => self.profiles_key(code),
             Screen::Calibrate => self.calibrate_key(code),
             Screen::Enroll => self.enroll_key(code),
+            Screen::Identify => self.identify_key(code),
             Screen::Pam => self.pam_key(code),
             Screen::Doctor if matches!(code, KeyCode::Char('r')) => self.refresh_probe(),
             _ => match code {
@@ -257,6 +386,158 @@ impl App {
                 KeyCode::Left => self.prev(),
                 _ => {}
             },
+        }
+    }
+
+    /// Profiles screen: navigate, set the active (enroll-target) profile, and
+    /// start/commit a name edit.
+    fn profiles_key(&mut self, code: KeyCode) {
+        let len = self.profiles.len();
+        match code {
+            KeyCode::Up => self.profile_cursor = self.profile_cursor.saturating_sub(1),
+            KeyCode::Down => {
+                self.profile_cursor = (self.profile_cursor + 1).min(len.saturating_sub(1))
+            }
+            // Make the highlighted profile the enroll target.
+            KeyCode::Char('s') => {
+                if let Some(p) = self.profiles.get(self.profile_cursor) {
+                    self.active_profile = p.user.clone();
+                    self.status = format!("enroll target: {}", p.user);
+                }
+            }
+            // New profile: enroll under a typed name on the next step. Here we
+            // just set the active profile to a fresh login-user name via input.
+            KeyCode::Char('a') => {
+                self.active_profile = self.user.clone();
+                self.status = format!(
+                    "enroll target set to your login '{}' — go to Enroll (Tab)",
+                    self.user
+                );
+            }
+            // Rename the highlighted profile.
+            KeyCode::Char('n') => {
+                if let Some(p) = self.profiles.get(self.profile_cursor) {
+                    self.name_input = Some(p.name.clone().unwrap_or_default());
+                    self.status = format!("naming '{}' — type, Enter to save, Esc to cancel", p.user);
+                }
+            }
+            KeyCode::Char('r') => self.refresh_profiles(),
+            KeyCode::Right => self.next(),
+            KeyCode::Left => self.prev(),
+            _ => {}
+        }
+    }
+
+    /// Editing a profile's friendly name (Profiles screen, `name_input` is Some).
+    fn name_edit_key(&mut self, code: KeyCode) {
+        let Some(buf) = self.name_input.as_mut() else { return };
+        match code {
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Esc => {
+                self.name_input = None;
+                self.status = "name edit cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let name = self.name_input.take().unwrap_or_default();
+                if let Some(p) = self.profiles.get(self.profile_cursor) {
+                    let user = p.user.clone();
+                    match crate::send(Request::SetProfileName {
+                        user: user.clone(),
+                        name: name.clone(),
+                    }) {
+                        Ok(Response::ProfileNameSet) => {
+                            self.status = format!("named '{user}': {name}");
+                            self.refresh_profiles();
+                        }
+                        Ok(Response::Error { message }) => self.status = format!("error: {message}"),
+                        Ok(other) => self.status = format!("unexpected: {other:?}"),
+                        Err(e) => self.status = format!("error: {e}"),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Identify screen: `i` runs a 1:N "which face is this" test.
+    fn identify_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('i') | KeyCode::Enter
+                if !matches!(self.identify, IdentifyState::Running) =>
+            {
+                self.identify = IdentifyState::Running;
+                self.status = "identifying — look at the camera…".to_string();
+            }
+            KeyCode::Right => self.next(),
+            KeyCode::Left => self.prev(),
+            _ => {}
+        }
+    }
+
+    /// Uninstall side screen: arm with `x`, toggle data wipe with `d`, type the
+    /// confirmation word, Esc to back out.
+    fn uninstall_key(&mut self, code: KeyCode) {
+        let state = std::mem::replace(&mut self.uninstall, UninstallState::Working);
+        match state {
+            UninstallState::Idle { remove_data } => match code {
+                KeyCode::Char('d') => {
+                    self.uninstall = UninstallState::Idle { remove_data: !remove_data };
+                }
+                KeyCode::Char('x') => {
+                    self.uninstall = UninstallState::Confirm {
+                        remove_data,
+                        input: String::new(),
+                    };
+                    self.status = format!("type {UNINSTALL_WORD} to confirm, Esc to cancel");
+                }
+                KeyCode::Esc => {
+                    self.uninstall = UninstallState::Idle { remove_data };
+                    self.screen = Screen::Welcome;
+                }
+                _ => self.uninstall = UninstallState::Idle { remove_data },
+            },
+            UninstallState::Confirm {
+                remove_data,
+                mut input,
+            } => match code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.uninstall = UninstallState::Confirm { remove_data, input };
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.uninstall = UninstallState::Confirm { remove_data, input };
+                }
+                KeyCode::Esc => {
+                    self.uninstall = UninstallState::Idle { remove_data };
+                    self.status = "uninstall cancelled".to_string();
+                }
+                KeyCode::Enter => {
+                    if input.trim() == UNINSTALL_WORD {
+                        // Perform it. Blocks briefly; fine for a one-shot.
+                        match crate::install::uninstall(remove_data) {
+                            Ok(log) => self.uninstall = UninstallState::Done { log },
+                            Err(e) => self.uninstall = UninstallState::Failed(e),
+                        }
+                    } else {
+                        self.status = format!("type exactly {UNINSTALL_WORD}");
+                        self.uninstall = UninstallState::Confirm { remove_data, input };
+                    }
+                }
+                _ => self.uninstall = UninstallState::Confirm { remove_data, input },
+            },
+            // Terminal/working states: Esc returns to Welcome, else stay.
+            other => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.screen = Screen::Welcome;
+                    self.uninstall = UninstallState::Idle { remove_data: false };
+                } else {
+                    self.uninstall = other;
+                }
+            }
         }
     }
 
@@ -286,7 +567,7 @@ impl App {
 
     fn do_enroll_capture(&self) -> Result<(), String> {
         match crate::send(Request::Enroll {
-            user: self.user.clone(),
+            user: self.active_profile.clone(),
             reset: false,
         }) {
             Ok(Response::Enrolled { .. }) => Ok(()),
@@ -342,6 +623,7 @@ impl App {
         };
         match camera::write_cameras_conf(&rgb, self.sel_ir.as_deref()) {
             Ok(()) => {
+                self.cameras_saved = true;
                 let ir = self
                     .sel_ir
                     .as_deref()
@@ -417,6 +699,28 @@ impl App {
     fn tick(&mut self) {
         if self.screen == Screen::Enroll {
             self.tick_enroll();
+            return;
+        }
+        if self.screen == Screen::Identify {
+            if matches!(self.identify, IdentifyState::Running) {
+                self.identify = match crate::send(Request::Identify) {
+                    Ok(Response::Identified {
+                        best,
+                        threshold,
+                        candidates,
+                    }) => {
+                        self.status = "identified".to_string();
+                        IdentifyState::Done {
+                            best,
+                            threshold,
+                            candidates,
+                        }
+                    }
+                    Ok(Response::Error { message }) => IdentifyState::Failed(message),
+                    Ok(other) => IdentifyState::Failed(format!("unexpected: {other:?}")),
+                    Err(e) => IdentifyState::Failed(e.to_string()),
+                };
+            }
             return;
         }
         if self.screen != Screen::Calibrate {
@@ -511,14 +815,22 @@ impl App {
         ])
         .split(frame.area());
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::raw(format!(" step {}/{}: ", self.step_index() + 1, ORDER.len())),
-            Span::styled(
-                self.screen.name(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .block(Block::bordered().title(" LinuxHello setup "));
+        let header_line = if self.screen == Screen::Uninstall {
+            Line::from(vec![Span::styled(
+                " Uninstall LinuxHello ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )])
+        } else {
+            Line::from(vec![
+                Span::raw(format!(" step {}/{}: ", self.step_index() + 1, ORDER.len())),
+                Span::styled(
+                    self.screen.name(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ])
+        };
+        let header =
+            Paragraph::new(header_line).block(Block::bordered().title(" LinuxHello setup "));
         frame.render_widget(header, chunks[0]);
 
         self.render_body(frame, chunks[1]);
@@ -547,9 +859,12 @@ impl App {
             Screen::Welcome => self.body_welcome(frame, area),
             Screen::Doctor => self.body_doctor(frame, area),
             Screen::Cameras => self.body_cameras(frame, area),
+            Screen::Profiles => self.body_profiles(frame, area),
             Screen::Enroll => self.body_enroll(frame, area),
             Screen::Calibrate => self.body_calibrate(frame, area),
+            Screen::Identify => self.body_identify(frame, area),
             Screen::Pam => self.body_pam(frame, area),
+            Screen::Uninstall => self.body_uninstall(frame, area),
             Screen::Done => {
                 let enrolled = !self.install.enrolled_users.is_empty()
                     || matches!(self.enroll, EnrollState::Done { .. });
@@ -615,6 +930,208 @@ impl App {
         lines.push(Line::from(hint.italic()));
         lines.push(Line::from(""));
         lines.push(Line::from("Tab to move between steps; q to quit.".italic()));
+        if st.is_installed() {
+            lines.push(Line::from(Span::styled(
+                "Press u to uninstall LinuxHello.",
+                Style::default().fg(Color::Red),
+            )));
+        }
+        self.body_paragraph(frame, area, lines);
+    }
+
+    fn body_profiles(&self, frame: &mut Frame, area: Rect) {
+        if let Some(buf) = &self.name_input {
+            // Name-edit overlay.
+            let target = self
+                .profiles
+                .get(self.profile_cursor)
+                .map(|p| p.user.as_str())
+                .unwrap_or("?");
+            self.body_paragraph(
+                frame,
+                area,
+                vec![
+                    Line::from(format!("Name profile '{target}'").bold()),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw("Friendly name: "),
+                        Span::styled(buf.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("▏", Style::default().fg(Color::Gray)),
+                    ]),
+                    Line::from(""),
+                    Line::from("Enter to save, Esc to cancel.".italic()),
+                ],
+            );
+            return;
+        }
+        let mut lines = vec![
+            Line::from("Profiles — enrolled faces on this machine".bold()),
+            Line::from(""),
+        ];
+        if self.profiles.is_empty() {
+            lines.push(Line::from("No profiles enrolled yet.".yellow()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "Enroll target is your login '{}'. Tab to the Enroll step.",
+                self.active_profile
+            )));
+        } else {
+            for (i, p) in self.profiles.iter().enumerate() {
+                let active = p.user == self.active_profile;
+                let marker = if active { "▶ " } else { "  " };
+                let nm = p.name.as_deref().unwrap_or("—");
+                let row = format!(
+                    "{marker}{:<14} {:<20} {} samples{}",
+                    p.user,
+                    nm,
+                    p.samples,
+                    if p.has_password { ", keyring" } else { "" },
+                );
+                let line = Line::from(row);
+                lines.push(if i == self.profile_cursor {
+                    line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else if active {
+                    line.style(Style::default().fg(Color::Green))
+                } else {
+                    line
+                });
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Enroll target: {}", self.active_profile).green()));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "↑/↓ pick · s = enroll-target · n = name · a = use my login · r = refresh".italic(),
+        ));
+        self.body_paragraph(frame, area, lines);
+    }
+
+    fn body_identify(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = match &self.identify {
+            IdentifyState::Idle => vec![
+                Line::from("Identify — which face is this?".bold()),
+                Line::from(""),
+                Line::from("Press i to capture and match your face against every"),
+                Line::from("enrolled profile. Tells you who it is (or no match)."),
+                Line::from(""),
+                Line::from("Press i to start, or Tab to skip.".italic()),
+            ],
+            IdentifyState::Running => vec![
+                Line::from("Look at the camera…".bold().green()),
+                Line::from(""),
+                Line::from("Capturing and matching against all profiles."),
+            ],
+            IdentifyState::Done {
+                best,
+                threshold,
+                candidates,
+            } => {
+                let mut v = match best {
+                    Some(c) => {
+                        let label = c.name.clone().unwrap_or_else(|| c.user.clone());
+                        vec![
+                            Line::from("Match!".green().bold()),
+                            Line::from(""),
+                            Line::from(format!(
+                                "This face belongs to: {label}  (profile '{}')",
+                                c.user
+                            )),
+                            Line::from(format!("score {:.3} ≥ threshold {:.2}", c.score, threshold)),
+                        ]
+                    }
+                    None => vec![
+                        Line::from("No match.".yellow().bold()),
+                        Line::from(""),
+                        Line::from(format!("Nobody cleared the {threshold:.2} threshold.")),
+                    ],
+                };
+                if !candidates.is_empty() {
+                    v.push(Line::from(""));
+                    v.push(Line::from("ranked candidates:".bold()));
+                    for c in candidates {
+                        let nm = c.name.as_deref().unwrap_or("—");
+                        v.push(Line::from(format!("  {:<14} {:<18} {:.3}", c.user, nm, c.score)));
+                    }
+                }
+                v.push(Line::from(""));
+                v.push(Line::from("Press i to test again, or Tab to continue.".italic()));
+                v
+            }
+            IdentifyState::Failed(e) => vec![
+                Line::from("Identify failed.".red().bold()),
+                Line::from(""),
+                Line::from(e.clone()),
+                Line::from(""),
+                Line::from("Press i to retry.".italic()),
+            ],
+        };
+        self.body_paragraph(frame, area, lines);
+    }
+
+    fn body_uninstall(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = match &self.uninstall {
+            UninstallState::Idle { remove_data } | UninstallState::Confirm { remove_data, .. } => {
+                let mut v = vec![
+                    Line::from("Uninstall LinuxHello".red().bold()),
+                    Line::from(""),
+                    Line::from("This will:".bold()),
+                ];
+                for step in crate::install::uninstall_plan(*remove_data) {
+                    v.push(Line::from(format!("  • {step}")));
+                }
+                v.push(Line::from(""));
+                v.push(Line::from(
+                    "Your password login keeps working — only face auth is removed.".italic(),
+                ));
+                v.push(Line::from(""));
+                v.push(Line::from(vec![
+                    Span::raw("Also erase enrolled faces + models in /etc/linhello: "),
+                    if *remove_data {
+                        Span::styled("YES", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::styled("no", Style::default().fg(Color::Green))
+                    },
+                    Span::raw("   (d to toggle)"),
+                ]));
+                v.push(Line::from(""));
+                match &self.uninstall {
+                    UninstallState::Confirm { input, .. } => {
+                        v.push(Line::from(vec![
+                            Span::styled(
+                                format!("Type {UNINSTALL_WORD} to confirm: "),
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(input.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("▏", Style::default().fg(Color::Gray)),
+                        ]));
+                        v.push(Line::from("Enter to execute, Esc to cancel.".italic()));
+                    }
+                    _ => {
+                        v.push(Line::from(
+                            "Press x to begin uninstall, Esc to go back.".bold(),
+                        ));
+                    }
+                }
+                v
+            }
+            UninstallState::Working => vec![Line::from("Uninstalling…".bold())],
+            UninstallState::Done { log } => {
+                let mut v = vec![Line::from("Uninstalled.".green().bold()), Line::from("")];
+                for l in log {
+                    v.push(Line::from(format!("  {l}")));
+                }
+                v.push(Line::from(""));
+                v.push(Line::from("Press Esc to return, q to quit.".italic()));
+                v
+            }
+            UninstallState::Failed(e) => vec![
+                Line::from("Uninstall problem.".red().bold()),
+                Line::from(""),
+                Line::from(e.clone()),
+                Line::from(""),
+                Line::from("Press Esc to return.".italic()),
+            ],
+        };
         self.body_paragraph(frame, area, lines);
     }
 

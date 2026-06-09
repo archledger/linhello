@@ -132,6 +132,106 @@ impl InstallState {
     }
 }
 
+const BIN_NAMES: [&str; 3] = ["linhello", "linhellod", "linhello-reseal-hook"];
+const PAM_DIRS: [&str; 2] = ["/usr/lib/security", "/usr/lib64/security"];
+const PAM_LIBS: [&str; 2] = ["pam_linhello.so", "liblinhello_pam.so"];
+const UNIT_PATHS: [&str; 2] = [
+    "/etc/systemd/system/linhellod.service",
+    "/usr/lib/systemd/system/linhellod.service",
+];
+const PACMAN_HOOK: &str = "/etc/pacman.d/hooks/linhello-reseal.hook";
+
+/// Human-readable preview of what an uninstall will do, for the confirm screen.
+pub fn uninstall_plan(remove_data: bool) -> Vec<String> {
+    let mut v = vec![
+        "disable face login in every PAM stack (password login stays)".to_string(),
+        "stop and disable the linhellod service".to_string(),
+        "remove the linhello / linhellod / reseal-hook programs".to_string(),
+        "remove the PAM modules (pam_linhello.so, liblinhello_pam.so)".to_string(),
+        "remove the systemd unit and the pacman reseal hook".to_string(),
+    ];
+    if remove_data {
+        v.push(format!(
+            "ERASE {CONFIG_ROOT} — enrolled faces, models, and TPM envelopes"
+        ));
+    } else {
+        v.push(format!(
+            "keep {CONFIG_ROOT} (faces + models) so a reinstall reuses them"
+        ));
+    }
+    v
+}
+
+/// Remove LinuxHello from this host. PAM is unwired *first* so the module is
+/// never deleted while a login stack still references it (which could wedge
+/// login); if unwiring fails we abort before touching anything else. Best-effort
+/// thereafter — every action is logged. Requires root (the caller, the TUI,
+/// already runs as root).
+pub fn uninstall(remove_data: bool) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+
+    match crate::pamwire::disable(false) {
+        Ok(changes) => log.push(format!("unwired face login from {} PAM file(s)", changes.len())),
+        Err(e) => {
+            return Err(format!(
+                "could not unwire PAM ({e}); aborted before removing anything (login stays intact)"
+            ))
+        }
+    }
+
+    if run_systemctl(&["disable", "--now", "linhellod"]) {
+        log.push("stopped and disabled linhellod".to_string());
+    } else {
+        log.push("linhellod was not running / already disabled".to_string());
+    }
+
+    for dir in BIN_DIRS {
+        for name in BIN_NAMES {
+            remove_if(&Path::new(dir).join(name), &mut log);
+        }
+    }
+    for dir in PAM_DIRS {
+        for lib in PAM_LIBS {
+            remove_if(&Path::new(dir).join(lib), &mut log);
+        }
+    }
+    for p in UNIT_PATHS {
+        remove_if(Path::new(p), &mut log);
+    }
+    remove_if(Path::new(PACMAN_HOOK), &mut log);
+    run_systemctl(&["daemon-reload"]);
+
+    if remove_data {
+        match std::fs::remove_dir_all(CONFIG_ROOT) {
+            Ok(()) => log.push(format!("erased {CONFIG_ROOT}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log.push(format!("{CONFIG_ROOT} already absent"))
+            }
+            Err(e) => log.push(format!("could not erase {CONFIG_ROOT}: {e}")),
+        }
+    } else {
+        log.push(format!("kept {CONFIG_ROOT} (faces + models preserved)"));
+    }
+
+    Ok(log)
+}
+
+fn remove_if(path: &Path, log: &mut Vec<String>) {
+    match std::fs::remove_file(path) {
+        Ok(()) => log.push(format!("removed {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log.push(format!("could not remove {}: {e}", path.display())),
+    }
+}
+
+fn run_systemctl(args: &[&str]) -> bool {
+    Command::new("systemctl")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn find_bin(name: &str) -> Option<PathBuf> {
     BIN_DIRS
         .iter()
