@@ -249,6 +249,12 @@ pub fn deploy(user: &str) -> Result<Vec<String>, String> {
         "can't find the LinuxHello source tree — set LINHELLO_SRC, or run from the repo's \
          target/release; on a packaged system, install via your package manager instead",
     )?;
+    deploy_from(&root, user)
+}
+
+/// `deploy` against an explicit source tree (the updater builds in a managed
+/// clone that is not where the running binary lives).
+pub fn deploy_from(root: &Path, user: &str) -> Result<Vec<String>, String> {
     // The Makefile's PAMDIR default is the Arch location; on Debian/Fedora the
     // PAM module dir differs — resolve it for the running distro so the greeter
     // can actually load the module after install.
@@ -354,6 +360,155 @@ pub fn copy_models_from(dir: &Path) -> Result<Vec<String>, String> {
 
 const BIN_NAMES: [&str; 3] = ["linhello", "linhellod", "linhello-reseal-hook"];
 const PAM_DIRS: [&str; 2] = ["/usr/lib/security", "/usr/lib64/security"];
+/// Where `linhello update` fetches from.
+const REPO_URL: &str = "https://github.com/archledger/linhello";
+/// The clone `linhello update` manages when this install didn't come from one
+/// (ZIP download, deleted checkout). Root-owned; nothing else touches it.
+const MANAGED_SRC: &str = "/var/lib/linhello/src";
+
+/// Update from GitHub: pull the latest source (reusing the git checkout we're
+/// running from when there is one, else a managed clone), rebuild, reinstall
+/// via `deploy_from`, and re-apply the existing PAM wiring so newly supported
+/// services get wired. Enrollment, config, models, and PAM backups are never
+/// touched. Root-only; build/git output streams to the caller's terminal.
+pub fn update(user: &str) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+
+    let (root, fresh_clone) = match source_root().filter(|r| r.join(".git").exists()) {
+        Some(r) => {
+            log.push(format!("source: git checkout at {}", r.display()));
+            (r, false)
+        }
+        None => {
+            let managed = PathBuf::from(MANAGED_SRC);
+            if managed.join(".git").exists() {
+                log.push(format!("source: managed clone at {}", managed.display()));
+                (managed, false)
+            } else {
+                if let Some(parent) = managed.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+                }
+                log.push(format!("cloning {REPO_URL} -> {}", managed.display()));
+                run_streamed(None, Path::new("/"), "git", &["clone", REPO_URL, MANAGED_SRC])?;
+                (managed, true)
+            }
+        }
+    };
+
+    // Run git/cargo as the checkout's owner: keeps a user-owned dev repo free
+    // of root-owned objects (and trips neither git's dubious-ownership check
+    // nor a user-local cargo setup). The managed clone is root-owned -> root.
+    let owner = dir_owner(&root);
+
+    let before = git_head(&root, owner);
+    if !fresh_clone {
+        run_streamed(owner, &root, "git", &["pull", "--ff-only"])?;
+    }
+    let after = git_head(&root, owner);
+
+    if !fresh_clone && before == after && installed_cli().is_some() {
+        log.push(format!(
+            "already up to date ({}) — nothing to do. (Force a reinstall from the TUI's \
+             Install step if programs are damaged.)",
+            after.as_deref().unwrap_or("unknown commit")
+        ));
+        return Ok(log);
+    }
+
+    log.push("building (cargo build --release)…".to_string());
+    run_streamed(owner, &root, "cargo", &["build", "--release"])?;
+
+    log.extend(deploy_from(&root, user)?);
+
+    // Extend login wiring only when the operator had already opted in: re-run
+    // enable (idempotent) so services this version newly supports get wired;
+    // keep sudo exactly as opted.
+    let st = crate::pamwire::status();
+    if st.iter().any(|s| s.wired) {
+        let sudo_wired = st
+            .iter()
+            .any(|s| s.wired && s.path.file_name().and_then(|n| n.to_str()) == Some("sudo"));
+        match crate::pamwire::enable(sudo_wired, false) {
+            Ok(changes) => log.extend(changes.iter().map(|c| c.describe())),
+            Err(e) => log.push(format!("PAM wiring not re-applied: {e}")),
+        }
+    } else {
+        log.push("login wiring untouched (none was enabled)".to_string());
+    }
+
+    log.push(format!(
+        "updated {} -> {}",
+        before.as_deref().unwrap_or("unknown"),
+        after.as_deref().unwrap_or("unknown")
+    ));
+    Ok(log)
+}
+
+/// Owner uid of `path` when it isn't root — the uid update's git/cargo calls
+/// should run as. `None` means "run as the current (root) user directly".
+fn dir_owner(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.uid()).filter(|&u| u != 0)
+}
+
+/// Run `prog args` in `cwd`, output inherited (the user watches git/cargo
+/// progress live). With `Some(uid)`, drops to that user via `sudo -u #uid`.
+fn run_streamed(
+    uid: Option<u32>,
+    cwd: &Path,
+    prog: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let mut cmd = match uid {
+        Some(u) => {
+            let mut c = Command::new("sudo");
+            c.arg("-u").arg(format!("#{u}")).arg(prog).args(args);
+            c
+        }
+        None => {
+            let mut c = Command::new(prog);
+            c.args(args);
+            c
+        }
+    };
+    let status = cmd
+        .current_dir(cwd)
+        .status()
+        .map_err(|e| format!("running {prog}: {e} (is it installed system-wide?)"))?;
+    if !status.success() {
+        return Err(format!("{prog} {} failed (see output above)", args.join(" ")));
+    }
+    Ok(())
+}
+
+fn git_head(root: &Path, uid: Option<u32>) -> Option<String> {
+    let out = match uid {
+        Some(u) => Command::new("sudo")
+            .args(["-u", &format!("#{u}"), "git", "rev-parse", "--short", "HEAD"])
+            .current_dir(root)
+            .output(),
+        None => Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(root)
+            .output(),
+    }
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The installed CLI binary, if any (distinguishes "source unchanged, nothing
+/// to do" from "source unchanged but programs were never/no longer installed").
+fn installed_cli() -> Option<PathBuf> {
+    BIN_DIRS
+        .iter()
+        .map(|d| Path::new(d).join("linhello"))
+        .find(|p| p.exists())
+}
+
 const PAM_LIBS: [&str; 2] = ["pam_linhello.so", "liblinhello_pam.so"];
 const UNIT_PATHS: [&str; 2] = [
     "/etc/systemd/system/linhellod.service",
@@ -499,6 +654,15 @@ fn scrub_pam_references(log: &mut Vec<String>) {
         if path.file_name().and_then(|n| n.to_str()) == Some("linhello-test") {
             if std::fs::remove_file(&path).is_ok() {
                 log.push(format!("removed {}", path.display()));
+            }
+            continue;
+        }
+        // Override files WE materialized from a PAM vendor-dir copy (KDE
+        // lockscreen): delete outright — there is no distro original in /etc
+        // to preserve, and the service falls back to the vendor file.
+        if crate::pamwire::is_created_override(&content) {
+            if std::fs::remove_file(&path).is_ok() {
+                log.push(format!("removed {} (was a linhello-created override)", path.display()));
             }
             continue;
         }

@@ -55,6 +55,12 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Update LinuxHello from GitHub: pull the latest source (managing its own
+    /// clone under /var/lib/linhello/src when this install didn't come from a
+    /// git checkout), rebuild, reinstall the programs + daemon, and re-apply
+    /// your existing login wiring. Enrolled faces, config, models, and PAM
+    /// backups are never touched. Root-only.
+    Update,
     /// First-run wizard: pick your webcam, calibrate the match threshold against
     /// your own live scores, and (optionally) enroll. Writes
     /// /etc/linhello/{cameras.conf,settings.conf} and restarts the daemon, so
@@ -377,6 +383,21 @@ fn uninstall_cmd(remove_models: bool, yes: bool) -> Result<()> {
                 println!("  {l}");
             }
             println!("\nDone. Password login is unaffected.");
+            Ok(())
+        }
+        Err(e) => bail!(e),
+    }
+}
+
+fn update_cmd() -> Result<()> {
+    require_root("update")?;
+    let user = current_user()?;
+    match install::update(&user) {
+        Ok(log) => {
+            for l in log {
+                println!("  {l}");
+            }
+            println!("\nUpdate complete. Enrollment, config, and PAM backups were untouched.");
             Ok(())
         }
         Err(e) => bail!(e),
@@ -756,6 +777,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Update => update_cmd()?,
         Cmd::Setup => run_setup()?,
         Cmd::Detect => detect_cmd(),
         Cmd::Uninstall { keep_models, yes } => uninstall_cmd(!keep_models, yes)?,

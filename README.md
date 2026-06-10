@@ -45,6 +45,19 @@ linhello doctor      # is everything healthy?
 sudo linhello tui    # re-run setup, manage profiles, or uninstall
 ```
 
+## Update
+
+```sh
+sudo linhello update
+```
+
+Pulls the latest LinuxHello from GitHub, rebuilds, and reinstalls in place —
+it works even if you originally installed from a ZIP download (it keeps its
+own clone under `/var/lib/linhello/src`). Your enrolled faces, configuration,
+models, and login wiring are never touched; wiring is only *extended* if a new
+version supports a login service yours didn't (and only if you had wiring
+enabled).
+
 ## Security in one paragraph
 
 Face templates are encrypted (AES-256-GCM) with a key that only your TPM can

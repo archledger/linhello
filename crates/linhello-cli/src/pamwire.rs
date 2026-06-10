@@ -53,6 +53,16 @@ const GREETERS: &[&str] = &[
 /// module answers verify-only there — so it gets the plain `sufficient`
 /// stanza, not the greeter `[success=1]` jump.
 const KDE_LOCKSCREEN: &str = "/etc/pam.d/kde";
+/// Where Arch ships the kscreenlocker service since Plasma 6: the PAM *vendor*
+/// directory. PAM gives `/etc/pam.d/<service>` priority over it, so we never
+/// edit the vendor file (package-owned, clobbered on update) — when only the
+/// vendor copy exists, we materialize an `/etc/pam.d/kde` override from it.
+const KDE_VENDOR: &str = "/usr/lib/pam.d/kde";
+/// First line of an override file WE created (no pre-existing /etc file to
+/// back up). Lets disable/uninstall know to delete the whole file — leaving a
+/// vendor-copy behind would freeze the service against future vendor updates.
+pub(crate) const CREATED_MARKER: &str =
+    "# linhello: created from /usr/lib/pam.d/kde — delete this file to revert to the vendor copy";
 const SUDO: &str = "/etc/pam.d/sudo";
 
 /// Read-only status of one PAM service file.
@@ -65,6 +75,8 @@ pub struct ServiceStatus {
 pub enum Change {
     WouldEdit(PathBuf),
     Edited(PathBuf),
+    /// A new /etc override file materialized from a PAM vendor-dir copy.
+    Created(PathBuf),
     AlreadyWired(PathBuf),
     WouldRemove(PathBuf),
     Removed(PathBuf),
@@ -78,6 +90,7 @@ impl Change {
         match self {
             Change::WouldEdit(p) => format!("would wire  {}", p.display()),
             Change::Edited(p) => format!("wired       {} (backup {}{})", p.display(), p.display(), BACKUP_SUFFIX),
+            Change::Created(p) => format!("wired       {} (created from {})", p.display(), KDE_VENDOR),
             Change::AlreadyWired(p) => format!("already     {}", p.display()),
             Change::WouldRemove(p) => format!("would clear {}", p.display()),
             Change::Removed(p) => format!("cleared     {}", p.display()),
@@ -91,9 +104,10 @@ impl Change {
 /// inspected are distro-specific: the rendered shared stacks on Debian/Fedora,
 /// the per-service greeter/sudo files on Arch.
 pub fn status() -> Vec<ServiceStatus> {
+    // No `exists()` filter here: a vendor-backed target (the KDE lockscreen
+    // before its /etc override is created) must still show up as "not wired".
     inspect_files()
         .into_iter()
-        .filter(|p| p.exists())
         .map(|path| {
             let wired = std::fs::read_to_string(&path)
                 .map(|c| content_has_module(&c))
@@ -106,11 +120,17 @@ pub fn status() -> Vec<ServiceStatus> {
 /// Files whose `pam_linhello` presence indicates active wiring, per distro.
 fn inspect_files() -> Vec<PathBuf> {
     match platform::distro_family() {
-        DistroFamily::Debian => vec![PathBuf::from("/etc/pam.d/common-auth")],
+        DistroFamily::Debian => vec![PathBuf::from("/etc/pam.d/common-auth")]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect(),
         DistroFamily::Fedora => vec![
             PathBuf::from("/etc/pam.d/system-auth"),
             PathBuf::from("/etc/pam.d/password-auth"),
-        ],
+        ]
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect(),
         DistroFamily::Arch | DistroFamily::Other => existing_targets(true),
     }
 }
@@ -127,9 +147,12 @@ pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
             for g in GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()) {
                 changes.push(edit_in(&g, GREETER_STANZA, dry_run)?);
             }
-            let kde = PathBuf::from(KDE_LOCKSCREEN);
-            if kde.exists() {
-                changes.push(edit_in(&kde, SUFFICIENT_STANZA, dry_run)?);
+            if let Some(kde) = lockscreen_target() {
+                changes.push(if kde.exists() {
+                    edit_in(&kde, SUFFICIENT_STANZA, dry_run)?
+                } else {
+                    create_lockscreen_override(&kde, dry_run)?
+                });
             }
             if include_sudo {
                 let sudo = PathBuf::from(SUDO);
@@ -159,12 +182,10 @@ pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
 }
 
 fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = GREETERS
-        .iter()
-        .chain(std::iter::once(&KDE_LOCKSCREEN))
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
+    let mut v: Vec<PathBuf> = GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
+    if let Some(kde) = lockscreen_target() {
+        v.push(kde);
+    }
     if include_sudo {
         let sudo = PathBuf::from(SUDO);
         if sudo.exists() {
@@ -172,6 +193,39 @@ fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
         }
     }
     v
+}
+
+/// The KDE lockscreen service file we manage: always the /etc path (PAM gives
+/// it priority), present as a target when either it or the vendor copy under
+/// /usr/lib/pam.d exists — i.e. when this host actually has kscreenlocker.
+fn lockscreen_target() -> Option<PathBuf> {
+    let etc = PathBuf::from(KDE_LOCKSCREEN);
+    (etc.exists() || Path::new(KDE_VENDOR).exists()).then_some(etc)
+}
+
+/// The /etc override content for a vendor-shipped lockscreen service: marker
+/// line (so disable/uninstall know to delete the file), then the vendor stack
+/// with our stanza wired in.
+fn build_lockscreen_override(vendor_content: &str) -> String {
+    let (wired, _) = insert_first_auth(vendor_content, SUFFICIENT_STANZA);
+    format!("{CREATED_MARKER}\n{wired}")
+}
+
+/// Whether this /etc/pam.d file is an override WE materialized (vs. one the
+/// distro shipped or the admin wrote): such files are deleted on unwire.
+pub(crate) fn is_created_override(content: &str) -> bool {
+    content.starts_with(CREATED_MARKER)
+}
+
+fn create_lockscreen_override(path: &Path, dry_run: bool) -> Result<Change> {
+    if dry_run {
+        return Ok(Change::WouldEdit(path.to_path_buf()));
+    }
+    let vendor = std::fs::read_to_string(KDE_VENDOR)
+        .map_err(|e| anyhow::anyhow!("reading {KDE_VENDOR}: {e}"))?;
+    std::fs::write(path, build_lockscreen_override(&vendor))
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    Ok(Change::Created(path.to_path_buf()))
 }
 
 fn edit_in(path: &Path, stanza: &str, dry_run: bool) -> Result<Change> {
@@ -190,8 +244,24 @@ fn edit_in(path: &Path, stanza: &str, dry_run: bool) -> Result<Change> {
 }
 
 fn remove_in(path: &Path, dry_run: bool) -> Result<Change> {
+    // A vendor-backed target whose /etc override was never created: nothing
+    // to unwire (read would fail below otherwise).
+    if !path.exists() {
+        return Ok(Change::NotWired(path.to_path_buf()));
+    }
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    // An override we created has no distro original behind it in /etc — delete
+    // the whole file so the service falls back to the live vendor copy instead
+    // of a frozen snapshot of it.
+    if is_created_override(&content) {
+        if dry_run {
+            return Ok(Change::WouldRemove(path.to_path_buf()));
+        }
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("removing {}: {e}", path.display()))?;
+        return Ok(Change::Removed(path.to_path_buf()));
+    }
     let (new, changed) = remove_module(&content);
     if !changed {
         return Ok(Change::NotWired(path.to_path_buf()));
@@ -516,6 +586,22 @@ mod tests {
         let (again, changed2) = remove_module(&cleared);
         assert!(!changed2);
         assert_eq!(cleared, again);
+    }
+
+    #[test]
+    fn lockscreen_override_marks_and_wires_vendor_content() {
+        // The Plasma 6 vendor file shape (Arch ships it at /usr/lib/pam.d/kde).
+        let vendor = "#%PAM-1.0\nauth\tinclude\tsystem-login\naccount\tinclude\tsystem-login\n";
+        let out = build_lockscreen_override(vendor);
+        assert!(is_created_override(&out));
+        assert!(content_has_module(&out));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], CREATED_MARKER);
+        assert_eq!(lines[1], "#%PAM-1.0");
+        assert_eq!(lines[2], SUFFICIENT_STANZA);
+        assert!(lines[3].starts_with("auth"));
+        // Distro-shipped or admin-written files must never look like ours.
+        assert!(!is_created_override(vendor));
     }
 
     #[test]

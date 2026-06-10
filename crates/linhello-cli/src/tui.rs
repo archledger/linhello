@@ -1364,6 +1364,10 @@ impl App {
                         "Already installed and the daemon is running.".green(),
                     ));
                     v.push(Line::from("Tab to continue to setup, or press i to redeploy."));
+                    v.push(Line::from(""));
+                    v.push(Line::from(
+                        "Newer LinuxHello on GitHub? Quit and run: sudo linhello update".dark_gray(),
+                    ));
                 } else {
                     v.push(Line::from("This deploys the programs + daemon, then the face models:"));
                     v.push(Line::from(""));
