@@ -123,11 +123,11 @@ enum IdentifyState {
 }
 
 /// Destructive uninstall flow. Two gates: arm with `x`, then type the word to
-/// confirm. `remove_data` decides whether enrolled faces/models under
-/// /etc/linhello are also wiped.
+/// confirm. Enrolled faces + config are ALWAYS removed; `remove_models` decides
+/// whether the big ~190MB .onnx models are deleted too.
 enum UninstallState {
-    Idle { remove_data: bool },
-    Confirm { remove_data: bool, input: String },
+    Idle { remove_models: bool },
+    Confirm { remove_models: bool, input: String },
     Working,
     Done { log: Vec<String> },
     Failed(String),
@@ -227,7 +227,7 @@ impl App {
             active_profile,
             name_input: None,
             identify: IdentifyState::Idle,
-            uninstall: UninstallState::Idle { remove_data: false },
+            uninstall: UninstallState::Idle { remove_models: true },
             install_step: InstallStep::Idle,
             activity: Vec::new(),
             cameras_saved,
@@ -422,7 +422,7 @@ impl App {
         match self.screen {
             Screen::Welcome if matches!(code, KeyCode::Char('u')) => {
                 self.screen = Screen::Uninstall;
-                self.uninstall = UninstallState::Idle { remove_data: false };
+                self.uninstall = UninstallState::Idle { remove_models: true };
             }
             Screen::Install => self.install_key(code),
             Screen::Cameras => self.cameras_key(code),
@@ -625,45 +625,45 @@ impl App {
     fn uninstall_key(&mut self, code: KeyCode) {
         let state = std::mem::replace(&mut self.uninstall, UninstallState::Working);
         match state {
-            UninstallState::Idle { remove_data } => match code {
+            UninstallState::Idle { remove_models } => match code {
                 KeyCode::Char('d') => {
-                    self.uninstall = UninstallState::Idle { remove_data: !remove_data };
+                    self.uninstall = UninstallState::Idle { remove_models: !remove_models };
                 }
                 KeyCode::Char('x') => {
                     self.uninstall = UninstallState::Confirm {
-                        remove_data,
+                        remove_models,
                         input: String::new(),
                     };
                     self.status = format!("type {UNINSTALL_WORD} to confirm, Esc to cancel");
                 }
                 KeyCode::Esc => {
-                    self.uninstall = UninstallState::Idle { remove_data };
+                    self.uninstall = UninstallState::Idle { remove_models };
                     self.screen = Screen::Welcome;
                     self.on_enter();
                 }
-                _ => self.uninstall = UninstallState::Idle { remove_data },
+                _ => self.uninstall = UninstallState::Idle { remove_models },
             },
             UninstallState::Confirm {
-                remove_data,
+                remove_models,
                 mut input,
             } => match code {
                 KeyCode::Char(c) => {
                     input.push(c);
-                    self.uninstall = UninstallState::Confirm { remove_data, input };
+                    self.uninstall = UninstallState::Confirm { remove_models, input };
                 }
                 KeyCode::Backspace => {
                     input.pop();
-                    self.uninstall = UninstallState::Confirm { remove_data, input };
+                    self.uninstall = UninstallState::Confirm { remove_models, input };
                 }
                 KeyCode::Esc => {
-                    self.uninstall = UninstallState::Idle { remove_data };
+                    self.uninstall = UninstallState::Idle { remove_models };
                     self.status = "uninstall cancelled".to_string();
                 }
                 KeyCode::Enter => {
                     if input.trim() == UNINSTALL_WORD {
                         // Perform it. Blocks briefly; fine for a one-shot.
                         self.log_activity("uninstalling LinuxHello…");
-                        match crate::install::uninstall(remove_data) {
+                        match crate::install::uninstall(remove_models) {
                             Ok(log) => {
                                 for l in &log {
                                     self.log_activity(l.clone());
@@ -678,16 +678,16 @@ impl App {
                         }
                     } else {
                         self.status = format!("type exactly {UNINSTALL_WORD}");
-                        self.uninstall = UninstallState::Confirm { remove_data, input };
+                        self.uninstall = UninstallState::Confirm { remove_models, input };
                     }
                 }
-                _ => self.uninstall = UninstallState::Confirm { remove_data, input },
+                _ => self.uninstall = UninstallState::Confirm { remove_models, input },
             },
             // Terminal/working states: Esc returns to Welcome, else stay.
             other => {
                 if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.screen = Screen::Welcome;
-                    self.uninstall = UninstallState::Idle { remove_data: false };
+                    self.uninstall = UninstallState::Idle { remove_models: true };
                     self.on_enter();
                 } else {
                     self.uninstall = other;
@@ -1357,26 +1357,30 @@ impl App {
 
     fn body_uninstall(&self, frame: &mut Frame, area: Rect) {
         let lines: Vec<Line> = match &self.uninstall {
-            UninstallState::Idle { remove_data } | UninstallState::Confirm { remove_data, .. } => {
+            UninstallState::Idle { remove_models } | UninstallState::Confirm { remove_models, .. } => {
                 let mut v = vec![
                     Line::from("Uninstall LinuxHello".red().bold()),
                     Line::from(""),
                     Line::from("This will:".bold()),
                 ];
-                for step in crate::install::uninstall_plan(*remove_data) {
+                for step in crate::install::uninstall_plan(*remove_models) {
                     v.push(Line::from(format!("  • {step}")));
                 }
                 v.push(Line::from(""));
                 v.push(Line::from(
-                    "Your password login keeps working — only face auth is removed.".italic(),
+                    "Enrolled faces + config are ALWAYS removed. Password login keeps working."
+                        .italic(),
                 ));
                 v.push(Line::from(""));
                 v.push(Line::from(vec![
-                    Span::raw("Also erase enrolled faces + models in /etc/linhello: "),
-                    if *remove_data {
-                        Span::styled("YES", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    Span::raw("Also delete the ~190MB face models: "),
+                    if *remove_models {
+                        Span::styled(
+                            "YES",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )
                     } else {
-                        Span::styled("no", Style::default().fg(Color::Green))
+                        Span::styled("no (keep for reinstall)", Style::default().fg(Color::Green))
                     },
                     Span::raw("   (d to toggle)"),
                 ]));

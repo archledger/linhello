@@ -216,22 +216,19 @@ const UNIT_PATHS: [&str; 2] = [
 const PACMAN_HOOK: &str = "/etc/pacman.d/hooks/linhello-reseal.hook";
 
 /// Human-readable preview of what an uninstall will do, for the confirm screen.
-pub fn uninstall_plan(remove_data: bool) -> Vec<String> {
+pub fn uninstall_plan(remove_models: bool) -> Vec<String> {
     let mut v = vec![
         "disable face login in every PAM stack (password login stays)".to_string(),
         "stop and disable the linhellod service".to_string(),
         "remove the linhello / linhellod / reseal-hook programs".to_string(),
         "remove the PAM modules (pam_linhello.so, liblinhello_pam.so)".to_string(),
         "remove the systemd unit and the pacman reseal hook".to_string(),
+        "ERASE enrolled faces, TPM envelopes, and config in /etc/linhello".to_string(),
     ];
-    if remove_data {
-        v.push(format!(
-            "ERASE {CONFIG_ROOT} — enrolled faces, models, and TPM envelopes"
-        ));
+    if remove_models {
+        v.push("also delete the ~190MB face models (re-fetch needed to reinstall)".to_string());
     } else {
-        v.push(format!(
-            "keep {CONFIG_ROOT} (faces + models) so a reinstall reuses them"
-        ));
+        v.push("keep only the ~190MB face models (so a reinstall skips re-fetch)".to_string());
     }
     v
 }
@@ -241,7 +238,7 @@ pub fn uninstall_plan(remove_data: bool) -> Vec<String> {
 /// login); if unwiring fails we abort before touching anything else. Best-effort
 /// thereafter — every action is logged. Requires root (the caller, the TUI,
 /// already runs as root).
-pub fn uninstall(remove_data: bool) -> Result<Vec<String>, String> {
+pub fn uninstall(remove_models: bool) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
 
     match crate::pamwire::disable(false) {
@@ -279,19 +276,51 @@ pub fn uninstall(remove_data: bool) -> Result<Vec<String>, String> {
     remove_if(Path::new(PACMAN_HOOK), &mut log);
     run_systemctl(&["daemon-reload"]);
 
-    if remove_data {
-        match std::fs::remove_dir_all(CONFIG_ROOT) {
-            Ok(()) => log.push(format!("erased {CONFIG_ROOT}")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                log.push(format!("{CONFIG_ROOT} already absent"))
-            }
-            Err(e) => log.push(format!("could not erase {CONFIG_ROOT}: {e}")),
-        }
-    } else {
-        log.push(format!("kept {CONFIG_ROOT} (faces + models preserved)"));
-    }
+    // Always remove the data LinuxHello created — enrolled faces, envelopes,
+    // and config — so an uninstall really does return the machine to clean.
+    // The big .onnx models are the only thing optionally kept (re-fetching them
+    // is the expensive part of a reinstall).
+    remove_config_data(remove_models, &mut log);
 
     Ok(log)
+}
+
+/// Remove everything under `CONFIG_ROOT` — enrolled faces, TPM envelopes, and
+/// config files — always. The `.onnx` models are removed only if `remove_models`
+/// (they're large and slow to re-fetch). Finally drops the now-empty config dir.
+fn remove_config_data(remove_models: bool, log: &mut Vec<String>) {
+    let root = Path::new(CONFIG_ROOT);
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let is_model = path.extension().map(|e| e == "onnx").unwrap_or(false);
+        if is_model && !remove_models {
+            log.push(format!(
+                "kept model {}",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            ));
+            continue;
+        }
+        let res = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match res {
+            Ok(()) => log.push(format!("removed {}", path.display())),
+            Err(e) => log.push(format!("could not remove {}: {e}", path.display())),
+        }
+    }
+    // If nothing's left (models removed too), drop the directory itself.
+    if std::fs::read_dir(root)
+        .map(|mut r| r.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(root);
+        log.push(format!("removed {CONFIG_ROOT}"));
+    }
 }
 
 /// Remove every `pam_linhello` reference left under `/etc/pam.d` (after the
