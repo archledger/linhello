@@ -242,7 +242,39 @@ pub fn write_cameras_conf(rgb: &str, ir: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Hard deadline for one capture attempt. A frozen USB camera or hung V4L
+/// driver must never hang the PAM stack (login/sudo) — past the deadline we
+/// return an error (PAM falls through to password) and the stuck worker thread
+/// is abandoned (it holds one fd; the kernel reclaims it if the device resets).
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const IR_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Run a capture closure on a worker thread with a deadline.
+fn capture_with_timeout<T: Send + 'static>(
+    what: &str,
+    path: String,
+    timeout: std::time::Duration,
+    f: fn(&str) -> Result<T>,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let label = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(f(&path));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => Err(bio_err(format!(
+            "{what} camera {label} produced no frame within {}s (device hung or held by another app)",
+            timeout.as_secs()
+        ))),
+    }
+}
+
 pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
+    capture_with_timeout("IR", path.to_string(), IR_CAPTURE_TIMEOUT, capture_ir_from_blocking)
+}
+
+fn capture_ir_from_blocking(path: &str) -> Result<IrFrame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
 
     let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
@@ -290,27 +322,64 @@ pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
         .ok_or_else(|| bio_err("no IR frame captured"))
 }
 
+/// Pixel formats we can decode, in preference order. V4L2's S_FMT adjusts
+/// rather than failing on most drivers — we always decode by the fourcc the
+/// driver actually *returned* — but some drivers reject the request outright
+/// or settle on a format we can't decode (NV12-only pipelines, H264-only
+/// nodes). Trying each preference covers MJPEG-only and YUYV-only cameras.
+const RGB_FOURCC_PREFS: [&[u8; 4]; 2] = [b"MJPG", b"YUYV"];
+
+fn decodable(fourcc: &FourCC) -> bool {
+    matches!(&fourcc.repr, b"MJPG" | b"YUYV")
+}
+
 pub fn capture_from(path: &str) -> Result<Frame> {
+    capture_with_timeout("RGB", path.to_string(), CAPTURE_TIMEOUT, capture_from_blocking)
+}
+
+fn capture_from_blocking(path: &str) -> Result<Frame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
 
-    let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
-    fmt.width = CAPTURE_WIDTH;
-    fmt.height = CAPTURE_HEIGHT;
-    fmt.fourcc = FourCC::new(b"MJPG");
-    let fmt = dev.set_format(&fmt).map_err(|e| bio_err(format!("set format: {e}")))?;
+    let mut last_err: Option<crate::LinuxHelloError> = None;
+    for pref in RGB_FOURCC_PREFS {
+        let mut fmt = match dev.format() {
+            Ok(f) => f,
+            Err(e) => return Err(bio_err(format!("get format: {e}"))),
+        };
+        fmt.width = CAPTURE_WIDTH;
+        fmt.height = CAPTURE_HEIGHT;
+        fmt.fourcc = FourCC::new(pref);
+        // The driver may adjust width/height/fourcc — that's fine, we use what
+        // it returns. Only an outright rejection or an undecodable result moves
+        // us to the next preference.
+        let fmt = match dev.set_format(&fmt) {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = Some(bio_err(format!("set format {:?}: {e}", fourcc_str(pref))));
+                continue;
+            }
+        };
+        if !decodable(&fmt.fourcc) {
+            last_err = Some(bio_err(format!(
+                "driver chose unsupported pixel format {:?} (wanted {:?})",
+                fourcc_str(&fmt.fourcc.repr),
+                fourcc_str(pref),
+            )));
+            continue;
+        }
 
-    let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
-        .map_err(|e| bio_err(format!("stream init: {e}")))?;
-
-    for _ in 0..AE_WARMUP_RGB {
-        stream
-            .next()
-            .map_err(|e| bio_err(format!("warmup: {e}")))?;
+        let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+            .map_err(|e| bio_err(format!("stream init: {e}")))?;
+        for _ in 0..AE_WARMUP_RGB {
+            stream
+                .next()
+                .map_err(|e| bio_err(format!("warmup: {e}")))?;
+        }
+        let (buf, _meta) = stream.next().map_err(|e| bio_err(format!("stream next: {e}")))?;
+        return decode(&fmt.fourcc, buf, fmt.width, fmt.height);
     }
-
-    let (buf, _meta) = stream.next().map_err(|e| bio_err(format!("stream next: {e}")))?;
-
-    decode(&fmt.fourcc, buf, fmt.width, fmt.height)
+    Err(last_err
+        .unwrap_or_else(|| bio_err("no usable pixel format (camera offers neither MJPG nor YUYV)")))
 }
 
 fn decode(fourcc: &FourCC, buf: &[u8], w: u32, h: u32) -> Result<Frame> {

@@ -6,24 +6,40 @@
 
 use crate::bio_err;
 use linhello_common::Result;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-static INIT: Once = Once::new();
+/// The outcome of the single init attempt. Stored (not just attempted once and
+/// forgotten) so every later call reports the same actionable error instead of
+/// a misleading `Ok` after a failed first init.
+static INIT_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 pub fn ensure_initialized() -> Result<()> {
-    let mut err: Option<String> = None;
-    INIT.call_once(|| {
+    let outcome = INIT_RESULT.get_or_init(|| {
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-            if let Some(path) = linhello_common::platform::onnxruntime_dylib() {
-                std::env::set_var("ORT_DYLIB_PATH", path);
+            match linhello_common::platform::onnxruntime_dylib() {
+                Some(path) => std::env::set_var("ORT_DYLIB_PATH", path),
+                None => {
+                    // Make the most common fresh-install failure actionable
+                    // instead of a bare dlopen error.
+                    return Err(
+                        "libonnxruntime.so not found — install the ONNX Runtime package \
+                         (Arch: `pacman -S onnxruntime`; Debian/Ubuntu: libonnxruntime; \
+                         Fedora: onnxruntime), or set ORT_DYLIB_PATH"
+                            .to_string(),
+                    );
+                }
             }
         }
-        if let Err(e) = ort::init().with_name("linhello").commit() {
-            err = Some(format!("ort init: {e}"));
-        }
+        ort::init()
+            .with_name("linhello")
+            .commit()
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "ort init: {e} (is the onnxruntime package installed? \
+                     set ORT_DYLIB_PATH to override)"
+                )
+            })
     });
-    if let Some(e) = err {
-        return Err(bio_err(e));
-    }
-    Ok(())
+    outcome.clone().map_err(bio_err)
 }
