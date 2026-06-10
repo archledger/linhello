@@ -210,11 +210,36 @@ pub fn source_root() -> Option<PathBuf> {
     root.join("Makefile").exists().then_some(root)
 }
 
+/// Wait until the daemon actually answers on its socket (systemctl returning
+/// success only means the unit launched — the socket may not be up yet, or the
+/// process may have crashed right after). Polls Status for up to ~10s.
+fn wait_for_daemon() -> std::result::Result<(), String> {
+    use linhello_common::ipc::{Request, Response};
+    for _ in 0..20 {
+        if let Ok(Response::Status { .. }) = crate::send(Request::Status) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // Surface WHY: the unit's state and its last journal lines.
+    let why = Command::new("journalctl")
+        .args(["-u", "linhellod", "-n", "5", "--no-pager", "-o", "cat"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "no journal output".to_string());
+    Err(format!(
+        "linhellod did not answer on its socket within 10s. Last journal lines:\n{why}"
+    ))
+}
+
 /// Deploy the programs + daemon: run the repo Makefile's `install` target with
 /// the prebuilt artifacts (`CARGO=true CC=true` no-ops the rebuilds), then
-/// enable + start the daemon. Requires the source tree and `make`. Root-only
-/// (the TUI caller already runs as root).
-pub fn deploy() -> Result<Vec<String>, String> {
+/// enable + start the daemon and VERIFY it answers. Creates the `linhello`
+/// socket group and adds `user` to it so the unprivileged CLI works. Requires
+/// the source tree and `make`. Root-only (the TUI caller already runs as root).
+pub fn deploy(user: &str) -> Result<Vec<String>, String> {
     let root = source_root().ok_or(
         "can't find the LinuxHello source tree — set LINHELLO_SRC, or run from the repo's \
          target/release; on a packaged system, install via your package manager instead",
@@ -258,16 +283,47 @@ pub fn deploy() -> Result<Vec<String>, String> {
         .map(|s| s.success())
         .unwrap_or(false)
     {
-        log.push(
-            "created group 'linhello' — add yourself: sudo usermod -aG linhello $USER".to_string(),
-        );
+        log.push("created group 'linhello' (socket access for the CLI)".to_string());
+    }
+    // Add the target user to the group automatically — the manual usermod step
+    // was a setup hurdle. Disclosed in the log; membership applies at next login.
+    if !user.is_empty() && user != "root" {
+        let already = Command::new("id")
+            .args(["-nG", user])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .any(|g| g == "linhello")
+            })
+            .unwrap_or(false);
+        if already {
+            log.push(format!("'{user}' is already in the linhello group"));
+        } else if Command::new("usermod")
+            .args(["-aG", "linhello", user])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            log.push(format!(
+                "added '{user}' to the linhello group (CLI without sudo; takes effect at next login)"
+            ));
+        } else {
+            log.push(format!(
+                "could not add '{user}' to the linhello group — run: sudo usermod -aG linhello {user}"
+            ));
+        }
     }
     run_systemctl(&["daemon-reload"]);
-    if run_systemctl(&["enable", "--now", "linhellod"]) {
-        log.push("enabled + started linhellod".to_string());
-    } else {
-        log.push("warning: could not enable/start linhellod — check `systemctl status linhellod`".to_string());
+    if !run_systemctl(&["enable", "--now", "linhellod"]) {
+        return Err(
+            "could not enable/start linhellod — check `systemctl status linhellod`".to_string(),
+        );
     }
+    // Don't claim success until the daemon actually answers — systemctl can
+    // report a started unit whose process crashed immediately.
+    wait_for_daemon()?;
+    log.push("linhellod is running and answering on its socket".to_string());
     Ok(log)
 }
 

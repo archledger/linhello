@@ -43,6 +43,10 @@ SystemCallFilter=@system-service
 # @resources is needed by onnxruntime's thread pool (sched_setaffinity);
 # keep @privileged stripped so bpf/kexec/init_module stay denied.
 SystemCallFilter=~@privileged
+# ...but the daemon must chown its socket to the `linhello` group at startup,
+# and @privileged strips the chown family. Re-allow just that. Without this the
+# daemon dies SIGSYS on boot the moment the linhello group exists.
+SystemCallFilter=@chown
 
 # Devices: TPM resource manager + V4L cameras.
 DeviceAllow=/dev/tpmrm0 rw

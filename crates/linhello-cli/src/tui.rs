@@ -279,6 +279,17 @@ impl App {
     /// phased-progression gate: you can't skip past a step that isn't done.
     fn gate(&self) -> Result<(), &'static str> {
         match self.screen {
+            Screen::Install => {
+                if !self.install.is_installed() {
+                    Err("install first — press i to deploy")
+                } else if !self.install.daemon_active {
+                    Err("the daemon isn't running — press i to deploy/start it")
+                } else if !self.install.models_present {
+                    Err("required face models missing — press m to copy them in")
+                } else {
+                    Ok(())
+                }
+            }
             Screen::Doctor => match &self.report {
                 Some(Ok(r)) if r.can_run() => Ok(()),
                 Some(Ok(_)) => Err("host can't run LinuxHello — fix the [FAIL] item first"),
@@ -484,6 +495,16 @@ impl App {
             Screen::Password => self.password_key(code),
             Screen::Pam => self.pam_key(code),
             Screen::Doctor if matches!(code, KeyCode::Char('r')) => self.refresh_probe(),
+            // Self-heal: when the daemon is down, the user can have the wizard
+            // start it rather than being told to go run systemctl themselves.
+            Screen::Doctor if matches!(code, KeyCode::Char('s')) => {
+                self.log_activity("starting linhellod service (systemctl start)…");
+                match Self::restart_daemon_quiet() {
+                    Ok(()) => self.log_activity("started linhellod"),
+                    Err(e) => self.log_activity(format!("could not start linhellod: {e}")),
+                }
+                self.refresh_probe();
+            }
             _ => match code {
                 KeyCode::Enter | KeyCode::Right => self.next(),
                 KeyCode::Left => self.prev(),
@@ -500,7 +521,8 @@ impl App {
             InstallStep::Idle => match code {
                 KeyCode::Char('i') => {
                     self.log_activity("installing programs + daemon (make install)…");
-                    match crate::install::deploy() {
+                    let target_user = self.user.clone();
+                    match crate::install::deploy(&target_user) {
                         Ok(mut log) => {
                             for l in &log {
                                 self.log_activity(l.clone());
@@ -522,8 +544,10 @@ impl App {
                                         }
                                         log.extend(mlog);
                                         self.install = crate::install::InstallState::detect();
-                                        let _ = Self::restart_daemon_quiet();
-                                        self.log_activity("restarted linhellod service");
+                                        match Self::restart_daemon_quiet() {
+                                            Ok(()) => self.log_activity("restarted linhellod service"),
+                                            Err(e) => self.log_activity(format!("daemon restart failed: {e}")),
+                                        }
                                         self.install_step = InstallStep::Done { log };
                                     }
                                     Err(e) => {
@@ -578,8 +602,10 @@ impl App {
                                 self.log_activity(l.clone());
                             }
                             self.install = crate::install::InstallState::detect();
-                            let _ = Self::restart_daemon_quiet();
-                            self.log_activity("restarted linhellod service");
+                            match Self::restart_daemon_quiet() {
+                                Ok(()) => self.log_activity("restarted linhellod service"),
+                                Err(e) => self.log_activity(format!("daemon restart failed: {e}")),
+                            }
                             self.install_step = InstallStep::Done { log };
                         }
                         Err(e) => {
@@ -1388,8 +1414,15 @@ impl App {
                     }
                     v.push(Line::from(""));
                     v.push(Line::from(
-                        "i = deploy (auto-installs shipped + found models)    m = copy from a folder"
-                            .bold(),
+                        "i = install everything    m = copy models from a folder".bold(),
+                    ));
+                    v.push(Line::from(
+                        "    installs programs + PAM module, creates the linhello group and adds you,"
+                            .dim(),
+                    ));
+                    v.push(Line::from(
+                        "    starts the daemon (verified), installs models — every action shown below"
+                            .dim(),
                     ));
                     if let Some(root) = crate::install::source_root() {
                         v.push(Line::from(
@@ -1655,7 +1688,16 @@ impl App {
                     Line::from(""),
                     Line::from(e.clone()),
                     Line::from(""),
-                    Line::from("Is linhellod running? Press r to retry.".italic()),
+                    Line::from(vec![
+                        Span::styled("s", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" = start the daemon for me    "),
+                        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" = retry the probe"),
+                    ]),
+                    Line::from(""),
+                    Line::from(
+                        "(If starting fails, go back a step — Install will show why.)".italic(),
+                    ),
                 ],
             ),
             Some(Ok(report)) => {
