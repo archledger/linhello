@@ -19,8 +19,9 @@ use linhello_biometrics::camera::{self, CameraInfo, CameraKind};
 use linhello_common::config;
 use linhello_common::ipc::{
     CapabilityReport, CapabilityStatus, IdentifyCandidate, PositionReport, ProfileInfo, Request,
-    Response,
+    Response, SecretBytes,
 };
+use zeroize::Zeroize;
 use linhello_common::platform;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -43,6 +44,7 @@ enum Screen {
     Enroll,
     Calibrate,
     Identify,
+    Password,
     Pam,
     Done,
     /// Off the wizard path — reached from Welcome with `u`, returns with Esc.
@@ -60,6 +62,7 @@ impl Screen {
             Screen::Enroll => "Enroll",
             Screen::Calibrate => "Calibrate",
             Screen::Identify => "Identify",
+            Screen::Password => "Password",
             Screen::Pam => "Login wiring",
             Screen::Done => "Done",
             Screen::Uninstall => "Uninstall",
@@ -69,7 +72,7 @@ impl Screen {
 
 /// The linear wizard path. `Uninstall` is intentionally excluded — it is a side
 /// screen, not a step.
-const ORDER: [Screen; 10] = [
+const ORDER: [Screen; 11] = [
     Screen::Welcome,
     Screen::Install,
     Screen::Doctor,
@@ -78,6 +81,7 @@ const ORDER: [Screen; 10] = [
     Screen::Enroll,
     Screen::Calibrate,
     Screen::Identify,
+    Screen::Password,
     Screen::Pam,
     Screen::Done,
 ];
@@ -136,6 +140,16 @@ enum UninstallState {
 const UNINSTALL_WORD: &str = "REMOVE";
 const ACTIVITY_MAX: usize = 200;
 
+/// Seal-the-login-password step. The typed password (masked on screen) is
+/// TPM-sealed via `SealPassword`, creating the envelope `pam_linhello` unseals
+/// to set `PAM_AUTHTOK` — the linchpin for keyring unlock AND for face-auth to
+/// satisfy sudo/greeter at all.
+enum PasswordStep {
+    Entry { input: String },
+    Sealed,
+    Failed(String),
+}
+
 /// Install step: deploy the programs + daemon, then make sure the face models
 /// are present (copied from a directory the user points at).
 enum InstallStep {
@@ -175,6 +189,7 @@ struct App {
     /// When `Some`, the Profiles screen is editing the highlighted profile's name.
     name_input: Option<String>,
     identify: IdentifyState,
+    password: PasswordStep,
     uninstall: UninstallState,
     install_step: InstallStep,
     /// Rolling log of what the software has actually done to the system —
@@ -229,6 +244,9 @@ impl App {
             active_profile,
             name_input: None,
             identify: IdentifyState::Idle,
+            password: PasswordStep::Entry {
+                input: String::new(),
+            },
             uninstall: UninstallState::Idle { remove_models: true },
             install_step: InstallStep::Idle,
             activity: Vec::new(),
@@ -280,6 +298,15 @@ impl App {
                     Err("enroll at least one face sample first (press Enter)")
                 }
             }
+            Screen::Password => {
+                if matches!(self.password, PasswordStep::Sealed)
+                    || self.active_profile_has_password()
+                {
+                    Ok(())
+                } else {
+                    Err("seal your login password first — it's what unlocks the keyring and sudo")
+                }
+            }
             // Welcome / Profiles / Calibrate / Identify / Pam / Done are optional
             // to advance past.
             _ => Ok(()),
@@ -326,9 +353,26 @@ impl App {
                 self.cam_cursor = self.cam_cursor.min(self.cameras.len().saturating_sub(1));
             }
             Screen::Profiles => self.refresh_profiles(),
+            Screen::Password => {
+                self.refresh_profiles();
+                if self.active_profile_has_password() {
+                    self.password = PasswordStep::Sealed;
+                } else if !matches!(self.password, PasswordStep::Entry { .. }) {
+                    self.password = PasswordStep::Entry {
+                        input: String::new(),
+                    };
+                }
+            }
             Screen::Pam => self.pam = crate::pamwire::status(),
             _ => {}
         }
+    }
+
+    /// Does the active profile already have a sealed login-password envelope?
+    fn active_profile_has_password(&self) -> bool {
+        self.profiles
+            .iter()
+            .any(|p| p.user == self.active_profile && p.has_password)
     }
 
     fn refresh_profiles(&mut self) {
@@ -397,6 +441,13 @@ impl App {
             self.install_key(code);
             return;
         }
+        if self.screen == Screen::Password
+            && matches!(self.password, PasswordStep::Entry { .. })
+            && !matches!(code, KeyCode::Tab | KeyCode::BackTab)
+        {
+            self.password_key(code);
+            return;
+        }
         if self.screen == Screen::Uninstall {
             self.uninstall_key(code);
             return;
@@ -430,6 +481,7 @@ impl App {
             Screen::Calibrate => self.calibrate_key(code),
             Screen::Enroll => self.enroll_key(code),
             Screen::Identify => self.identify_key(code),
+            Screen::Password => self.password_key(code),
             Screen::Pam => self.pam_key(code),
             Screen::Doctor if matches!(code, KeyCode::Char('r')) => self.refresh_probe(),
             _ => match code {
@@ -641,6 +693,82 @@ impl App {
             KeyCode::Right => self.next(),
             KeyCode::Left => self.prev(),
             _ => {}
+        }
+    }
+
+    /// Password screen: type the login password (masked) and seal it to the TPM
+    /// so face-auth can unlock the keyring and satisfy sudo/greeter.
+    fn password_key(&mut self, code: KeyCode) {
+        let step = std::mem::replace(
+            &mut self.password,
+            PasswordStep::Entry {
+                input: String::new(),
+            },
+        );
+        match step {
+            PasswordStep::Entry { mut input } => match code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.password = PasswordStep::Entry { input };
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.password = PasswordStep::Entry { input };
+                }
+                KeyCode::Esc => {
+                    input.zeroize();
+                    self.status = "password entry cleared".to_string();
+                    self.password = PasswordStep::Entry {
+                        input: String::new(),
+                    };
+                }
+                KeyCode::Enter => {
+                    if input.is_empty() {
+                        self.status = "type your login password first".to_string();
+                        self.password = PasswordStep::Entry { input };
+                        return;
+                    }
+                    let user = self.active_profile.clone();
+                    let secret = SecretBytes::new(input.clone().into_bytes());
+                    input.zeroize();
+                    self.password = match crate::send(Request::SealPassword {
+                        user: user.clone(),
+                        password: secret,
+                    }) {
+                        Ok(Response::PasswordSealed) => {
+                            self.log_activity(format!(
+                                "sealed {user}'s login password to the TPM → /etc/linhello/{user}/password_envelope.json"
+                            ));
+                            self.install = crate::install::InstallState::detect();
+                            PasswordStep::Sealed
+                        }
+                        Ok(Response::Error { message }) => {
+                            self.log_activity(format!("seal password failed: {message}"));
+                            PasswordStep::Failed(message)
+                        }
+                        Ok(other) => PasswordStep::Failed(format!("unexpected: {other:?}")),
+                        Err(e) => PasswordStep::Failed(e.to_string()),
+                    };
+                }
+                _ => self.password = PasswordStep::Entry { input },
+            },
+            // Sealed / Failed: r re-enters, arrows navigate.
+            other => match code {
+                KeyCode::Char('r') => {
+                    self.password = PasswordStep::Entry {
+                        input: String::new(),
+                    }
+                }
+                KeyCode::Right => {
+                    self.password = other;
+                    self.next();
+                }
+                KeyCode::Left => {
+                    self.password = other;
+                    self.prev();
+                }
+                _ => self.password = other,
+            },
         }
     }
 
@@ -1119,6 +1247,7 @@ impl App {
             Screen::Enroll => self.body_enroll(frame, area),
             Screen::Calibrate => self.body_calibrate(frame, area),
             Screen::Identify => self.body_identify(frame, area),
+            Screen::Password => self.body_password(frame, area),
             Screen::Pam => self.body_pam(frame, area),
             Screen::Uninstall => self.body_uninstall(frame, area),
             Screen::Done => {
@@ -1756,6 +1885,54 @@ impl App {
         }
         lines.push(check(ready, "Ready to capture"));
         lines
+    }
+
+    fn body_password(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = match &self.password {
+            PasswordStep::Entry { input } => vec![
+                Line::from("Seal your login password".bold()),
+                Line::from(""),
+                Line::from(format!(
+                    "LinuxHello seals {}'s login password in the TPM. When your face",
+                    self.active_profile
+                )),
+                Line::from("matches, it hands that password to the login screen so your keyring"),
+                Line::from("unlocks — and it's what lets face-auth satisfy sudo without a prompt."),
+                Line::from(""),
+                Line::from("Without this, face-auth can't unlock anything and sudo keeps".yellow()),
+                Line::from("asking for your password.".yellow()),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Login password: "),
+                    Span::styled(
+                        "•".repeat(input.chars().count()),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("▏", Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(""),
+                Line::from("Type it (hidden), Enter to seal. Esc clears. It is never written to disk in the clear.".italic()),
+            ],
+            PasswordStep::Sealed => vec![
+                Line::from("Password sealed.".green().bold()),
+                Line::from(""),
+                Line::from(format!(
+                    "{}'s login password is sealed in the TPM. Face-auth can now unlock",
+                    self.active_profile
+                )),
+                Line::from("the keyring and satisfy sudo. Re-run `r` if you change your password."),
+                Line::from(""),
+                Line::from("Tab to continue to Login wiring.".italic()),
+            ],
+            PasswordStep::Failed(e) => vec![
+                Line::from("Couldn't seal the password.".red().bold()),
+                Line::from(""),
+                Line::from(e.clone()),
+                Line::from(""),
+                Line::from("Press r to try again.".italic()),
+            ],
+        };
+        self.body_paragraph(frame, area, lines);
     }
 
     fn body_pam(&self, frame: &mut Frame, area: Rect) {
