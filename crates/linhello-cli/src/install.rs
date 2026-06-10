@@ -235,10 +235,15 @@ fn wait_for_daemon() -> std::result::Result<(), String> {
 }
 
 /// Deploy the programs + daemon: run the repo Makefile's `install` target with
-/// the prebuilt artifacts (`CARGO=true CC=true` no-ops the rebuilds), then
+/// the prebuilt Rust artifacts (`CARGO=true` no-ops the cargo rebuild), then
 /// enable + start the daemon and VERIFY it answers. Creates the `linhello`
 /// socket group and adds `user` to it so the unprivileged CLI works. Requires
 /// the source tree and `make`. Root-only (the TUI caller already runs as root).
+///
+/// The C PAM shim (`pam/pam_linhello.so`) is NOT no-op'd: the README flow only
+/// runs `cargo build --release`, so on a fresh clone the shim doesn't exist yet
+/// — and its compile embeds `-rpath $(PAMDIR)`, which is distro-specific, so a
+/// shim built elsewhere could be wrong anyway. One small `cc` invocation.
 pub fn deploy(user: &str) -> Result<Vec<String>, String> {
     let root = source_root().ok_or(
         "can't find the LinuxHello source tree — set LINHELLO_SRC, or run from the repo's \
@@ -250,12 +255,7 @@ pub fn deploy(user: &str) -> Result<Vec<String>, String> {
     let pam_dir = linhello_common::platform::pam_module_dir();
     let out = Command::new("make")
         .current_dir(&root)
-        .args([
-            "install",
-            "CARGO=true",
-            "CC=true",
-            &format!("PAMDIR={pam_dir}"),
-        ])
+        .args(["install", "CARGO=true", &format!("PAMDIR={pam_dir}")])
         .output()
         .map_err(|e| format!("running make install: {e}"))?;
     if !out.status.success() {
