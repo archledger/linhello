@@ -43,6 +43,18 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
+    /// Remove LinuxHello from this host: unwire PAM (password login stays), stop
+    /// + disable the daemon, delete the programs/PAM module/unit/hook, and erase
+    /// enrolled faces + config in /etc/linhello. The big face models are removed
+    /// too unless `--keep-models`. Requires `--yes` to actually run. Root-only.
+    Uninstall {
+        /// Keep the ~190MB .onnx models (so a reinstall skips re-fetch).
+        #[arg(long)]
+        keep_models: bool,
+        /// Actually perform it (without this, only the plan is printed).
+        #[arg(long)]
+        yes: bool,
+    },
     /// First-run wizard: pick your webcam, calibrate the match threshold against
     /// your own live scores, and (optionally) enroll. Writes
     /// /etc/linhello/{cameras.conf,settings.conf} and restarts the daemon, so
@@ -344,6 +356,30 @@ fn profile_name_cmd(user: &str, name: &str) -> Result<()> {
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// `linhello uninstall [--keep-models] [--yes]` — headless full removal.
+fn uninstall_cmd(remove_models: bool, yes: bool) -> Result<()> {
+    require_root("uninstall")?;
+    println!("Uninstalling LinuxHello will:");
+    for step in install::uninstall_plan(remove_models) {
+        println!("  • {step}");
+    }
+    if !yes {
+        println!("\nNothing done. Re-run with --yes to perform it.");
+        return Ok(());
+    }
+    println!();
+    match install::uninstall(remove_models) {
+        Ok(log) => {
+            for l in log {
+                println!("  {l}");
+            }
+            println!("\nDone. Password login is unaffected.");
+            Ok(())
+        }
+        Err(e) => bail!(e),
     }
 }
 
@@ -722,6 +758,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Setup => run_setup()?,
         Cmd::Detect => detect_cmd(),
+        Cmd::Uninstall { keep_models, yes } => uninstall_cmd(!keep_models, yes)?,
         Cmd::Profiles => profiles_cmd()?,
         Cmd::Identify => identify_cmd()?,
         Cmd::ProfileName { user, name } => profile_name_cmd(&user, &name)?,
