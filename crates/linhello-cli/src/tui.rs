@@ -293,8 +293,11 @@ impl App {
         }
     }
 
-    /// Lazy side-effects when a screen becomes active.
+    /// Lazy side-effects when a screen becomes active. Re-detects the install
+    /// state every time so the wizard reflects reality live (e.g. right after an
+    /// uninstall or install), rather than a stale snapshot from startup.
     fn on_enter(&mut self) {
+        self.install = crate::install::InstallState::detect();
         match self.screen {
             Screen::Doctor if self.report.is_none() => self.refresh_probe(),
             Screen::Cameras => {
@@ -328,6 +331,7 @@ impl App {
             Err(e) => self.pam_note = vec![format!("error: {e}")],
         }
         self.pam = crate::pamwire::status();
+        self.install = crate::install::InstallState::detect();
     }
 
     fn refresh_probe(&mut self) {
@@ -601,6 +605,7 @@ impl App {
                 KeyCode::Esc => {
                     self.uninstall = UninstallState::Idle { remove_data };
                     self.screen = Screen::Welcome;
+                    self.on_enter();
                 }
                 _ => self.uninstall = UninstallState::Idle { remove_data },
             },
@@ -624,7 +629,10 @@ impl App {
                     if input.trim() == UNINSTALL_WORD {
                         // Perform it. Blocks briefly; fine for a one-shot.
                         match crate::install::uninstall(remove_data) {
-                            Ok(log) => self.uninstall = UninstallState::Done { log },
+                            Ok(log) => {
+                                self.install = crate::install::InstallState::detect();
+                                self.uninstall = UninstallState::Done { log };
+                            }
                             Err(e) => self.uninstall = UninstallState::Failed(e),
                         }
                     } else {
@@ -639,6 +647,7 @@ impl App {
                 if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.screen = Screen::Welcome;
                     self.uninstall = UninstallState::Idle { remove_data: false };
+                    self.on_enter();
                 } else {
                     self.uninstall = other;
                 }
@@ -897,6 +906,8 @@ impl App {
                             let n = captured + 1;
                             self.status = format!("captured {n}/{ENROLL_TARGET}");
                             self.enroll = if n >= ENROLL_TARGET {
+                                // Reflect the new enrollment in live detection.
+                                self.install = crate::install::InstallState::detect();
                                 EnrollState::Done { captured: n }
                             } else {
                                 EnrollState::Framing { captured: n, streak: 0 }

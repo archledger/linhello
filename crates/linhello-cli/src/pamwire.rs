@@ -137,7 +137,10 @@ pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
     match platform::distro_family() {
         DistroFamily::Debian => debian_disable(dry_run),
         DistroFamily::Fedora => fedora_disable(dry_run),
-        DistroFamily::Arch | DistroFamily::Other => existing_targets(false)
+        // include_sudo: true — disable must clean sudo even though enable makes
+        // it opt-in, otherwise `auth sufficient pam_linhello.so` is left behind
+        // (a dangling reference once the module is removed).
+        DistroFamily::Arch | DistroFamily::Other => existing_targets(true)
             .into_iter()
             .map(|p| remove_in(&p, dry_run))
             .collect(),

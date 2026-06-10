@@ -252,6 +252,10 @@ pub fn uninstall(remove_data: bool) -> Result<Vec<String>, String> {
             ))
         }
     }
+    // Belt-and-suspenders: scrub any remaining pam_linhello reference (the
+    // system-auth reseal line, a throwaway test service, stragglers) so the
+    // module is never left referenced after it is deleted.
+    scrub_pam_references(&mut log);
 
     if run_systemctl(&["disable", "--now", "linhellod"]) {
         log.push("stopped and disabled linhellod".to_string());
@@ -288,6 +292,51 @@ pub fn uninstall(remove_data: bool) -> Result<Vec<String>, String> {
     }
 
     Ok(log)
+}
+
+/// Remove every `pam_linhello` reference left under `/etc/pam.d` (after the
+/// per-distro `pamwire::disable` has done the structured unwiring). Drops the
+/// throwaway `linhello-test` service entirely; for other files, strips the
+/// referencing lines and keeps a `.pre-linhello-uninstall` backup. This is what
+/// guarantees no stack references the module once it's deleted.
+fn scrub_pam_references(log: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir("/etc/pam.d") else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content.contains("pam_linhello") {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("linhello-test") {
+            if std::fs::remove_file(&path).is_ok() {
+                log.push(format!("removed {}", path.display()));
+            }
+            continue;
+        }
+        let kept: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.contains("pam_linhello"))
+            .collect();
+        let mut cleaned = kept.join("\n");
+        if content.ends_with('\n') {
+            cleaned.push('\n');
+        }
+        let backup = format!("{}.pre-linhello-uninstall", path.display());
+        let _ = std::fs::copy(&path, &backup);
+        if std::fs::write(&path, cleaned).is_ok() {
+            log.push(format!(
+                "scrubbed pam_linhello from {} (backup {backup})",
+                path.display()
+            ));
+        }
+    }
 }
 
 fn remove_if(path: &Path, log: &mut Vec<String>) {
