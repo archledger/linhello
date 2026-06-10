@@ -315,6 +315,9 @@ pub fn deploy(user: &str) -> Result<Vec<String>, String> {
         }
     }
     run_systemctl(&["daemon-reload"]);
+    // A prior crash-loop leaves the unit in start-limit-hit; clear it so this
+    // (re)install can actually start the fixed daemon.
+    run_systemctl(&["reset-failed", "linhellod"]);
     if !run_systemctl(&["enable", "--now", "linhellod"]) {
         return Err(
             "could not enable/start linhellod — check `systemctl status linhellod`".to_string(),
