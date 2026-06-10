@@ -134,6 +134,7 @@ enum UninstallState {
 }
 
 const UNINSTALL_WORD: &str = "REMOVE";
+const ACTIVITY_MAX: usize = 200;
 
 /// Install step: deploy the programs + daemon, then make sure the face models
 /// are present (copied from a directory the user points at).
@@ -176,6 +177,9 @@ struct App {
     identify: IdentifyState,
     uninstall: UninstallState,
     install_step: InstallStep,
+    /// Rolling log of what the software has actually done to the system —
+    /// shown live in the activity bar so the user can see every change.
+    activity: Vec<String>,
     /// Set true once the user explicitly saves a camera selection this session
     /// (or an existing cameras.conf is present) — gates leaving the Cameras step.
     cameras_saved: bool,
@@ -225,6 +229,7 @@ impl App {
             identify: IdentifyState::Idle,
             uninstall: UninstallState::Idle { remove_data: false },
             install_step: InstallStep::Idle,
+            activity: Vec::new(),
             cameras_saved,
             status: String::new(),
             should_quit: false,
@@ -233,6 +238,19 @@ impl App {
 
     fn step_index(&self) -> usize {
         ORDER.iter().position(|s| *s == self.screen).unwrap_or(0)
+    }
+
+    /// Record a system-affecting action so the user can see, live, exactly what
+    /// the software is doing to their machine. The newest line also becomes the
+    /// footer status.
+    fn log_activity(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.status = msg.clone();
+        self.activity.push(msg);
+        if self.activity.len() > ACTIVITY_MAX {
+            let drop = self.activity.len() - ACTIVITY_MAX;
+            self.activity.drain(0..drop);
+        }
     }
 
     /// Whether the current step is complete enough to advance. `Err(reason)`
@@ -326,9 +344,16 @@ impl App {
         match res {
             Ok(changes) => {
                 self.pam_note = changes.iter().map(|c| c.describe()).collect();
-                self.status = if enable { "applied: face login enabled" } else { "applied: face login disabled" }.to_string();
+                let verb = if enable { "enabling" } else { "disabling" };
+                self.log_activity(format!("{verb} face login in PAM:"));
+                for c in &changes {
+                    self.log_activity(format!("   {}", c.describe()));
+                }
             }
-            Err(e) => self.pam_note = vec![format!("error: {e}")],
+            Err(e) => {
+                self.pam_note = vec![format!("error: {e}")];
+                self.log_activity(format!("PAM change failed: {e}"));
+            }
         }
         self.pam = crate::pamwire::status();
         self.install = crate::install::InstallState::detect();
@@ -422,24 +447,27 @@ impl App {
         match step {
             InstallStep::Idle => match code {
                 KeyCode::Char('i') => {
-                    self.status = "deploying… (running make install)".to_string();
+                    self.log_activity("installing programs + daemon (make install)…");
                     match crate::install::deploy() {
                         Ok(mut log) => {
+                            for l in &log {
+                                self.log_activity(l.clone());
+                            }
                             self.install = crate::install::InstallState::detect();
                             if self.install.models_present {
                                 log.push("face models already in place".to_string());
-                                self.status = "installed".to_string();
                                 self.install_step = InstallStep::Done { log };
                             } else {
-                                self.status =
-                                    "deployed — now give me the folder holding the .onnx models"
-                                        .to_string();
+                                self.log_activity("models missing — point me at the .onnx folder");
                                 self.install_step = InstallStep::ModelPath {
                                     input: String::new(),
                                 };
                             }
                         }
-                        Err(e) => self.install_step = InstallStep::Failed(e),
+                        Err(e) => {
+                            self.log_activity(format!("install failed: {e}"));
+                            self.install_step = InstallStep::Failed(e);
+                        }
                     }
                 }
                 KeyCode::Char('m') => {
@@ -467,15 +495,19 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let dir = std::path::PathBuf::from(input.trim());
+                    self.log_activity(format!("copying models from {} → /etc/linhello", dir.display()));
                     match crate::install::copy_models_from(&dir) {
                         Ok(log) => {
+                            for l in &log {
+                                self.log_activity(l.clone());
+                            }
                             self.install = crate::install::InstallState::detect();
                             let _ = Self::restart_daemon_quiet();
-                            self.status = "models installed; daemon restarted".to_string();
+                            self.log_activity("restarted linhellod service");
                             self.install_step = InstallStep::Done { log };
                         }
                         Err(e) => {
-                            self.status = format!("error: {e}");
+                            self.log_activity(format!("model copy failed: {e}"));
                             self.install_step = InstallStep::ModelPath { input };
                         }
                     }
@@ -558,7 +590,9 @@ impl App {
                         name: name.clone(),
                     }) {
                         Ok(Response::ProfileNameSet) => {
-                            self.status = format!("named '{user}': {name}");
+                            self.log_activity(format!(
+                                "set name of profile '{user}' → \"{name}\" (/etc/linhello/{user}/display_name)"
+                            ));
                             self.refresh_profiles();
                         }
                         Ok(Response::Error { message }) => self.status = format!("error: {message}"),
@@ -628,12 +662,19 @@ impl App {
                 KeyCode::Enter => {
                     if input.trim() == UNINSTALL_WORD {
                         // Perform it. Blocks briefly; fine for a one-shot.
+                        self.log_activity("uninstalling LinuxHello…");
                         match crate::install::uninstall(remove_data) {
                             Ok(log) => {
+                                for l in &log {
+                                    self.log_activity(l.clone());
+                                }
                                 self.install = crate::install::InstallState::detect();
                                 self.uninstall = UninstallState::Done { log };
                             }
-                            Err(e) => self.uninstall = UninstallState::Failed(e),
+                            Err(e) => {
+                                self.log_activity(format!("uninstall aborted: {e}"));
+                                self.uninstall = UninstallState::Failed(e);
+                            }
                         }
                     } else {
                         self.status = format!("type exactly {UNINSTALL_WORD}");
@@ -743,12 +784,13 @@ impl App {
                     .as_deref()
                     .map(|p| format!(", ir={p}"))
                     .unwrap_or_default();
-                self.status = match Self::restart_daemon_quiet() {
-                    Ok(()) => format!("saved rgb={rgb}{ir}; daemon restarted"),
-                    Err(e) => format!("saved cameras.conf; restart failed: {e}"),
-                };
+                self.log_activity(format!("wrote /etc/linhello/cameras.conf (rgb={rgb}{ir})"));
+                match Self::restart_daemon_quiet() {
+                    Ok(()) => self.log_activity("restarted linhellod service"),
+                    Err(e) => self.log_activity(format!("daemon restart failed: {e}")),
+                }
             }
-            Err(e) => self.status = format!("save failed: {e}"),
+            Err(e) => self.log_activity(format!("could not write cameras.conf: {e}")),
         }
     }
 
@@ -791,13 +833,16 @@ impl App {
         if let Some(v) = save_val {
             match config::write_kv("settings.conf", "match_threshold", &format!("{v:.2}")) {
                 Ok(()) => {
-                    self.status = match Self::restart_daemon_quiet() {
-                        Ok(()) => format!("saved match_threshold={v:.2}; daemon restarted"),
-                        Err(e) => format!("saved match_threshold={v:.2}; restart failed: {e}"),
-                    };
+                    self.log_activity(format!(
+                        "wrote match_threshold={v:.2} → /etc/linhello/settings.conf"
+                    ));
+                    match Self::restart_daemon_quiet() {
+                        Ok(()) => self.log_activity("restarted linhellod service"),
+                        Err(e) => self.log_activity(format!("daemon restart failed: {e}")),
+                    }
                     cal = CalState::Saved { value: v };
                 }
-                Err(e) => self.status = format!("save failed: {e}"),
+                Err(e) => self.log_activity(format!("could not write settings.conf: {e}")),
             }
         }
         self.cal = cal;
@@ -904,7 +949,10 @@ impl App {
                     match self.do_enroll_capture() {
                         Ok(()) => {
                             let n = captured + 1;
-                            self.status = format!("captured {n}/{ENROLL_TARGET}");
+                            self.log_activity(format!(
+                                "stored face sample {n}/{ENROLL_TARGET} (encrypted) → /etc/linhello/{}/embedding.enc",
+                                self.active_profile
+                            ));
                             self.enroll = if n >= ENROLL_TARGET {
                                 // Reflect the new enrollment in live detection.
                                 self.install = crate::install::InstallState::detect();
@@ -913,7 +961,10 @@ impl App {
                                 EnrollState::Framing { captured: n, streak: 0 }
                             };
                         }
-                        Err(e) => self.enroll = EnrollState::Failed(e),
+                        Err(e) => {
+                            self.log_activity(format!("enroll capture failed: {e}"));
+                            self.enroll = EnrollState::Failed(e);
+                        }
                     }
                 } else {
                     self.enroll = EnrollState::Countdown { captured, left: left - 1 };
@@ -925,9 +976,10 @@ impl App {
 
     fn render(&self, frame: &mut Frame) {
         let chunks = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(3), // header
+            Constraint::Min(0),    // body
+            Constraint::Length(6), // activity bar
+            Constraint::Length(3), // footer
         ])
         .split(frame.area());
 
@@ -950,6 +1002,7 @@ impl App {
         frame.render_widget(header, chunks[0]);
 
         self.render_body(frame, chunks[1]);
+        self.render_activity(frame, chunks[2]);
 
         let key = |k: &'static str| {
             Span::styled(
@@ -967,7 +1020,39 @@ impl App {
             Span::styled(self.status.clone(), Style::default().fg(Color::DarkGray)),
         ]))
         .block(Block::bordered());
-        frame.render_widget(footer, chunks[2]);
+        frame.render_widget(footer, chunks[3]);
+    }
+
+    /// The activity bar: a live, plain-language feed of every change the
+    /// software makes to the system, so the user can always see what is being
+    /// done to their machine. Shows the most recent entries (newest last).
+    fn render_activity(&self, frame: &mut Frame, area: Rect) {
+        let title =
+            " ● Activity — what LinuxHello is doing to your system (newest last) ".to_string();
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(Color::Blue));
+        let inner_rows = area.height.saturating_sub(2) as usize;
+        let lines: Vec<Line> = if self.activity.is_empty() {
+            vec![Line::from(
+                "Nothing changed yet. Any file the software touches will be listed here."
+                    .dim()
+                    .italic(),
+            )]
+        } else {
+            let shown = self.activity.len().min(inner_rows.max(1));
+            self.activity[self.activity.len() - shown..]
+                .iter()
+                .map(|m| {
+                    Line::from(vec![
+                        Span::styled("→ ", Style::default().fg(Color::Blue)),
+                        Span::raw(m.clone()),
+                    ])
+                })
+                .collect()
+        };
+        let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(p, area);
     }
 
     fn render_body(&self, frame: &mut Frame, area: Rect) {
@@ -1589,10 +1674,17 @@ impl App {
 
     fn body_pam(&self, frame: &mut Frame, area: Rect) {
         let distro = platform::distro_family().as_str();
+        let greeter_on = self.pam.iter().any(|s| pam_role(&s.path) == "login screen" && s.wired);
         let mut lines = vec![
-            Line::from("Enable face login".bold()),
+            Line::from("Login wiring — connect face auth into your login".bold()),
             Line::from(""),
-            Line::from(format!("Distro family: {distro}    e=enable · a=enable+sudo · d=disable")),
+            Line::from("LinuxHello works by adding one line to your login's PAM stack so"),
+            Line::from("your face can stand in for the password (and unlock the keyring)."),
+            Line::from("Every change is backed up and listed in the Activity bar below."),
+            Line::from(""),
+            Line::from("What it wires:".bold()),
+            Line::from("  • login screen — face unlock + keyring  (needed for LinuxHello)"),
+            Line::from("  • sudo — face for sudo prompts  (optional)"),
             Line::from(""),
         ];
         if self.pam.is_empty() {
@@ -1601,28 +1693,44 @@ impl App {
             lines.push(Line::from("Current wiring:".bold()));
             for s in &self.pam {
                 let (tag, color) = if s.wired {
-                    ("[on ]", Color::Green)
+                    ("[ on ]", Color::Green)
                 } else {
-                    ("[off]", Color::DarkGray)
+                    ("[ off]", Color::DarkGray)
                 };
                 lines.push(Line::from(vec![
                     Span::styled(tag, Style::default().fg(color)),
-                    Span::raw(format!(" {}", s.path.display())),
+                    Span::raw(format!(" {:<26} {}", pam_role(&s.path), s.path.display())),
                 ]));
             }
         }
-        if !self.pam_note.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from("Last action:".bold()));
-            for n in &self.pam_note {
-                lines.push(Line::from(format!("  {n}")));
-            }
+        lines.push(Line::from(""));
+        // Tell the user clearly whether the needed wiring is in place.
+        if greeter_on {
+            lines.push(Line::from(
+                "✓ Face login is wired into your login screen.".green(),
+            ));
+        } else {
+            lines.push(Line::from(
+                "✗ Face login is NOT wired yet — press e to set it up.".yellow(),
+            ));
         }
         lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "[{distro}]   e = enable (login screen)   a = enable + sudo   d = remove"
+        )));
         lines.push(Line::from(
-            "Face-auth is a fallback (password still works); the TTY login is left alone.".italic(),
+            "Password login always keeps working; the TTY login is never touched.".italic(),
         ));
         self.body_paragraph(frame, area, lines);
+    }
+}
+
+/// Human role of a PAM file for the wiring screen.
+fn pam_role(path: &std::path::Path) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("sudo") => "sudo",
+        Some("system-auth") | Some("password-auth") | Some("common-auth") => "system auth",
+        _ => "login screen",
     }
 }
 
