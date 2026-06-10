@@ -79,8 +79,11 @@ install: all
 	sed 's|/usr/local/bin|$(BINDIR)|g' etc/pacman.d/hooks/linhello-reseal.hook \
 	    | install -Dm644 /dev/stdin $(DESTDIR)/etc/pacman.d/hooks/linhello-reseal.hook
 	install -dm755 $(DESTDIR)$(CONFDIR)
+	# Ship the Apache-2.0 anti-spoof models so install needs no PyTorch/convert.
+	install -Dm644 models/antispoof.onnx   $(DESTDIR)$(CONFDIR)/antispoof.onnx
+	install -Dm644 models/antispoof_4.onnx $(DESTDIR)$(CONFDIR)/antispoof_4.onnx
 	@echo
-	@echo "Installed. Next:"
+	@echo "Installed (incl. anti-spoof models). Next — fetch buffalo_l (InsightFace):"
 	@echo "  systemctl daemon-reload && systemctl enable --now linhellod"
 	@echo "  cp /path/to/det_10g.onnx  $(CONFDIR)/det_10g.onnx"
 	@echo "  cp /path/to/w600k_r50.onnx $(CONFDIR)/face.onnx"

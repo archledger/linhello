@@ -48,32 +48,30 @@ export LINHELLO_MODEL_PATH=/path/to/w600k_r50.onnx
 linhello enroll
 ```
 
-## Installing the anti-spoof model (optional but recommended)
+## The anti-spoof model ships with LinuxHello
 
-Without this model LinuxHello still performs face recognition, but a printed photo
-of the enrolled user's face will pass. With it, MiniFASNet scores a spoof
-probability on every verify and the daemon rejects frames above
-`LINHELLO_SPOOF_THRESHOLD` (default 0.5).
+Unlike buffalo_l, the MiniFASNet anti-spoof models are **Apache-2.0** and small
+(~1.9 MB each), so they ship in this repo (`models/antispoof.onnx`,
+`models/antispoof_4.onnx`) and `make install` deploys them to `/etc/linhello`
+automatically. **No PyTorch, no conversion, nothing to download** — that's why
+a fresh install doesn't need the heavy toolchain.
 
-The MiniFASNet `2.7_80x80_MiniFASNetV2` model from
-`minivision-ai/Silent-Face-Anti-Spoofing` is expected. Input is `[1,3,80,80]`
-BGR float32 (0–255, no mean/std); output is three logits with class 1 = real.
+Without this model LinuxHello would still recognize faces, but a printed photo
+of the enrolled user would pass; with it, MiniFASNet scores a spoof probability
+on every verify and the daemon rejects frames above `LINHELLO_SPOOF_THRESHOLD`
+(default 0.5). The daemon is fail-closed by default, so the bundled model
+keeps that protection on out of the box.
 
-Upstream ships `.pth` weights, not ONNX. Convert them yourself — we don't
-trust third-party mirrors for a security-critical gate, because a tampered
-model that always outputs "real" would silently defeat liveness:
+Provenance + checksums are in `models/antispoof.NOTICE` and `models/SHA256SUMS`
+— **verify them**, since a tampered liveness model would silently always say
+"real". To rebuild from the upstream `.pth` weights yourself (and confirm the
+checksums match):
 
 ```sh
-# one-time (~2 GB on Arch)
+# one-time (~2 GB on Arch) — only needed if you want to re-derive the models
 sudo pacman -S python-pytorch git
-
-# from the linhello repo root
 python3 scripts/convert_antispoof.py antispoof.onnx
-
-# install
-sudo install -m 0644 antispoof.onnx /etc/linhello/antispoof.onnx
-sudo systemctl restart linhellod
-linhello liveness-test     # should now print a real spoof_prob
+sha256sum -c models/SHA256SUMS
 ```
 
 Tune or disable:

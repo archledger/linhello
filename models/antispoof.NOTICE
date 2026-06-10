@@ -1,0 +1,21 @@
+# Anti-spoof models — attribution & provenance
+
+`antispoof.onnx` and `antispoof_4.onnx` shipped here are ONNX conversions of
+the MiniFASNet anti-spoofing models from:
+
+    minivision-ai / Silent-Face-Anti-Spoofing
+    https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
+    Licensed under the Apache License, Version 2.0.
+
+Source weights:
+    antispoof.onnx    ← 2.7_80x80_MiniFASNetV2.pth      (primary,   2.7× crop)
+    antispoof_4.onnx  ← 4_0_0_80x80_MiniFASNetV1SE.pth  (secondary, 4.0× crop)
+
+These are LinuxHello's own conversions (see `scripts/convert_antispoof.py`),
+shipped so installation does not require a 2GB PyTorch toolchain. Because this
+is a security-critical liveness gate, verify the files against `SHA256SUMS`
+before trusting them — a tampered model that always outputs "real" would
+silently defeat anti-spoofing. To rebuild from upstream yourself, run
+`scripts/convert_antispoof.py` and compare the checksums.
+
+A copy of the Apache 2.0 license is at https://www.apache.org/licenses/LICENSE-2.0.

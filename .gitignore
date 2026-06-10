@@ -2,6 +2,11 @@
 **/*.rs.bk
 Cargo.lock.bak
 *.onnx
+# Exception: the anti-spoof models are Apache-2.0 (minivision-ai Silent-Face)
+# and small (~1.9MB each), so we ship them to keep install smooth. buffalo_l
+# (det_10g/face) stays user-fetched (InsightFace license).
+!/models/antispoof.onnx
+!/models/antispoof_4.onnx
 /etc/linhello/*/embedding.bin
 /etc/linhello/*/tpm_envelope.json
 
