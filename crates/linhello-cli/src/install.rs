@@ -219,9 +219,18 @@ pub fn deploy() -> Result<Vec<String>, String> {
         "can't find the LinuxHello source tree — set LINHELLO_SRC, or run from the repo's \
          target/release; on a packaged system, install via your package manager instead",
     )?;
+    // The Makefile's PAMDIR default is the Arch location; on Debian/Fedora the
+    // PAM module dir differs — resolve it for the running distro so the greeter
+    // can actually load the module after install.
+    let pam_dir = linhello_common::platform::pam_module_dir();
     let out = Command::new("make")
         .current_dir(&root)
-        .args(["install", "CARGO=true", "CC=true"])
+        .args([
+            "install",
+            "CARGO=true",
+            "CC=true",
+            &format!("PAMDIR={pam_dir}"),
+        ])
         .output()
         .map_err(|e| format!("running make install: {e}"))?;
     if !out.status.success() {
@@ -230,7 +239,29 @@ pub fn deploy() -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let mut log = vec![format!("installed binaries + unit from {}", root.display())];
+    let mut log = vec![
+        format!("installed binaries + unit from {}", root.display()),
+        format!("PAM module → {pam_dir}"),
+    ];
+    // Create the socket group so the user's own session can run the read-only
+    // CLI (status/test/doctor) without sudo. Root/PAM never needs it.
+    if Command::new("getent")
+        .args(["group", "linhello"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        log.push("group 'linhello' already exists".to_string());
+    } else if Command::new("groupadd")
+        .args(["--system", "linhello"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        log.push(
+            "created group 'linhello' — add yourself: sudo usermod -aG linhello $USER".to_string(),
+        );
+    }
     run_systemctl(&["daemon-reload"]);
     if run_systemctl(&["enable", "--now", "linhellod"]) {
         log.push("enabled + started linhellod".to_string());

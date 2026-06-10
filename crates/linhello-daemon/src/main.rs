@@ -24,14 +24,14 @@ fn get_template_key_cache() -> &'static Mutex<HashMap<String, zeroize::Zeroizing
 fn cached_template_key(user: &str) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, String> {
     let cache = get_template_key_cache();
     {
-        let map = cache.lock().unwrap();
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(key) = map.get(user) {
             return Ok(key.clone());
         }
     }
     let key = linhello_core::ensure_template_key(user).map_err(|e| e.to_string())?;
     {
-        let mut map = cache.lock().unwrap();
+        let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(user.to_string(), key.clone());
     }
     Ok(key)
@@ -65,8 +65,15 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
 
+    // Bind under a restrictive umask so the socket is never world-connectable,
+    // even for the instant between bind() and the explicit chmod below.
+    // SAFETY: umask is a simple process-wide mode set/get with no preconditions.
+    let old_umask = unsafe { libc::umask(0o117) };
     let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
+        .with_context(|| format!("binding {}", socket.display()));
+    // SAFETY: restoring the previous process umask; no preconditions.
+    unsafe { libc::umask(old_umask) };
+    let listener = listener?;
     // Prefer `0660 root:linhello` so only group members can reach the socket.
     // If the `linhello` group doesn't exist yet, fall back to `0660` root-only
     // (privileged callers are root anyway) rather than a world-writable 0666 —
@@ -735,7 +742,7 @@ fn do_reseal_user_envelopes(user: &str) -> Response {
                                 // Invalidate the daemon's cached key so next
                                 // verify picks up the fresh envelope.
                                 let cache = get_template_key_cache();
-                                let mut map = cache.lock().unwrap();
+                                let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
                                 map.remove(user);
                             }
                             Err(e) => tracing::warn!("save template key for {user}: {e}"),
