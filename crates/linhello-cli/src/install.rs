@@ -139,6 +139,27 @@ const REQUIRED_FOR_COPY: [(&str, bool); 3] = [
     ("antispoof.onnx", false),
 ];
 
+/// Files that must be present for a directory to count as a usable model bundle.
+const BUNDLE_REQUIRED: [&str; 2] = ["det_10g.onnx", "face.onnx"];
+
+/// Find a directory that already holds the required models so the installer can
+/// copy them in instantly — no download, no path typing. Searched in order:
+/// `$LINHELLO_MODELS_DIR`, `<source_root>/models`, `/usr/share/linhello/models`.
+/// A bundle ships these out-of-band (size + model license keep them out of git).
+pub fn bundled_models_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = std::env::var("LINHELLO_MODELS_DIR") {
+        candidates.push(PathBuf::from(d));
+    }
+    if let Some(root) = source_root() {
+        candidates.push(root.join("models"));
+    }
+    candidates.push(PathBuf::from("/usr/share/linhello/models"));
+    candidates
+        .into_iter()
+        .find(|d| BUNDLE_REQUIRED.iter().all(|m| d.join(m).exists()))
+}
+
 /// Locate the source/build tree to install from: `$LINHELLO_SRC` (must hold a
 /// Makefile), else derived from the running binary at
 /// `<root>/target/release/linhello`. `None` if neither looks like the repo.

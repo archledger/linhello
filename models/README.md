@@ -11,6 +11,21 @@ The biometrics pipeline loads up to three ONNX models at runtime:
 Detector + recognizer both ship inside the `buffalo_l` pack from InsightFace.
 Anti-spoof is a separate model from `minivision-ai/Silent-Face-Anti-Spoofing`.
 
+> **The models are NOT distributed with LinuxHello** (size + upstream
+> licensing). Obtain them from the official sources below. The setup wizard
+> (`linhello tui` / `linhello setup`) makes this painless: if it finds the model
+> files in a directory it knows about, it copies them in automatically — no
+> typing, no download prompt. It looks, in order, at:
+>
+> 1. `$LINHELLO_MODELS_DIR`
+> 2. `<repo>/models/` (next to the source tree the installer runs from)
+> 3. `/usr/share/linhello/models/`
+>
+> Drop `det_10g.onnx`, `face.onnx` (and optionally `antispoof.onnx`) into any of
+> those and the installer handles the rest. `make models-bundle` packs the models
+> already on a working machine into a tarball you can carry to another box — a
+> convenience for *your own* deployments, not a redistribution channel.
+
 ## Installing buffalo_l
 
 ```sh

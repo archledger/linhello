@@ -87,6 +87,22 @@ install: all
 	@echo "  linhello enroll --user \$$USER"
 	@echo "  PAM examples in $(PREFIX)/share/linhello/pam.d/"
 
+# Package the installed, tested face models into a shippable bundle so a new
+# user can install them instantly (no slow download / hunting for files). The
+# models live out of git (size + model license) — MODELS_SRC defaults to the
+# system config dir where they are deployed. `linhello`'s installer auto-detects
+# an unpacked bundle at <repo>/models, /usr/share/linhello/models, or
+# $LINHELLO_MODELS_DIR.
+MODELS_SRC   ?= $(CONFDIR)
+MODELS_BUNDLE ?= packaging/linhello-models.tar.gz
+models-bundle:
+	@for m in det_10g.onnx face.onnx antispoof.onnx; do \
+	    [ -f "$(MODELS_SRC)/$$m" ] || { echo "missing $(MODELS_SRC)/$$m"; exit 1; }; \
+	done
+	mkdir -p $(dir $(MODELS_BUNDLE))
+	tar -C $(MODELS_SRC) -czf $(MODELS_BUNDLE) det_10g.onnx face.onnx antispoof.onnx
+	@echo "wrote $(MODELS_BUNDLE) (ship as a release asset; unpack to <repo>/models or /usr/share/linhello/models)"
+
 clean:
 	$(CARGO) clean
 	rm -f $(PAM_SO)

@@ -457,6 +457,30 @@ impl App {
                             if self.install.models_present {
                                 log.push("face models already in place".to_string());
                                 self.install_step = InstallStep::Done { log };
+                            } else if let Some(dir) = crate::install::bundled_models_dir() {
+                                // Bundled models found — copy them automatically.
+                                self.log_activity(format!(
+                                    "found bundled models in {} — installing them",
+                                    dir.display()
+                                ));
+                                match crate::install::copy_models_from(&dir) {
+                                    Ok(mlog) => {
+                                        for l in &mlog {
+                                            self.log_activity(l.clone());
+                                        }
+                                        log.extend(mlog);
+                                        self.install = crate::install::InstallState::detect();
+                                        let _ = Self::restart_daemon_quiet();
+                                        self.log_activity("restarted linhellod service");
+                                        self.install_step = InstallStep::Done { log };
+                                    }
+                                    Err(e) => {
+                                        self.log_activity(format!("bundled copy failed: {e}"));
+                                        self.install_step = InstallStep::ModelPath {
+                                            input: dir.display().to_string(),
+                                        };
+                                    }
+                                }
                             } else {
                                 self.log_activity("models missing — point me at the .onnx folder");
                                 self.install_step = InstallStep::ModelPath {
@@ -1176,9 +1200,24 @@ impl App {
                             format!(" (missing: {})", st.missing_models.join(", "))
                         }
                     )));
+                    // If a model bundle is found, deploy will install it
+                    // automatically — no download, no path typing.
+                    if !st.models_present {
+                        match crate::install::bundled_models_dir() {
+                            Some(dir) => v.push(Line::from(
+                                format!("  ✓ model bundle found at {} — will install automatically", dir.display())
+                                    .green(),
+                            )),
+                            None => v.push(Line::from(
+                                "  · no model bundle found — you'll point me at the .onnx folder"
+                                    .dim(),
+                            )),
+                        }
+                    }
                     v.push(Line::from(""));
                     v.push(Line::from(
-                        "i = deploy binaries + daemon    m = copy models from a folder".bold(),
+                        "i = deploy (auto-installs bundled models)    m = copy models from a folder"
+                            .bold(),
                     ));
                     if let Some(root) = crate::install::source_root() {
                         v.push(Line::from(
