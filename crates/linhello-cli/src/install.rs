@@ -15,9 +15,28 @@ use std::process::Command;
 /// distro package (/usr) would place them.
 const BIN_DIRS: [&str; 2] = ["/usr/local/bin", "/usr/bin"];
 
-/// Face models required for recognition (detector + embedder). Anti-spoof is
-/// optional, so it isn't listed here.
-const REQUIRED_MODELS: [&str; 2] = ["det_10g.onnx", "face.onnx"];
+/// The models LinuxHello can use, with their role, whether recognition requires
+/// them, and whether LinuxHello ships them (vs the user fetching). buffalo_l's
+/// detector + recognizer are user-fetched (InsightFace license); the anti-spoof
+/// pair is shipped (Apache-2.0).
+const MODEL_CATALOG: [(&str, &str, bool, bool); 4] = [
+    ("det_10g.onnx", "detector (buffalo_l)", true, false),
+    ("face.onnx", "recognizer (buffalo_l)", true, false),
+    ("antispoof.onnx", "anti-spoof", false, true),
+    ("antispoof_4.onnx", "anti-spoof (secondary)", false, true),
+];
+
+/// Live presence of one model file under `CONFIG_ROOT`.
+#[derive(Clone)]
+pub struct ModelStatus {
+    pub file: &'static str,
+    pub role: &'static str,
+    /// Recognition can't run without it.
+    pub required: bool,
+    /// LinuxHello ships it (so the user shouldn't be told to fetch it).
+    pub shipped: bool,
+    pub present: bool,
+}
 
 /// A read-only snapshot of how far LinuxHello is deployed on this machine.
 pub struct InstallState {
@@ -25,6 +44,8 @@ pub struct InstallState {
     pub daemon_bin: Option<PathBuf>,
     pub daemon_active: bool,
     pub daemon_enabled: bool,
+    /// Per-model live presence (detector, recognizer, anti-spoof…).
+    pub models: Vec<ModelStatus>,
     /// Required face models all present?
     pub models_present: bool,
     pub missing_models: Vec<&'static str>,
@@ -45,13 +66,20 @@ impl InstallState {
         let cli_bin = find_bin("linhello");
         let daemon_bin = find_bin("linhellod");
         let (daemon_active, daemon_enabled) = systemd_state("linhellod");
-        let (models_present, missing_models) = model_state();
+        let models = model_states();
+        let missing_models: Vec<&'static str> = models
+            .iter()
+            .filter(|m| m.required && !m.present)
+            .map(|m| m.file)
+            .collect();
+        let models_present = missing_models.is_empty();
         let pam = crate::pamwire::status();
         InstallState {
             cli_bin,
             daemon_bin,
             daemon_active,
             daemon_enabled,
+            models,
             models_present,
             missing_models,
             camera_configured: config::config_path("cameras.conf").exists(),
@@ -108,10 +136,17 @@ impl InstallState {
                 yn(self.daemon_active),
                 yn(self.daemon_enabled)
             ),
-            if self.models_present {
-                "models       present".to_string()
-            } else {
-                format!("models       MISSING: {}", self.missing_models.join(", "))
+            {
+                let present = self.models.iter().filter(|m| m.present).count();
+                let total = self.models.len();
+                if self.models_present {
+                    format!("models       {present}/{total} present")
+                } else {
+                    format!(
+                        "models       {present}/{total} — need: {}",
+                        self.missing_models.join(", ")
+                    )
+                }
             },
             format!("camera       {}", if self.camera_configured { "pinned (cameras.conf)" } else { "auto-detect (no cameras.conf)" }),
             format!("threshold    {}", self.threshold.clone().unwrap_or_else(|| "default 0.60".to_string())),
@@ -425,13 +460,18 @@ fn systemd_state(unit: &str) -> (bool, bool) {
     (query("is-active"), query("is-enabled"))
 }
 
-fn model_state() -> (bool, Vec<&'static str>) {
-    let missing: Vec<&'static str> = REQUIRED_MODELS
+/// Live per-model presence under `CONFIG_ROOT`, from the catalog.
+fn model_states() -> Vec<ModelStatus> {
+    MODEL_CATALOG
         .iter()
-        .copied()
-        .filter(|m| !Path::new(CONFIG_ROOT).join(m).exists())
-        .collect();
-    (missing.is_empty(), missing)
+        .map(|&(file, role, required, shipped)| ModelStatus {
+            file,
+            role,
+            required,
+            shipped,
+            present: Path::new(CONFIG_ROOT).join(file).exists(),
+        })
+        .collect()
 }
 
 /// Users with a stored face template (`embedding.enc`, or legacy
@@ -468,6 +508,7 @@ mod tests {
             daemon_bin: None,
             daemon_active: false,
             daemon_enabled: false,
+            models: vec![],
             models_present: false,
             missing_models: vec![],
             camera_configured: false,

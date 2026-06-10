@@ -31,7 +31,7 @@ use ratatui::{
     Frame,
 };
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -180,6 +180,8 @@ struct App {
     /// Rolling log of what the software has actually done to the system —
     /// shown live in the activity bar so the user can see every change.
     activity: Vec<String>,
+    /// Throttle for the live re-detection poll (real-time host state).
+    last_poll: Instant,
     /// Set true once the user explicitly saves a camera selection this session
     /// (or an existing cameras.conf is present) — gates leaving the Cameras step.
     cameras_saved: bool,
@@ -230,6 +232,7 @@ impl App {
             uninstall: UninstallState::Idle { remove_models: true },
             install_step: InstallStep::Idle,
             activity: Vec::new(),
+            last_poll: Instant::now(),
             cameras_saved,
             status: String::new(),
             should_quit: false,
@@ -361,10 +364,7 @@ impl App {
 
     fn refresh_probe(&mut self) {
         self.report = Some(match crate::send(Request::Probe) {
-            Ok(Response::Capabilities { report }) => {
-                self.status = "host probed".to_string();
-                Ok(report)
-            }
+            Ok(Response::Capabilities { report }) => Ok(report),
             Ok(other) => Err(format!("unexpected response: {other:?}")),
             Err(e) => Err(e.to_string()),
         });
@@ -879,7 +879,37 @@ impl App {
 
     /// Advance any in-progress, time-based work (calibration sampling, guided
     /// enrollment). Called once per event-loop iteration.
+    /// Real-time host detection: rescan ~1/s so the wizard always reflects what
+    /// is actually present right now — models dropped into /etc/linhello,
+    /// cameras hot-plugged over USB, the daemon started/stopped — rather than a
+    /// snapshot from when the screen was entered.
+    fn poll_live(&mut self) {
+        self.install = crate::install::InstallState::detect();
+        let cams = camera::enumerate();
+        if cams.len() != self.cameras.len() {
+            self.log_activity(format!(
+                "cameras changed: {} device(s) now present",
+                cams.len()
+            ));
+        }
+        self.cameras = cams;
+        if self.cam_cursor >= self.cameras.len() {
+            self.cam_cursor = self.cameras.len().saturating_sub(1);
+        }
+        // On screens backed by a daemon round-trip, keep those live too while
+        // the user is looking at them.
+        match self.screen {
+            Screen::Doctor => self.refresh_probe(),
+            Screen::Profiles => self.refresh_profiles(),
+            _ => {}
+        }
+    }
+
     fn tick(&mut self) {
+        if self.last_poll.elapsed() >= Duration::from_secs(1) {
+            self.poll_live();
+            self.last_poll = Instant::now();
+        }
         if self.screen == Screen::Enroll {
             self.tick_enroll();
             return;
@@ -1191,32 +1221,45 @@ impl App {
                         "  {} daemon running",
                         mark(st.daemon_active)
                     )));
-                    v.push(Line::from(format!(
-                        "  {} face models present{}",
-                        mark(st.models_present),
-                        if st.models_present {
-                            String::new()
+                    v.push(Line::from("  models (live):"));
+                    for m in &st.models {
+                        let (sym, color) = if m.present {
+                            ("✓", Color::Green)
+                        } else if m.required {
+                            ("✗", Color::Yellow)
                         } else {
-                            format!(" (missing: {})", st.missing_models.join(", "))
-                        }
-                    )));
-                    // If a model bundle is found, deploy will install it
-                    // automatically — no download, no path typing.
-                    if !st.models_present {
-                        match crate::install::bundled_models_dir() {
-                            Some(dir) => v.push(Line::from(
-                                format!("  ✓ model bundle found at {} — will install automatically", dir.display())
-                                    .green(),
-                            )),
-                            None => v.push(Line::from(
-                                "  · no model bundle found — you'll point me at the .onnx folder"
-                                    .dim(),
-                            )),
-                        }
+                            ("·", Color::DarkGray)
+                        };
+                        let note = if m.present {
+                            "installed"
+                        } else if m.shipped {
+                            "ships with LinuxHello (installed on deploy)"
+                        } else {
+                            "fetch buffalo_l — see models/README.md"
+                        };
+                        v.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(sym, Style::default().fg(color)),
+                            Span::raw(format!(" {:<18} {:<24} {note}", m.file, m.role)),
+                        ]));
+                    }
+                    v.push(Line::from(""));
+                    // Adaptive guidance — only ask for what is actually missing.
+                    if st.models_present {
+                        v.push(Line::from("  ✓ all required models present.".green()));
+                    } else if let Some(dir) = crate::install::bundled_models_dir() {
+                        v.push(Line::from(
+                            format!("  ✓ models found in {} — deploy will install them", dir.display())
+                                .green(),
+                        ));
+                    } else {
+                        v.push(Line::from(
+                            "  → fetch buffalo_l (det_10g.onnx + face.onnx) per models/README.md, then it auto-installs".yellow(),
+                        ));
                     }
                     v.push(Line::from(""));
                     v.push(Line::from(
-                        "i = deploy (auto-installs bundled models)    m = copy models from a folder"
+                        "i = deploy (auto-installs shipped + found models)    m = copy from a folder"
                             .bold(),
                     ));
                     if let Some(root) = crate::install::source_root() {
