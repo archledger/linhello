@@ -132,6 +132,80 @@ impl InstallState {
     }
 }
 
+/// Required face models (detector + embedder). Anti-spoof is optional.
+const REQUIRED_FOR_COPY: [(&str, bool); 3] = [
+    ("det_10g.onnx", true),
+    ("face.onnx", true),
+    ("antispoof.onnx", false),
+];
+
+/// Locate the source/build tree to install from: `$LINHELLO_SRC` (must hold a
+/// Makefile), else derived from the running binary at
+/// `<root>/target/release/linhello`. `None` if neither looks like the repo.
+pub fn source_root() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("LINHELLO_SRC") {
+        let p = PathBuf::from(s);
+        if p.join("Makefile").exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let root = exe.ancestors().nth(3)?.to_path_buf();
+    root.join("Makefile").exists().then_some(root)
+}
+
+/// Deploy the programs + daemon: run the repo Makefile's `install` target with
+/// the prebuilt artifacts (`CARGO=true CC=true` no-ops the rebuilds), then
+/// enable + start the daemon. Requires the source tree and `make`. Root-only
+/// (the TUI caller already runs as root).
+pub fn deploy() -> Result<Vec<String>, String> {
+    let root = source_root().ok_or(
+        "can't find the LinuxHello source tree — set LINHELLO_SRC, or run from the repo's \
+         target/release; on a packaged system, install via your package manager instead",
+    )?;
+    let out = Command::new("make")
+        .current_dir(&root)
+        .args(["install", "CARGO=true", "CC=true"])
+        .output()
+        .map_err(|e| format!("running make install: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "make install failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut log = vec![format!("installed binaries + unit from {}", root.display())];
+    run_systemctl(&["daemon-reload"]);
+    if run_systemctl(&["enable", "--now", "linhellod"]) {
+        log.push("enabled + started linhellod".to_string());
+    } else {
+        log.push("warning: could not enable/start linhellod — check `systemctl status linhellod`".to_string());
+    }
+    Ok(log)
+}
+
+/// Copy the face models from a directory into `CONFIG_ROOT`. The detector and
+/// embedder are required; anti-spoof is copied if present. Returns a per-file
+/// log, or an error naming the first missing required model.
+pub fn copy_models_from(dir: &Path) -> Result<Vec<String>, String> {
+    std::fs::create_dir_all(CONFIG_ROOT).map_err(|e| format!("create {CONFIG_ROOT}: {e}"))?;
+    let mut log = Vec::new();
+    for (name, required) in REQUIRED_FOR_COPY {
+        let src = dir.join(name);
+        if !src.exists() {
+            if required {
+                return Err(format!("missing required model '{name}' in {}", dir.display()));
+            }
+            log.push(format!("optional {name}: not found, skipped"));
+            continue;
+        }
+        let dst = Path::new(CONFIG_ROOT).join(name);
+        std::fs::copy(&src, &dst).map_err(|e| format!("copy {name}: {e}"))?;
+        log.push(format!("copied {name}"));
+    }
+    Ok(log)
+}
+
 const BIN_NAMES: [&str; 3] = ["linhello", "linhellod", "linhello-reseal-hook"];
 const PAM_DIRS: [&str; 2] = ["/usr/lib/security", "/usr/lib64/security"];
 const PAM_LIBS: [&str; 2] = ["pam_linhello.so", "liblinhello_pam.so"];

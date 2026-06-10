@@ -36,6 +36,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Welcome,
+    Install,
     Doctor,
     Cameras,
     Profiles,
@@ -52,6 +53,7 @@ impl Screen {
     fn name(self) -> &'static str {
         match self {
             Screen::Welcome => "Welcome",
+            Screen::Install => "Install",
             Screen::Doctor => "Host check",
             Screen::Cameras => "Cameras",
             Screen::Profiles => "Profiles",
@@ -67,8 +69,9 @@ impl Screen {
 
 /// The linear wizard path. `Uninstall` is intentionally excluded — it is a side
 /// screen, not a step.
-const ORDER: [Screen; 9] = [
+const ORDER: [Screen; 10] = [
     Screen::Welcome,
+    Screen::Install,
     Screen::Doctor,
     Screen::Cameras,
     Screen::Profiles,
@@ -132,6 +135,17 @@ enum UninstallState {
 
 const UNINSTALL_WORD: &str = "REMOVE";
 
+/// Install step: deploy the programs + daemon, then make sure the face models
+/// are present (copied from a directory the user points at).
+enum InstallStep {
+    /// Showing the plan / current state.
+    Idle,
+    /// Editing the directory to copy models from.
+    ModelPath { input: String },
+    Done { log: Vec<String> },
+    Failed(String),
+}
+
 struct App {
     screen: Screen,
     user: String,
@@ -161,6 +175,7 @@ struct App {
     name_input: Option<String>,
     identify: IdentifyState,
     uninstall: UninstallState,
+    install_step: InstallStep,
     /// Set true once the user explicitly saves a camera selection this session
     /// (or an existing cameras.conf is present) — gates leaving the Cameras step.
     cameras_saved: bool,
@@ -209,6 +224,7 @@ impl App {
             name_input: None,
             identify: IdentifyState::Idle,
             uninstall: UninstallState::Idle { remove_data: false },
+            install_step: InstallStep::Idle,
             cameras_saved,
             status: String::new(),
             should_quit: false,
@@ -347,6 +363,11 @@ impl App {
             self.name_edit_key(code);
             return;
         }
+        if self.screen == Screen::Install && matches!(self.install_step, InstallStep::ModelPath { .. })
+        {
+            self.install_key(code);
+            return;
+        }
         if self.screen == Screen::Uninstall {
             self.uninstall_key(code);
             return;
@@ -374,6 +395,7 @@ impl App {
                 self.screen = Screen::Uninstall;
                 self.uninstall = UninstallState::Idle { remove_data: false };
             }
+            Screen::Install => self.install_key(code),
             Screen::Cameras => self.cameras_key(code),
             Screen::Profiles => self.profiles_key(code),
             Screen::Calibrate => self.calibrate_key(code),
@@ -385,6 +407,89 @@ impl App {
                 KeyCode::Enter | KeyCode::Right => self.next(),
                 KeyCode::Left => self.prev(),
                 _ => {}
+            },
+        }
+    }
+
+    /// Install screen: deploy binaries+daemon (`i`), then copy in the models
+    /// (`m` / path entry). Both block briefly; fine for a one-shot.
+    fn install_key(&mut self, code: KeyCode) {
+        let step = std::mem::replace(&mut self.install_step, InstallStep::Idle);
+        match step {
+            InstallStep::Idle => match code {
+                KeyCode::Char('i') => {
+                    self.status = "deploying… (running make install)".to_string();
+                    match crate::install::deploy() {
+                        Ok(mut log) => {
+                            self.install = crate::install::InstallState::detect();
+                            if self.install.models_present {
+                                log.push("face models already in place".to_string());
+                                self.status = "installed".to_string();
+                                self.install_step = InstallStep::Done { log };
+                            } else {
+                                self.status =
+                                    "deployed — now give me the folder holding the .onnx models"
+                                        .to_string();
+                                self.install_step = InstallStep::ModelPath {
+                                    input: String::new(),
+                                };
+                            }
+                        }
+                        Err(e) => self.install_step = InstallStep::Failed(e),
+                    }
+                }
+                KeyCode::Char('m') => {
+                    self.install_step = InstallStep::ModelPath {
+                        input: String::new(),
+                    };
+                    self.status = "type the models folder, Enter to copy".to_string();
+                }
+                KeyCode::Right => self.next(),
+                KeyCode::Left => self.prev(),
+                _ => {}
+            },
+            InstallStep::ModelPath { mut input } => match code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.install_step = InstallStep::ModelPath { input };
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.install_step = InstallStep::ModelPath { input };
+                }
+                KeyCode::Esc => {
+                    self.status = "model copy cancelled".to_string();
+                    self.install_step = InstallStep::Idle;
+                }
+                KeyCode::Enter => {
+                    let dir = std::path::PathBuf::from(input.trim());
+                    match crate::install::copy_models_from(&dir) {
+                        Ok(log) => {
+                            self.install = crate::install::InstallState::detect();
+                            let _ = Self::restart_daemon_quiet();
+                            self.status = "models installed; daemon restarted".to_string();
+                            self.install_step = InstallStep::Done { log };
+                        }
+                        Err(e) => {
+                            self.status = format!("error: {e}");
+                            self.install_step = InstallStep::ModelPath { input };
+                        }
+                    }
+                }
+                _ => self.install_step = InstallStep::ModelPath { input },
+            },
+            // Terminal states: i redoes, arrows navigate.
+            other => match code {
+                KeyCode::Char('i') => self.install_step = InstallStep::Idle,
+                KeyCode::Right => {
+                    self.install_step = other;
+                    self.next();
+                }
+                KeyCode::Left => {
+                    self.install_step = other;
+                    self.prev();
+                }
+                _ => self.install_step = other,
             },
         }
     }
@@ -857,6 +962,7 @@ impl App {
     fn render_body(&self, frame: &mut Frame, area: Rect) {
         match self.screen {
             Screen::Welcome => self.body_welcome(frame, area),
+            Screen::Install => self.body_install(frame, area),
             Screen::Doctor => self.body_doctor(frame, area),
             Screen::Cameras => self.body_cameras(frame, area),
             Screen::Profiles => self.body_profiles(frame, area),
@@ -936,6 +1042,91 @@ impl App {
                 Style::default().fg(Color::Red),
             )));
         }
+        self.body_paragraph(frame, area, lines);
+    }
+
+    fn body_install(&self, frame: &mut Frame, area: Rect) {
+        let st = &self.install;
+        let lines: Vec<Line> = match &self.install_step {
+            InstallStep::Idle => {
+                let installed = st.is_installed() && st.daemon_active;
+                let mut v = vec![
+                    Line::from("Install LinuxHello".bold()),
+                    Line::from(""),
+                ];
+                if installed && st.models_present {
+                    v.push(Line::from(
+                        "Already installed and the daemon is running.".green(),
+                    ));
+                    v.push(Line::from("Tab to continue to setup, or press i to redeploy."));
+                } else {
+                    v.push(Line::from("This deploys the programs + daemon, then the face models:"));
+                    v.push(Line::from(""));
+                    let mark = |ok: bool| if ok { "✓" } else { "·" };
+                    v.push(Line::from(format!(
+                        "  {} binaries + daemon installed",
+                        mark(st.is_installed())
+                    )));
+                    v.push(Line::from(format!(
+                        "  {} daemon running",
+                        mark(st.daemon_active)
+                    )));
+                    v.push(Line::from(format!(
+                        "  {} face models present{}",
+                        mark(st.models_present),
+                        if st.models_present {
+                            String::new()
+                        } else {
+                            format!(" (missing: {})", st.missing_models.join(", "))
+                        }
+                    )));
+                    v.push(Line::from(""));
+                    v.push(Line::from(
+                        "i = deploy binaries + daemon    m = copy models from a folder".bold(),
+                    ));
+                    if let Some(root) = crate::install::source_root() {
+                        v.push(Line::from(
+                            format!("source tree: {}", root.display()).dim(),
+                        ));
+                    } else {
+                        v.push(Line::from(
+                            "no source tree found — set LINHELLO_SRC, or install via your package manager"
+                                .yellow(),
+                        ));
+                    }
+                }
+                v
+            }
+            InstallStep::ModelPath { input } => vec![
+                Line::from("Copy face models".bold()),
+                Line::from(""),
+                Line::from("Folder holding det_10g.onnx, face.onnx (+ optional antispoof.onnx):"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(input.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled("▏", Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(""),
+                Line::from("Enter to copy, Esc to cancel.".italic()),
+            ],
+            InstallStep::Done { log } => {
+                let mut v = vec![Line::from("Installed.".green().bold()), Line::from("")];
+                for l in log {
+                    v.push(Line::from(format!("  {l}")));
+                }
+                v.push(Line::from(""));
+                v.push(Line::from("Tab to continue to setup.".italic()));
+                v
+            }
+            InstallStep::Failed(e) => vec![
+                Line::from("Install problem.".red().bold()),
+                Line::from(""),
+                Line::from(e.clone()),
+                Line::from(""),
+                Line::from("Fix the issue and press i to retry.".italic()),
+            ],
+        };
         self.body_paragraph(frame, area, lines);
     }
 
