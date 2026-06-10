@@ -393,6 +393,13 @@ fn scrub_pam_references(log: &mut Vec<String>) {
         if !path.is_file() {
             continue;
         }
+        // Never process our own backup files — they contain pam_linhello (they
+        // are pre-scrub copies) and re-scrubbing them just compounds nested
+        // `.pre-linhello-uninstall.pre-linhello-uninstall…` cruft.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains(".pre-linhello") {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -414,7 +421,9 @@ fn scrub_pam_references(log: &mut Vec<String>) {
             cleaned.push('\n');
         }
         let backup = format!("{}.pre-linhello-uninstall", path.display());
-        let _ = std::fs::copy(&path, &backup);
+        if !Path::new(&backup).exists() {
+            let _ = std::fs::copy(&path, &backup);
+        }
         if std::fs::write(&path, cleaned).is_ok() {
             log.push(format!(
                 "scrubbed pam_linhello from {} (backup {backup})",
