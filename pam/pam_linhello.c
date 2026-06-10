@@ -13,8 +13,10 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <unistd.h>
 
 extern int  linhello_unseal_keyring(const char *user, uint8_t *buf, size_t len);
+extern int  linhello_verify_face(const char *user);
 extern int  linhello_reseal_password(const char *user, uint8_t *buf, size_t len);
 extern void linhello_zero_buf(uint8_t *buf, size_t len);
 
@@ -25,6 +27,27 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     const char *user = NULL;
     if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || user == NULL) {
+        return PAM_AUTH_ERR;
+    }
+
+    /* Unprivileged PAM stacks — KDE's kscreenlocker runs PAM as the session
+     * user (no root helper since Plasma 5.25). The daemon refuses to release
+     * the sealed password to a non-root peer (by design: a user-level process
+     * must never be able to extract the login password), and an in-session
+     * unlock doesn't need PAM_AUTHTOK anyway — the wallet/keyring is already
+     * open. Verify the face (same liveness-gated pipeline) and answer
+     * success/failure only. */
+    if (geteuid() != 0) {
+        if (linhello_verify_face(user) == 0) {
+            pam_syslog(pamh, LOG_NOTICE,
+                       "face auth (verify-only, unprivileged) succeeded for user '%s'",
+                       user);
+            return PAM_SUCCESS;
+        }
+        pam_syslog(pamh, LOG_NOTICE,
+                   "face auth (verify-only, unprivileged) declined for user '%s'; "
+                   "deferring to next auth module",
+                   user);
         return PAM_AUTH_ERR;
     }
 

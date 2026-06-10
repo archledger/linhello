@@ -7,7 +7,8 @@
 //!   `sufficient`) so `pam_gnome_keyring`'s auth phase still runs and unlocks
 //!   the login keyring — `[success=1]` works because Arch's greeter jumps over
 //!   exactly one `include system-local-login`. `sudo`/TTY use plain
-//!   `sufficient`.
+//!   `sufficient`. The KDE *lockscreen* is a separate service (`kde`,
+//!   kscreenlocker) — wired with `sufficient`; see `KDE_LOCKSCREEN`.
 //! * **Debian/Ubuntu**: the greeter `@include common-auth`, which expands to
 //!   several modules, so a naive `[success=1]` jump would land mid-stack. The
 //!   correct mechanism is a `pam-auth-update` profile.
@@ -46,6 +47,12 @@ const GREETERS: &[&str] = &[
     "/etc/pam.d/sddm",
     "/etc/pam.d/lightdm",
 ];
+/// KDE lockscreen (kscreenlocker). NOT a greeter: it runs PAM as the session
+/// user (no root helper since Plasma 5.25), there is no keyring module
+/// downstream to preserve (the wallet is already open in-session), and the
+/// module answers verify-only there — so it gets the plain `sufficient`
+/// stanza, not the greeter `[success=1]` jump.
+const KDE_LOCKSCREEN: &str = "/etc/pam.d/kde";
 const SUDO: &str = "/etc/pam.d/sudo";
 
 /// Read-only status of one PAM service file.
@@ -120,6 +127,10 @@ pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
             for g in GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()) {
                 changes.push(edit_in(&g, GREETER_STANZA, dry_run)?);
             }
+            let kde = PathBuf::from(KDE_LOCKSCREEN);
+            if kde.exists() {
+                changes.push(edit_in(&kde, SUFFICIENT_STANZA, dry_run)?);
+            }
             if include_sudo {
                 let sudo = PathBuf::from(SUDO);
                 if sudo.exists() {
@@ -148,7 +159,12 @@ pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
 }
 
 fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
+    let mut v: Vec<PathBuf> = GREETERS
+        .iter()
+        .chain(std::iter::once(&KDE_LOCKSCREEN))
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
     if include_sudo {
         let sudo = PathBuf::from(SUDO);
         if sudo.exists() {

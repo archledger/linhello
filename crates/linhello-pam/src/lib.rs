@@ -45,6 +45,33 @@ pub unsafe extern "C" fn linhello_unseal_keyring(
     }
 }
 
+/// Verify the named user's face WITHOUT unsealing any secret. Returns 0 on a
+/// liveness-gated match, -1 otherwise.
+///
+/// This is the unprivileged auth path. The daemon only releases the sealed
+/// password to a root peer, but `Verify` is allowed for a caller asking about
+/// its own uid — exactly the KDE lockscreen situation: kscreenlocker runs PAM
+/// as the session user, and an in-session unlock needs no PAM_AUTHTOK (the
+/// wallet/keyring is already open). Verify runs the same capture + liveness +
+/// match pipeline as the unseal path; only the password release differs.
+///
+/// # Safety
+/// `user` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn linhello_verify_face(user: *const libc::c_char) -> i32 {
+    if user.is_null() {
+        return -1;
+    }
+    let user = match CStr::from_ptr(user).to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return -1,
+    };
+    match client::request(&Request::Verify { user }) {
+        Ok(Response::Verified { matched: true, .. }) => 0,
+        _ => -1,
+    }
+}
+
 /// Reseal `password` as the user's login password envelope. Called from the
 /// PAM `password` stack after the new token has been accepted by the upstream
 /// module, so the face-auth path stays in lockstep with the real password.
