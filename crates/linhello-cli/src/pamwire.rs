@@ -40,6 +40,11 @@ const FEDORA_CUSTOM_DIR: &str = "/etc/authselect/custom/linhello";
 const GREETER_STANZA: &str = "auth       [success=1 default=ignore]   pam_linhello.so";
 /// sudo line: plain sufficient — face success authenticates immediately.
 const SUFFICIENT_STANZA: &str = "auth       sufficient   pam_linhello.so";
+/// Lockscreen parallel-stack line: `wait` makes the module keep scanning for
+/// ~20s instead of one capture, because kscreenlocker starts this stack the
+/// moment the lock screen appears — the window is what lets you sit down and
+/// be recognized without touching a key.
+const WAIT_STANZA: &str = "auth       sufficient   pam_linhello.so wait";
 
 /// Candidate greeter PAM services (same names across distros).
 const GREETERS: &[&str] = &[
@@ -47,22 +52,30 @@ const GREETERS: &[&str] = &[
     "/etc/pam.d/sddm",
     "/etc/pam.d/lightdm",
 ];
-/// KDE lockscreen (kscreenlocker). NOT a greeter: it runs PAM as the session
-/// user (no root helper since Plasma 5.25), there is no keyring module
-/// downstream to preserve (the wallet is already open in-session), and the
-/// module answers verify-only there — so it gets the plain `sufficient`
-/// stanza, not the greeter `[success=1]` jump.
+/// KDE lockscreen (kscreenlocker) services. NOT a greeter: kscreenlocker_greet
+/// runs PAM in-process as the unprivileged session user (kcheckpass removed in
+/// Plasma 5.25), only the auth phase runs, and the module answers verify-only.
+///
+/// kscreenlocker runs PARALLEL stacks from greeter start: the interactive
+/// `kde` (password prompt) plus non-interactive `kde-fingerprint` /
+/// `kde-smartcard`, first success unlocks (kscreenlocker MR !15). We prefer
+/// riding `kde-fingerprint`: face unlock with no Enter press, and face
+/// attempts never reach `kde`'s pam_unix — so they can't increment
+/// pam_faillock. The interactive `kde` stays stock (password), which is also
+/// the safest stack NOT to touch ("if the service is misconfigured, you will
+/// NOT be able to unlock a locked screen" — kscreenlocker README).
 const KDE_LOCKSCREEN: &str = "/etc/pam.d/kde";
-/// Where Arch ships the kscreenlocker service since Plasma 6: the PAM *vendor*
-/// directory. PAM gives `/etc/pam.d/<service>` priority over it, so we never
-/// edit the vendor file (package-owned, clobbered on update) — when only the
-/// vendor copy exists, we materialize an `/etc/pam.d/kde` override from it.
+const KDE_FP_LOCKSCREEN: &str = "/etc/pam.d/kde-fingerprint";
+/// Where Arch ships the kscreenlocker services since Plasma 6: the PAM
+/// *vendor* directory. PAM gives `/etc/pam.d/<service>` priority, so we never
+/// edit vendor files (package-owned, clobbered on update) — when only the
+/// vendor copy exists, we materialize an /etc override from it.
 const KDE_VENDOR: &str = "/usr/lib/pam.d/kde";
-/// First line of an override file WE created (no pre-existing /etc file to
-/// back up). Lets disable/uninstall know to delete the whole file — leaving a
-/// vendor-copy behind would freeze the service against future vendor updates.
-pub(crate) const CREATED_MARKER: &str =
-    "# linhello: created from /usr/lib/pam.d/kde — delete this file to revert to the vendor copy";
+const KDE_FP_VENDOR: &str = "/usr/lib/pam.d/kde-fingerprint";
+/// First-line prefix of an override file WE created (no pre-existing /etc file
+/// to back up). Lets disable/uninstall know to delete the whole file — leaving
+/// a vendor-copy behind would freeze the service against vendor updates.
+pub(crate) const CREATED_PREFIX: &str = "# linhello: created from ";
 const SUDO: &str = "/etc/pam.d/sudo";
 
 /// Read-only status of one PAM service file.
@@ -90,7 +103,9 @@ impl Change {
         match self {
             Change::WouldEdit(p) => format!("would wire  {}", p.display()),
             Change::Edited(p) => format!("wired       {} (backup {}{})", p.display(), p.display(), BACKUP_SUFFIX),
-            Change::Created(p) => format!("wired       {} (created from {})", p.display(), KDE_VENDOR),
+            Change::Created(p) => {
+                format!("wired       {} (created from the /usr/lib/pam.d vendor copy)", p.display())
+            }
             Change::AlreadyWired(p) => format!("already     {}", p.display()),
             Change::WouldRemove(p) => format!("would clear {}", p.display()),
             Change::Removed(p) => format!("cleared     {}", p.display()),
@@ -131,7 +146,20 @@ fn inspect_files() -> Vec<PathBuf> {
         .into_iter()
         .filter(|p| p.exists())
         .collect(),
-        DistroFamily::Arch | DistroFamily::Other => existing_targets(true),
+        DistroFamily::Arch | DistroFamily::Other => {
+            // Status shows the wiring PLAN: one lockscreen row (the service we
+            // would/do manage), not every unwirable leftover.
+            let mut v: Vec<PathBuf> =
+                GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
+            if let Some(plan) = lockscreen_plan() {
+                v.push(plan.etc);
+            }
+            let sudo = PathBuf::from(SUDO);
+            if sudo.exists() {
+                v.push(sudo);
+            }
+            v
+        }
     }
 }
 
@@ -147,11 +175,11 @@ pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
             for g in GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()) {
                 changes.push(edit_in(&g, GREETER_STANZA, dry_run)?);
             }
-            if let Some(kde) = lockscreen_target() {
-                changes.push(if kde.exists() {
-                    edit_in(&kde, SUFFICIENT_STANZA, dry_run)?
+            if let Some(plan) = lockscreen_plan() {
+                changes.push(if plan.etc.exists() {
+                    edit_in(&plan.etc, plan.stanza, dry_run)?
                 } else {
-                    create_lockscreen_override(&kde, dry_run)?
+                    create_override_from(&plan.etc, plan.vendor, plan.stanza, dry_run)?
                 });
             }
             if include_sudo {
@@ -181,10 +209,15 @@ pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
     }
 }
 
+/// Targets for disable/uninstall: every file we might have wired, including
+/// BOTH lockscreen services (an older LinuxHello wired `kde`; current prefers
+/// `kde-fingerprint` — unwiring must clean whichever exists).
 fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-    if let Some(kde) = lockscreen_target() {
-        v.push(kde);
+    for p in [KDE_FP_LOCKSCREEN, KDE_LOCKSCREEN] {
+        if Path::new(p).exists() {
+            v.push(PathBuf::from(p));
+        }
     }
     if include_sudo {
         let sudo = PathBuf::from(SUDO);
@@ -195,35 +228,57 @@ fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
     v
 }
 
-/// The KDE lockscreen service file we manage: always the /etc path (PAM gives
-/// it priority), present as a target when either it or the vendor copy under
-/// /usr/lib/pam.d exists — i.e. when this host actually has kscreenlocker.
-fn lockscreen_target() -> Option<PathBuf> {
-    let etc = PathBuf::from(KDE_LOCKSCREEN);
-    (etc.exists() || Path::new(KDE_VENDOR).exists()).then_some(etc)
+/// How we wire the KDE lockscreen on this host: which /etc override to manage,
+/// the vendor file it is materialized from, and the stanza it gets.
+struct LockscreenPlan {
+    etc: PathBuf,
+    vendor: &'static str,
+    stanza: &'static str,
+}
+
+/// Prefer the non-interactive `kde-fingerprint` parallel stack (face unlock
+/// with no key press, no pam_unix/faillock contact); fall back to the
+/// interactive `kde` service on Plasma builds without it. Present only when
+/// this host actually has kscreenlocker (an /etc or vendor file exists).
+fn lockscreen_plan() -> Option<LockscreenPlan> {
+    for (etc, vendor, stanza) in [
+        (KDE_FP_LOCKSCREEN, KDE_FP_VENDOR, WAIT_STANZA),
+        (KDE_LOCKSCREEN, KDE_VENDOR, SUFFICIENT_STANZA),
+    ] {
+        let etc_path = PathBuf::from(etc);
+        if etc_path.exists() || Path::new(vendor).exists() {
+            return Some(LockscreenPlan { etc: etc_path, vendor, stanza });
+        }
+    }
+    None
 }
 
 /// The /etc override content for a vendor-shipped lockscreen service: marker
 /// line (so disable/uninstall know to delete the file), then the vendor stack
 /// with our stanza wired in.
-fn build_lockscreen_override(vendor_content: &str) -> String {
-    let (wired, _) = insert_first_auth(vendor_content, SUFFICIENT_STANZA);
-    format!("{CREATED_MARKER}\n{wired}")
+fn build_override(vendor_path: &str, vendor_content: &str, stanza: &str) -> String {
+    let (wired, _) = insert_first_auth(vendor_content, stanza);
+    format!("{CREATED_PREFIX}{vendor_path} — delete this file to revert to the vendor copy\n{wired}")
 }
 
 /// Whether this /etc/pam.d file is an override WE materialized (vs. one the
 /// distro shipped or the admin wrote): such files are deleted on unwire.
 pub(crate) fn is_created_override(content: &str) -> bool {
-    content.starts_with(CREATED_MARKER)
+    content.starts_with(CREATED_PREFIX)
 }
 
-fn create_lockscreen_override(path: &Path, dry_run: bool) -> Result<Change> {
+fn create_override_from(
+    path: &Path,
+    vendor: &str,
+    stanza: &str,
+    dry_run: bool,
+) -> Result<Change> {
     if dry_run {
         return Ok(Change::WouldEdit(path.to_path_buf()));
     }
-    let vendor = std::fs::read_to_string(KDE_VENDOR)
-        .map_err(|e| anyhow::anyhow!("reading {KDE_VENDOR}: {e}"))?;
-    std::fs::write(path, build_lockscreen_override(&vendor))
+    let vendor_content = std::fs::read_to_string(vendor)
+        .map_err(|e| anyhow::anyhow!("reading {vendor}: {e}"))?;
+    std::fs::write(path, build_override(vendor, &vendor_content, stanza))
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     Ok(Change::Created(path.to_path_buf()))
 }
@@ -592,16 +647,32 @@ mod tests {
     fn lockscreen_override_marks_and_wires_vendor_content() {
         // The Plasma 6 vendor file shape (Arch ships it at /usr/lib/pam.d/kde).
         let vendor = "#%PAM-1.0\nauth\tinclude\tsystem-login\naccount\tinclude\tsystem-login\n";
-        let out = build_lockscreen_override(vendor);
+        let out = build_override(KDE_VENDOR, vendor, SUFFICIENT_STANZA);
         assert!(is_created_override(&out));
         assert!(content_has_module(&out));
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], CREATED_MARKER);
+        assert!(lines[0].starts_with(CREATED_PREFIX));
+        assert!(lines[0].contains(KDE_VENDOR));
         assert_eq!(lines[1], "#%PAM-1.0");
         assert_eq!(lines[2], SUFFICIENT_STANZA);
         assert!(lines[3].starts_with("auth"));
         // Distro-shipped or admin-written files must never look like ours.
         assert!(!is_created_override(vendor));
+        // Overrides created by older LinuxHello (full hardcoded marker) still match.
+        assert!(is_created_override(
+            "# linhello: created from /usr/lib/pam.d/kde — delete this file to revert to the vendor copy\n"
+        ));
+    }
+
+    #[test]
+    fn fingerprint_override_gets_wait_stanza_before_fprintd() {
+        // The parallel non-interactive stack: our wait-mode line runs first;
+        // a real fprintd line (if the user has a reader) stays reachable.
+        let vendor = "#%PAM-1.0\nauth\trequired\tpam_fprintd.so\n";
+        let out = build_override(KDE_FP_VENDOR, vendor, WAIT_STANZA);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[2], WAIT_STANZA);
+        assert!(lines[3].contains("pam_fprintd"));
     }
 
     #[test]
