@@ -78,3 +78,50 @@ Removes everything (PAM is unwired first — password login is never at risk).
 
 GPL-3.0-or-later. Bundled anti-spoof models: Apache-2.0 ([notice](models/antispoof.NOTICE)).
 Face-recognition models (buffalo_l) are downloaded directly by the user from the upstream [InsightFace](https://github.com/deepinsight/insightface) repository. These weights are subject to InsightFace's non-commercial research license and are intended solely for personal, non-commercial use by the end-user.
+
+## Citations and Attributions
+
+This project provides automated plumbing for state-of-the-art biometrics and
+face anti-spoofing research. If you use this software, please acknowledge the
+foundational upstream research works.
+
+### InsightFace — ArcFace (buffalo_l recognizer, `w600k_r50`)
+
+```bibtex
+@inproceedings{deng2019arcface,
+  title={ArcFace: Additive Angular Margin Loss for Deep Face Recognition},
+  author={Deng, Jiankang and Guo, Jia and Xue, Niannan and Zafeiriou, Stefanos},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  pages={4690--4699},
+  year={2019}
+}
+```
+
+### InsightFace — SCRFD (buffalo_l detector, `det_10g`)
+
+```bibtex
+@article{guo2021sample,
+  title={Sample and Computation Redistribution for Efficient Face Detection},
+  author={Guo, Jia and Deng, Jiankang and Lattas, Alexandros and Zafeiriou, Stefanos},
+  journal={arXiv preprint arXiv:2105.04714},
+  year={2021}
+}
+```
+
+> This is InsightFace's officially requested citation form (the paper was
+> subsequently accepted at ICLR 2022).
+
+See the [InsightFace README](https://github.com/deepinsight/insightface/blob/master/README.md)
+for the project's full citation and attribution requests.
+
+### Silent-Face-Anti-Spoofing
+
+```bibtex
+@misc{silentface2020,
+  author       = {Minivision},
+  title        = {Silent-Face-Anti-Spoofing: Real-time Face Anti-Spoofing Framework},
+  year         = {2020},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/minivision-ai/Silent-Face-Anti-Spoofing}}
+}
+```
