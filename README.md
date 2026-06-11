@@ -100,13 +100,16 @@ foundational upstream research works.
 ### InsightFace — SCRFD (buffalo_l detector, `det_10g`)
 
 ```bibtex
-@inproceedings{guo2022scrfd,
+@article{guo2021sample,
   title={Sample and Computation Redistribution for Efficient Face Detection},
   author={Guo, Jia and Deng, Jiankang and Lattas, Alexandros and Zafeiriou, Stefanos},
-  booktitle={International Conference on Learning Representations (ICLR)},
-  year={2022}
+  journal={arXiv preprint arXiv:2105.04714},
+  year={2021}
 }
 ```
+
+> This is InsightFace's officially requested citation form (the paper was
+> subsequently accepted at ICLR 2022).
 
 See the [InsightFace README](https://github.com/deepinsight/insightface/blob/master/README.md)
 for the project's full citation and attribution requests.
