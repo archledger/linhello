@@ -77,4 +77,4 @@ Removes everything (PAM is unwired first — password login is never at risk).
 ## License
 
 GPL-3.0-or-later. Bundled anti-spoof models: Apache-2.0 ([notice](models/antispoof.NOTICE)).
-Face-recognition models are downloaded by you from [InsightFace](https://github.com/deepinsight/insightface) (their license).
+Face-recognition models (buffalo_l) are downloaded directly by the user from the upstream [InsightFace](https://github.com/deepinsight/insightface) repository. These weights are subject to InsightFace's non-commercial research license and are intended solely for personal, non-commercial use by the end-user.
