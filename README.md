@@ -85,7 +85,7 @@ This project provides automated plumbing for state-of-the-art biometrics and
 face anti-spoofing research. If you use this software, please acknowledge the
 foundational upstream research works.
 
-### InsightFace (ArcFace / buffalo_l)
+### InsightFace — ArcFace (buffalo_l recognizer, `w600k_r50`)
 
 ```bibtex
 @inproceedings{deng2019arcface,
@@ -94,6 +94,17 @@ foundational upstream research works.
   booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
   pages={4690--4699},
   year={2019}
+}
+```
+
+### InsightFace — SCRFD (buffalo_l detector, `det_10g`)
+
+```bibtex
+@inproceedings{guo2022scrfd,
+  title={Sample and Computation Redistribution for Efficient Face Detection},
+  author={Guo, Jia and Deng, Jiankang and Lattas, Alexandros and Zafeiriou, Stefanos},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2022}
 }
 ```
 
