@@ -1,8 +1,8 @@
 # LinuxHello
 
-**Face login for Linux** — like Windows Hello. Look at your camera to unlock your login screen, keyring, and sudo.
+**LinuxHello is Windows Hello for Linux** — face unlock for your login screen, keyring, and sudo. Look at your camera instead of typing your password.
 
-Your password isn't replaced — it's sealed in your computer's TPM chip and released when your face matches. If the camera, TPM, or anything else fails, you just type your password like normal. **You can never be locked out.**
+A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): your password isn't replaced — it's sealed in your computer's TPM chip and released only when your face matches, with hardware-checked anti-spoofing. If the camera, TPM, or anything else fails, you just type your password like normal. **You can never be locked out.**
 
 ## What you need
 
@@ -65,6 +65,20 @@ release, and only when your machine's boot state (Secure Boot) is untampered.
 Anti-spoofing rejects photos and virtual cameras. Kernel updates don't break it.
 The TTY console login is never touched, so there's always a way in. Details:
 [`docs/design/signed-pcr-policy.md`](docs/design/signed-pcr-policy.md).
+
+## Compared to Howdy
+
+[Howdy](https://github.com/boltgolt/howdy) is the established, widely-packaged
+face-unlock tool for Linux and well worth a look. LinuxHello takes a different
+approach in a few respects:
+
+|                  | LinuxHello                                                   | Howdy                                                          |
+|------------------|-------------------------------------------------------------|---------------------------------------------------------------|
+| Language         | Rust                                                        | Python (+ C++)                                                |
+| Credential model | Password sealed in the **TPM**, released on a face match    | PAM module that returns success on a face match (no TPM)       |
+| Anti-spoofing    | Bundles a liveness model that rejects photos/virtual cameras | Its own docs note a well-printed photo can be enough to fool it |
+| Face recognition | InsightFace ONNX (ArcFace + SCRFD)                          | dlib / `face_recognition`                                     |
+| Maturity         | New                                                         | Mature, widely packaged                                       |
 
 ## Uninstall
 
