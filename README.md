@@ -1,16 +1,28 @@
-# LinuxHello
+<div align="center">
 
-**LinuxHello is Windows Hello for Linux** — face unlock for your login screen, keyring, and sudo. Look at your camera instead of typing your password.
+<img src="assets/banner.svg" alt="LinuxHello — Windows Hello for Linux, face unlock with TPM-backed security" width="720">
+
+**Windows Hello for Linux** — face unlock for your login screen, keyring, and sudo.
+
+[![License](https://img.shields.io/github/license/archledger/linhello?color=4c8eda)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-333?logo=linux&logoColor=white)](#-what-you-need)
+[![Windows Hello for Linux](https://img.shields.io/badge/Windows_Hello-for_Linux-0078D6?logo=windows&logoColor=white)](#)
+[![Stars](https://img.shields.io/github/stars/archledger/linhello?style=flat&color=f5c518)](https://github.com/archledger/linhello/stargazers)
+
+</div>
 
 A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): your password isn't replaced — it's sealed in your computer's TPM chip and released only when your face matches, with hardware-checked anti-spoofing. If the camera, TPM, or anything else fails, you just type your password like normal. **You can never be locked out.**
 
-## What you need
+<!-- Tip: a short demo GIF here sells the project instantly — drop one at assets/demo.gif and reference it as ![demo](assets/demo.gif) -->
+
+## 🧰 What you need
 
 - A TPM 2.0 chip (most PCs since ~2016 — check: `ls /dev/tpm*`)
 - A webcam (a Windows Hello IR camera is a bonus, not required)
 - Arch Linux (Debian/Ubuntu/Fedora support is experimental)
 
-## Install
+## ⚡ Install
 
 ```sh
 # 1. Dependencies
@@ -37,7 +49,7 @@ The wizard installs the daemon, checks your hardware, picks your camera, enrolls
 your face, and wires up login — one step at a time, showing you every change it
 makes to your system.
 
-## Everyday commands
+## 🎯 Everyday commands
 
 ```sh
 linhello test        # does it recognize me right now?
@@ -45,7 +57,7 @@ linhello doctor      # is everything healthy?
 sudo linhello tui    # re-run setup, manage profiles, or uninstall
 ```
 
-## Update
+## 🔄 Update
 
 ```sh
 sudo linhello update
@@ -58,7 +70,7 @@ models, and login wiring are never touched; wiring is only *extended* if a new
 version supports a login service yours didn't (and only if you had wiring
 enabled).
 
-## Security in one paragraph
+## 🔒 Security in one paragraph
 
 Face templates are encrypted (AES-256-GCM) with a key that only your TPM can
 release, and only when your machine's boot state (Secure Boot) is untampered.
@@ -66,7 +78,7 @@ Anti-spoofing rejects photos and virtual cameras. Kernel updates don't break it.
 The TTY console login is never touched, so there's always a way in. Details:
 [`docs/design/signed-pcr-policy.md`](docs/design/signed-pcr-policy.md).
 
-## Compared to Howdy
+## 🆚 Compared to Howdy
 
 [Howdy](https://github.com/boltgolt/howdy) is the established, widely-packaged
 face-unlock tool for Linux and well worth a look. LinuxHello takes a different
@@ -80,7 +92,7 @@ approach in a few respects:
 | Face recognition | InsightFace ONNX (ArcFace + SCRFD)                          | dlib / `face_recognition`                                     |
 | Maturity         | New                                                         | Mature, widely packaged                                       |
 
-## Uninstall
+## 🧹 Uninstall
 
 ```sh
 sudo linhello uninstall --yes
@@ -88,12 +100,12 @@ sudo linhello uninstall --yes
 
 Removes everything (PAM is unwired first — password login is never at risk).
 
-## License
+## 📜 License
 
 GPL-3.0-or-later. Bundled anti-spoof models: Apache-2.0 ([notice](models/antispoof.NOTICE)).
 Face-recognition models (buffalo_l) are downloaded directly by the user from the upstream [InsightFace](https://github.com/deepinsight/insightface) repository. These weights are subject to InsightFace's non-commercial research license and are intended solely for personal, non-commercial use by the end-user.
 
-## Citations and Attributions
+## 📚 Citations and Attributions
 
 This project provides automated plumbing for state-of-the-art biometrics and
 face anti-spoofing research. If you use this software, please acknowledge the
