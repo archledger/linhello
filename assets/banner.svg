@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" width="720" height="200" role="img" aria-label="LinuxHello — Windows Hello for Linux, face unlock with TPM-backed security">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#6e40c9"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="716" height="196" rx="18" fill="url(#bg)" stroke="#30363d" stroke-width="2"/>
+
+  <!-- face-scan icon -->
+  <g stroke="#58a6ff" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M62 78 V58 H82"/>
+    <path d="M158 58 H178 V78"/>
+    <path d="M62 122 V142 H82"/>
+    <path d="M158 142 H178 V122"/>
+  </g>
+  <g fill="none" stroke="#c9d1d9" stroke-width="3.5" stroke-linecap="round">
+    <circle cx="120" cy="100" r="30"/>
+    <circle cx="110" cy="93" r="2.6" fill="#c9d1d9" stroke="none"/>
+    <circle cx="130" cy="93" r="2.6" fill="#c9d1d9" stroke="none"/>
+    <path d="M107 110 Q120 122 133 110"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="212" y="92" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="700">
+    <tspan fill="#58a6ff">Linux</tspan><tspan fill="#ffffff">Hello</tspan>
+  </text>
+  <rect x="214" y="104" width="150" height="4" rx="2" fill="url(#accent)"/>
+
+  <!-- taglines -->
+  <text x="214" y="138" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#8b949e">Windows Hello for Linux · face unlock</text>
+  <text x="214" y="166" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#6e7681">TPM-sealed credential · anti-spoofing · built in Rust</text>
+</svg>
