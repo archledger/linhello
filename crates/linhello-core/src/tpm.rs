@@ -309,6 +309,11 @@ fn seal_authorized(
     pubkey_pem: &str,
     policy_ref: &[u8],
 ) -> Result<SealedEnvelope> {
+    // Only ever bind to the pinned trusted signing key. The plan layer already
+    // selects this key via `load_pubkey_pem`, but enforce it here too so no
+    // caller can seal `Full` under an untrusted key.
+    crate::pcrsig::ensure_trusted_pubkey(pubkey_pem)?;
+
     let mut ctx = open_context()?;
     let pcr_values = read_pcr_values(&mut ctx, pcrs)?;
 
@@ -417,6 +422,11 @@ fn unseal_authorized(
             crate::policy::AUTHORIZED_PCRS,
         )));
     }
+    // Pin the signing key recorded in the envelope to the trusted anchor before
+    // it is loaded into the TPM. `verify_signature` already enforces the key
+    // cryptographically, but this fails closed earlier and with a clear message
+    // if an envelope was rewritten to reference a different (attacker) key.
+    crate::pcrsig::ensure_trusted_pubkey(pubkey_pem)?;
     let mut ctx = open_context()?;
 
     with_handle(&mut ctx, create_srk, |ctx, srk| {
@@ -496,11 +506,19 @@ fn unseal_authorized(
     })
 }
 
-/// Load an external RSA public key (SPKI PEM) into the TPM under the Null
-/// hierarchy so its Name can be taken and signatures verified against it.
+/// Load an external RSA public key (SPKI PEM) into the TPM under the Owner
+/// hierarchy so its Name can be taken and signatures verified against it (the
+/// hierarchy must be non-NULL for the verification ticket to be usable by
+/// `TPM2_PolicyAuthorize` — see the note in the body).
 fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle> {
     let public = rsa_pem_to_public(pubkey_pem)?;
-    ctx.load_external_public(public, Hierarchy::Null)
+    // Load under the Owner hierarchy, NOT Null. TPM2_VerifySignature against a
+    // key in the NULL hierarchy yields a "null ticket" (empty digest), which
+    // TPM2_PolicyAuthorize then rejects with TPM_RC_VALUE on checkTicket. A
+    // non-NULL hierarchy makes VerifySignature return a real ticket that
+    // PolicyAuthorize accepts. The key Name (and thus the sealed authPolicy) is
+    // independent of the hierarchy, so seal/unseal stay consistent.
+    ctx.load_external_public(public, Hierarchy::Owner)
         .map_err(tpm_err)
 }
 
