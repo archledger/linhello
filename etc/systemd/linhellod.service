@@ -21,7 +21,15 @@ Environment=LINHELLO_REQUIRE_ANTISPOOF=1
 User=root
 Group=root
 
-# Hardening. Keep CAP_SYS_ADMIN off; we only need DAC/device access.
+# Hardening. Drop every capability except the few the daemon actually uses:
+#   CAP_CHOWN          — chown the socket to the `linhello` group at startup
+#   CAP_DAC_OVERRIDE   — read/write sealed envelopes + open the TPM/V4L device
+#                        nodes regardless of their owner/group mode bits
+#   CAP_FOWNER         — manage modes on files it creates under /etc/linhello
+# Without an explicit bounding set the daemon would keep the full root cap set
+# (CAP_SYS_ADMIN, CAP_SYS_MODULE, CAP_NET_ADMIN, CAP_SYS_PTRACE, …) despite this
+# section's intent. AmbientCapabilities stays empty (it is already root).
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/run /etc/linhello

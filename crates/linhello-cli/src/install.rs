@@ -366,6 +366,19 @@ const REPO_URL: &str = "https://github.com/archledger/linhello";
 /// (ZIP download, deleted checkout). Root-owned; nothing else touches it.
 const MANAGED_SRC: &str = "/var/lib/linhello/src";
 
+/// SHA-1 fingerprint (40 hex chars, no spaces) of the **only** key trusted to
+/// sign LinuxHello releases. `linhello update` builds and installs as root, so
+/// it refuses any source whose release tag is not signed by exactly this key —
+/// this is what neutralizes a repository/account takeover. Rotating the signing
+/// key means changing this constant and shipping a new signed release.
+const TRUSTED_SIGNER_FINGERPRINT: &str = "54C989C55B1FB5F26FDC55F7CC46D5CD5E601D4B";
+
+/// ASCII-armored public key for [`TRUSTED_SIGNER_FINGERPRINT`], installed with
+/// the rest of the config. The updater imports it into a dedicated, throwaway
+/// keyring so signature verification depends only on this pinned key — never on
+/// whatever happens to live in root's ambient GnuPG keyring.
+const TRUSTED_SIGNER_KEY_PATH: &str = "/etc/linhello/trusted-signer.asc";
+
 /// Update from GitHub: pull the latest source (reusing the git checkout we're
 /// running from when there is one, else a managed clone), rebuild, reinstall
 /// via `deploy_from`, and re-apply the existing PAM wiring so newly supported
@@ -374,7 +387,7 @@ const MANAGED_SRC: &str = "/var/lib/linhello/src";
 pub fn update(user: &str) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
 
-    let (root, fresh_clone) = match source_root().filter(|r| r.join(".git").exists()) {
+    let (root, _fresh_clone) = match source_root().filter(|r| r.join(".git").exists()) {
         Some(r) => {
             log.push(format!("source: git checkout at {}", r.display()));
             (r, false)
@@ -401,20 +414,36 @@ pub fn update(user: &str) -> Result<Vec<String>, String> {
     // nor a user-local cargo setup). The managed clone is root-owned -> root.
     let owner = dir_owner(&root);
 
-    let before = git_head(&root, owner);
-    if !fresh_clone {
-        run_streamed(owner, &root, "git", &["pull", "--ff-only"])?;
-    }
-    let after = git_head(&root, owner);
+    // We build only from a signed release tag, never an arbitrary branch HEAD.
+    // Fetch tags from the trusted remote.
+    run_streamed(owner, &root, "git", &["fetch", "--tags", "--force", "origin"])?;
 
-    if !fresh_clone && before == after && installed_cli().is_some() {
+    let tag = latest_release_tag(&root, owner)?.ok_or_else(|| {
+        "no release tags found on the remote — nothing to update to".to_string()
+    })?;
+    log.push(format!("latest release tag: {tag}"));
+
+    // HARD GATE: the tag must carry a valid signature from the pinned trusted
+    // key. Any failure — missing key, missing/invalid signature, or a different
+    // signer — aborts here. There is deliberately no override or prompt.
+    verify_tag_signature(&root, owner, &tag)?;
+    log.push(format!(
+        "signature verified: {tag} signed by trusted key {TRUSTED_SIGNER_FINGERPRINT}"
+    ));
+
+    let tag_commit = rev_commit(&root, owner, &tag)?;
+    let head_commit = rev_commit(&root, owner, "HEAD").unwrap_or_default();
+    if head_commit == tag_commit && installed_cli().is_some() {
         log.push(format!(
-            "already up to date ({}) — nothing to do. (Force a reinstall from the TUI's \
-             Install step if programs are damaged.)",
-            after.as_deref().unwrap_or("unknown commit")
+            "already at {tag} ({}) and installed — nothing to do",
+            short(&tag_commit)
         ));
         return Ok(log);
     }
+
+    // Check out exactly the verified tag (detached) and build from it.
+    run_streamed(owner, &root, "git", &["checkout", "--quiet", "--detach", &tag])?;
+    log.push(format!("checked out {tag} ({})", short(&tag_commit)));
 
     log.push("building (cargo build --release)…".to_string());
     run_streamed(owner, &root, "cargo", &["build", "--release"])?;
@@ -437,11 +466,7 @@ pub fn update(user: &str) -> Result<Vec<String>, String> {
         log.push("login wiring untouched (none was enabled)".to_string());
     }
 
-    log.push(format!(
-        "updated {} -> {}",
-        before.as_deref().unwrap_or("unknown"),
-        after.as_deref().unwrap_or("unknown")
-    ));
+    log.push(format!("updated to {tag} ({})", short(&tag_commit)));
     Ok(log)
 }
 
@@ -482,22 +507,196 @@ fn run_streamed(
     Ok(())
 }
 
-fn git_head(root: &Path, uid: Option<u32>) -> Option<String> {
-    let out = match uid {
-        Some(u) => Command::new("sudo")
-            .args(["-u", &format!("#{u}"), "git", "rev-parse", "--short", "HEAD"])
-            .current_dir(root)
-            .output(),
-        None => Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .current_dir(root)
-            .output(),
+/// Run `prog args` in `cwd` and capture its output (unlike `run_streamed`,
+/// which inherits stdio for live progress). With `Some(uid)` it drops to that
+/// user via `sudo -u #uid env …`, passing `envs` through (plain `sudo` scrubs
+/// the environment, so the `env` wrapper is required to carry `GNUPGHOME`).
+fn run_capture(
+    uid: Option<u32>,
+    cwd: &Path,
+    prog: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output, String> {
+    let mut cmd = match uid {
+        Some(u) => {
+            let mut c = Command::new("sudo");
+            c.arg("-u").arg(format!("#{u}")).arg("env");
+            for (k, v) in envs {
+                c.arg(format!("{k}={v}"));
+            }
+            c.arg(prog).args(args);
+            c
+        }
+        None => {
+            let mut c = Command::new(prog);
+            for (k, v) in envs {
+                c.env(k, v);
+            }
+            c.args(args);
+            c
+        }
+    };
+    cmd.current_dir(cwd)
+        .output()
+        .map_err(|e| format!("running {prog}: {e} (is it installed system-wide?)"))
+}
+
+/// Highest-versioned `v*` release tag known locally (after a fetch), or `None`
+/// if the repo has no release tags. Sorted by git's version ordering.
+fn latest_release_tag(root: &Path, uid: Option<u32>) -> Result<Option<String>, String> {
+    let out = run_capture(
+        uid,
+        root,
+        "git",
+        &["tag", "--list", "v*", "--sort=-version:refname"],
+        &[],
+    )?;
+    if !out.status.success() {
+        return Err("git tag --list failed (see output above)".to_string());
     }
-    .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string))
+}
+
+/// Full commit hash a ref resolves to.
+fn rev_commit(root: &Path, uid: Option<u32>, refname: &str) -> Result<String, String> {
+    // `<tag>^{commit}` dereferences an annotated tag to its commit.
+    let spec = format!("{refname}^{{commit}}");
+    let out = run_capture(uid, root, "git", &["rev-parse", "--verify", &spec], &[])?;
+    if !out.status.success() {
+        return Err(format!("cannot resolve {refname} to a commit"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
+/// Normalize a fingerprint for comparison: strip whitespace, uppercase.
+fn normalize_fpr(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// Every fingerprint asserted by a `[GNUPG:] VALIDSIG` line in raw gpg status.
+/// A VALIDSIG line means the signature is cryptographically valid for an
+/// available key; its 1st field is the signing (sub)key fingerprint and its
+/// last field is the primary-key fingerprint. We return both so a pinned
+/// primary key still matches when a release is signed by a rotating subkey.
+fn validsig_fingerprints(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let rest = match line.trim().strip_prefix("[GNUPG:] VALIDSIG ") {
+            Some(r) => r,
+            None => continue,
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if let Some(first) = fields.first() {
+            out.push(normalize_fpr(first));
+        }
+        if let Some(last) = fields.last() {
+            out.push(normalize_fpr(last));
+        }
+    }
+    out
+}
+
+/// Verify `tag` carries a valid signature from the pinned trusted key. Fatal
+/// error on any failure: bad pinned constant, missing trusted-key file,
+/// missing/invalid signature, or a signature from a different key. No bypass.
+fn verify_tag_signature(root: &Path, uid: Option<u32>, tag: &str) -> Result<(), String> {
+    let pinned = normalize_fpr(TRUSTED_SIGNER_FINGERPRINT);
+    if pinned.len() != 40 || !pinned.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "TRUSTED_SIGNER_FINGERPRINT is not a 40-hex-char fingerprint; refusing to update"
+                .to_string(),
+        );
+    }
+    let key_path = Path::new(TRUSTED_SIGNER_KEY_PATH);
+    if !key_path.exists() {
+        return Err(format!(
+            "trusted signer public key not found at {} — cannot verify the release \
+             signature (export it with: gpg --export --armor {pinned} | sudo tee {})",
+            key_path.display(),
+            key_path.display(),
+        ));
+    }
+
+    // Dedicated throwaway keyring so verification depends ONLY on the pinned
+    // key, not on root's ambient GnuPG state. gpg requires 0700 on its home.
+    let gnupghome = std::env::temp_dir().join(format!("linhello-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&gnupghome);
+    std::fs::create_dir_all(&gnupghome)
+        .map_err(|e| format!("creating verification keyring dir: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gnupghome, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing verification keyring dir: {e}"))?;
+    }
+    // When git/gpg runs as a non-root owner, the keyring dir must be theirs.
+    if let Some(u) = uid {
+        std::os::unix::fs::chown(&gnupghome, Some(u), None)
+            .map_err(|e| format!("chowning verification keyring dir: {e}"))?;
+    }
+
+    let result = verify_tag_in_keyring(root, uid, tag, &gnupghome, key_path, &pinned);
+    let _ = std::fs::remove_dir_all(&gnupghome);
+    result
+}
+
+fn verify_tag_in_keyring(
+    root: &Path,
+    uid: Option<u32>,
+    tag: &str,
+    gnupghome: &Path,
+    key_path: &Path,
+    pinned: &str,
+) -> Result<(), String> {
+    let gh = gnupghome.to_string_lossy().to_string();
+    let envs = [("GNUPGHOME", gh.as_str())];
+
+    // Import only the pinned public key into the dedicated keyring.
+    let imp = run_capture(
+        uid,
+        root,
+        "gpg",
+        &["--batch", "--quiet", "--import", &key_path.to_string_lossy()],
+        &envs,
+    )?;
+    if !imp.status.success() {
+        return Err(format!(
+            "failed to import trusted signer key from {}: {}",
+            key_path.display(),
+            String::from_utf8_lossy(&imp.stderr).trim()
+        ));
+    }
+
+    // Verify the tag. `--raw` prints machine-readable [GNUPG:] status to stderr.
+    let out = run_capture(uid, root, "git", &["verify-tag", "--raw", tag], &envs)?;
+    let status = String::from_utf8_lossy(&out.stderr);
+    let fprs = validsig_fingerprints(&status);
+
+    if fprs.is_empty() {
+        return Err(format!(
+            "release tag {tag} is not validly signed (no VALIDSIG from gpg) — refusing to \
+             build untrusted code as root"
+        ));
+    }
+    if !fprs.iter().any(|f| f == pinned) {
+        return Err(format!(
+            "release tag {tag} is signed by an untrusted key (got {:?}, expected {pinned}) — \
+             refusing to build untrusted code as root",
+            fprs
+        ));
+    }
+    Ok(())
 }
 
 /// The installed CLI binary, if any (distinguishes "source unchanged, nothing
@@ -764,6 +963,34 @@ fn enrolled_users() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_fingerprint_is_well_formed() {
+        let f = normalize_fpr(TRUSTED_SIGNER_FINGERPRINT);
+        assert_eq!(f.len(), 40, "pinned fingerprint must be 40 hex chars");
+        assert!(f.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn validsig_parses_signing_and_primary_fpr() {
+        // Real `git verify-tag --raw` status (signing fpr first, primary last).
+        let raw = "[GNUPG:] NEWSIG\n\
+            [GNUPG:] GOODSIG CC46D5CD5E601D4B archledger <archledger@gmail.com>\n\
+            [GNUPG:] VALIDSIG AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555 2026-06-15 1781 0 4 0 22 10 00 54C989C55B1FB5F26FDC55F7CC46D5CD5E601D4B\n\
+            [GNUPG:] TRUST_UNDEFINED 0 pgp";
+        let fprs = validsig_fingerprints(raw);
+        // Both the signing (sub)key fpr and the primary fpr are surfaced.
+        assert!(fprs.contains(&"AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555".to_string()));
+        assert!(fprs.contains(&"54C989C55B1FB5F26FDC55F7CC46D5CD5E601D4B".to_string()));
+    }
+
+    #[test]
+    fn no_validsig_yields_no_fingerprints() {
+        // ERRSIG/NO_PUBKEY (wrong or missing key) must NOT produce a match.
+        let raw = "[GNUPG:] ERRSIG CC46D5CD5E601D4B 22 10 00 1781 9 54C9\n\
+            [GNUPG:] NO_PUBKEY CC46D5CD5E601D4B";
+        assert!(validsig_fingerprints(raw).is_empty());
+    }
 
     fn state() -> InstallState {
         InstallState {
