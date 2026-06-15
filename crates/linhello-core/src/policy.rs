@@ -4,10 +4,14 @@
 //! [`plan`]:
 //!
 //! * **Authorized** — a `PolicyAuthorize` over the systemd PCR-signing public
-//!   key, covering PCR 7 (Secure Boot state) + PCR 11 (UKI). Survives kernel
-//!   updates because each new UKI ships a fresh signature for the new PCR 11.
-//!   Chosen only when Secure Boot is on, the system booted a UKI, and signed
-//!   artifacts (`/run/systemd/tpm2-pcr-{signature.json,public-key.pem}`) exist.
+//!   key, covering **PCR 11 (the UKI measurement) only** — the exact set
+//!   `ukify`/`systemd-measure` signs. Survives kernel updates because each new
+//!   UKI ships a fresh signature for the new PCR 11. Chosen only when Secure
+//!   Boot is on, the system booted a UKI, and signed artifacts
+//!   (`/run/systemd/tpm2-pcr-{signature.json,public-key.pem}`) exist, and the
+//!   public key matches the pinned trust anchor
+//!   ([`crate::pcrsig::TRUSTED_PUBKEY_SPKI_SHA256`]). PCR 7 (Secure Boot state)
+//!   is **not** folded in here — it is the separate literal gate below.
 //!
 //! * **Literal(PCR 7 only)** — a plain `PolicyPCR` over PCR 7. PCR 7 captures
 //!   the Secure Boot state/keys, which do **not** change on a kernel/initrd
@@ -22,8 +26,13 @@
 
 use linhello_common::{BootMode, SecurityLevel};
 
-/// PCRs covered by the signed (authorized) policy on a UKI system.
-pub const AUTHORIZED_PCRS: &[u32] = &[7, 11];
+/// PCRs covered by the signed (authorized) policy on a UKI system. systemd's
+/// `ukify`/`systemd-measure` signs **PCR 11 only** (the UKI measurement), so the
+/// `PolicyPCR` we replay at unseal must select exactly `[11]` to match a systemd
+/// signature entry — a `[7, 11]` set never matched the `pcrs:[11]` signatures
+/// systemd actually ships and so could never reach `Full`. PCR 7 (Secure Boot
+/// state) is the separate literal gate ([`LITERAL_PCRS`]), not folded in here.
+pub const AUTHORIZED_PCRS: &[u32] = &[11];
 /// PCRs covered by the literal fallback. PCR 7 only — stable across kernel
 /// updates (unlike PCR 11).
 pub const LITERAL_PCRS: &[u32] = &[7];
@@ -127,7 +136,7 @@ mod tests {
         assert_eq!(
             plan,
             PolicyPlan::Authorized {
-                pcrs: vec![7, 11],
+                pcrs: vec![11],
                 pubkey_pem: "PEM".into(),
                 policy_ref: Vec::new()
             }

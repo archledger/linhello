@@ -18,12 +18,29 @@
 
 use linhello_common::{LinuxHelloError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Default PCR bank we operate in. systemd writes `sha256` on modern systems.
 pub const DEFAULT_BANK: &str = "sha256";
+
+/// Lowercase-hex SHA-256 of the DER `SubjectPublicKeyInfo` of the PCR-signing
+/// public key this host trusts (the systemd UKI PCR signing key). The
+/// authorized (`Full`) path refuses to seal under, or unseal with, any key
+/// whose SPKI does not hash to this value, so a rogue key dropped into a
+/// higher-priority search dir (`/etc/systemd`) cannot authorize an unseal.
+///
+/// NOTE: this is the SHA-256 of the X.509 SPKI (matches
+/// `openssl pkey -pubin -outform DER | sha256sum`), which is **not** the same
+/// as systemd's own `pkfp` field in `tpm2-pcr-signature.json` (a different
+/// convention). We pin the key itself, then the TPM `verify_signature` step
+/// enforces it cryptographically. Established 2026-06-15; rotate this constant
+/// whenever the UKI PCR signing key is rotated.
+pub const TRUSTED_PUBKEY_SPKI_SHA256: &str =
+    "86812b40a327339e23d3c1a5621f31041e7581e1cc334746f3af62e861525ede";
 
 /// Search order matching `systemd-cryptenroll`/`systemd-cryptsetup`.
 const SEARCH_DIRS: [&str; 3] = ["/etc/systemd", "/run/systemd", "/usr/lib/systemd"];
@@ -82,11 +99,50 @@ pub fn signed_policy_available() -> bool {
     discover_signature_path().is_some() && discover_pubkey_path().is_some()
 }
 
-/// Read the authorizing public key as PEM text.
+/// Read the authorizing public key as PEM text, enforcing the pinned trust
+/// anchor. Errors if the discovered key is not the trusted signing key, so the
+/// policy layer falls back to the literal (PCR 7) tier rather than honour an
+/// untrusted key.
 pub fn load_pubkey_pem() -> Result<String> {
     let path = discover_pubkey_path()
         .ok_or_else(|| LinuxHelloError::Policy("no TPM2 PCR public key found".into()))?;
-    std::fs::read_to_string(&path).map_err(LinuxHelloError::Io)
+    let pem = std::fs::read_to_string(&path).map_err(LinuxHelloError::Io)?;
+    ensure_trusted_pubkey(&pem)?;
+    Ok(pem)
+}
+
+/// Lowercase-hex SHA-256 of `pubkey_pem`'s DER `SubjectPublicKeyInfo` — the
+/// fingerprint pinned by [`TRUSTED_PUBKEY_SPKI_SHA256`].
+pub fn pubkey_spki_fingerprint(pubkey_pem: &str) -> Result<String> {
+    let key = rsa::RsaPublicKey::from_public_key_pem(pubkey_pem)
+        .map_err(|e| LinuxHelloError::Policy(format!("parse PCR public key: {e}")))?;
+    let der = key
+        .to_public_key_der()
+        .map_err(|e| LinuxHelloError::Policy(format!("encode PCR public key SPKI: {e}")))?;
+    Ok(hex_lower(Sha256::digest(der.as_bytes()).as_slice()))
+}
+
+/// Error unless `pubkey_pem` is exactly the pinned trusted signing key. Used on
+/// both the seal path (which key to bind) and the unseal path (whether the key
+/// recorded in an envelope is still trusted).
+pub fn ensure_trusted_pubkey(pubkey_pem: &str) -> Result<()> {
+    let fp = pubkey_spki_fingerprint(pubkey_pem)?;
+    if fp != TRUSTED_PUBKEY_SPKI_SHA256 {
+        return Err(LinuxHelloError::Policy(format!(
+            "PCR signing key fingerprint {fp} is not the pinned trusted key \
+             {TRUSTED_PUBKEY_SPKI_SHA256}"
+        )));
+    }
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Parse all signatures for `bank` from the discovered signature file.
@@ -189,5 +245,21 @@ mod tests {
     fn rejects_bad_hex() {
         let bad = r#"{"sha256":[{"pcrs":[11],"pkfp":"a","pol":"xyz","sig":"AA=="}]}"#;
         assert!(parse_signatures(bad, "sha256").is_err());
+    }
+
+    #[test]
+    fn spki_fingerprint_is_deterministic_64_hex() {
+        use rsa::pkcs8::{EncodePublicKey, LineEnding};
+        let mut rng = rand::thread_rng();
+        let sk = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+        let pem = rsa::RsaPublicKey::from(&sk)
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pem");
+        let fp = pubkey_spki_fingerprint(&pem).unwrap();
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(fp, pubkey_spki_fingerprint(&pem).unwrap(), "deterministic");
+        // A freshly generated key is not the pinned production key.
+        assert!(ensure_trusted_pubkey(&pem).is_err());
     }
 }
