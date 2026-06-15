@@ -36,7 +36,7 @@ fn ae_warmup_ir() -> usize {
     std::env::var("LINHELLO_IR_WARMUP")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(3)
+        .unwrap_or(8)
 }
 
 /// Capture a single frame from the selected RGB camera. Blocks until one
@@ -291,7 +291,9 @@ fn capture_ir_from_blocking(path: &str) -> Result<IrFrame> {
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
-    let expected = (w * h) as usize;
+    // Widen before multiplying: driver-reported dimensions are u32, and `w * h`
+    // in u32 could overflow (wrapping in release) and yield a too-small buffer.
+    let expected = (w as usize) * (h as usize);
 
     let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| bio_err(format!("stream init: {e}")))?;

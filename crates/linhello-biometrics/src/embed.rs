@@ -77,6 +77,14 @@ impl Embedder {
             )));
         }
         l2_normalize(&mut v);
+        // Reject a degenerate (all-zero / non-finite) embedding rather than
+        // returning a non-unit vector. matcher::cosine assumes unit inputs; a
+        // NaN/Inf or zero-norm vector would otherwise propagate into the match
+        // score (NaN comparisons are silently dropped by f32::max).
+        let norm_ok = v.iter().all(|x| x.is_finite()) && v.iter().any(|&x| x != 0.0);
+        if !norm_ok {
+            return Err(bio_err("degenerate embedding (zero norm or non-finite)"));
+        }
         Ok(v)
     }
 }

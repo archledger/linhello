@@ -278,8 +278,12 @@ fn create_override_from(
     }
     let vendor_content = std::fs::read_to_string(vendor)
         .map_err(|e| anyhow::anyhow!("reading {vendor}: {e}"))?;
-    std::fs::write(path, build_override(vendor, &vendor_content, stanza))
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    // If an override already exists at this path, preserve a one-time backup
+    // before replacing it (parity with edit_in/remove_in).
+    if path.exists() {
+        backup(path)?;
+    }
+    write_atomic(path, &build_override(vendor, &vendor_content, stanza))?;
     Ok(Change::Created(path.to_path_buf()))
 }
 
@@ -294,7 +298,7 @@ fn edit_in(path: &Path, stanza: &str, dry_run: bool) -> Result<Change> {
         return Ok(Change::WouldEdit(path.to_path_buf()));
     }
     backup(path)?;
-    std::fs::write(path, new).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    write_atomic(path, &new)?;
     Ok(Change::Edited(path.to_path_buf()))
 }
 
@@ -325,8 +329,32 @@ fn remove_in(path: &Path, dry_run: bool) -> Result<Change> {
         return Ok(Change::WouldRemove(path.to_path_buf()));
     }
     backup(path)?;
-    std::fs::write(path, new).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    write_atomic(path, &new)?;
     Ok(Change::Removed(path.to_path_buf()))
+}
+
+/// Atomically replace `path`'s contents: write a sibling temp file, fsync-free
+/// `rename` over the target. PAM reads these files live, so a non-atomic
+/// truncate-in-place (`std::fs::write`) could expose a half-written auth stack
+/// if the process is interrupted (crash, ENOSPC, power loss). The rename is
+/// atomic within the same directory; the target's mode is preserved.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pam");
+    let tmp = dir.join(format!(".{fname}.linhello.tmp"));
+    std::fs::write(&tmp, contents)
+        .map_err(|e| anyhow::anyhow!("writing temp {}: {e}", tmp.display()))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("renaming {} into {}: {e}", tmp.display(), path.display())
+    })?;
+    Ok(())
 }
 
 /// Copy `path` to `path.pre-linhello` once (never overwrite an existing backup).

@@ -49,6 +49,11 @@ pub struct LivenessConfig {
     /// The secondary model is always optional — its absence only downgrades
     /// to single-model mode, it never fails.
     pub require_antispoof: bool,
+    /// If true, a missing IR frame is a hard decline (Uncertain) rather than a
+    /// silent downgrade to the RGB-only path. Opt-in (default false) so boxes
+    /// without an IR sensor keep working; enable it on IR-equipped hardware so
+    /// jamming/unplugging the IR camera cannot weaken liveness.
+    pub require_ir: bool,
 }
 
 impl LivenessConfig {
@@ -79,9 +84,14 @@ impl LivenessConfig {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_ANTISPOOF_MODEL_4)),
         );
 
+        // Reject threshold on a 0..1 softmax probability. Validate and clamp:
+        // a NaN/inf (or out-of-range) value would otherwise make the comparison
+        // `spoof_prob >= threshold` never fire, silently disabling the ML gate.
         let spoof_threshold = std::env::var("LINHELLO_SPOOF_THRESHOLD")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(DEFAULT_SPOOF_THRESHOLD);
 
         // Fail-closed by default: only an explicit falsey value disables the
@@ -92,11 +102,19 @@ impl LivenessConfig {
             .map(|v| !matches!(v, "0" | "false" | "no" | "off" | ""))
             .unwrap_or(true);
 
+        // Opt-in (default false): require an IR frame to be present.
+        let require_ir = std::env::var("LINHELLO_REQUIRE_IR")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         LivenessConfig {
             antispoof_model,
             antispoof_model_4,
             spoof_threshold,
             require_antispoof,
+            require_ir,
         }
     }
 }
@@ -327,6 +345,22 @@ impl LivenessEvaluator {
         let bbox_w = (bbox[2] - bbox[0]).max(0.0);
         let face_frac = bbox_w / frame.width().max(1) as f32;
         signals.face_frac = Some(face_frac);
+
+        // Fail-closed when IR is required but no frame was captured (sensor
+        // unplugged/jammed, capture error, or a panicked capture thread coerced
+        // to None upstream). Decline rather than silently fall back to the
+        // weaker RGB-only path. Uncertain (not Spoof) so the caller retries /
+        // falls back to password rather than treating it as an attack.
+        if ir.is_none() && self.config.require_ir {
+            return Ok(LivenessReport {
+                decision: LivenessDecision::Uncertain,
+                reason: Some(
+                    "IR liveness required (LINHELLO_REQUIRE_IR) but no IR frame was available"
+                        .to_string(),
+                ),
+                signals,
+            });
+        }
 
         // IR gate when a companion sensor is present. Policy derived from
         // calibration on Ben's ASUS WBF rig — see linhello-liveness/src/ir.rs

@@ -40,7 +40,7 @@ use linhello_common::client::socket_path;
 use anyhow::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task;
 
@@ -119,7 +119,13 @@ async fn main() -> Result<()> {
 async fn handle(stream: UnixStream) -> Result<()> {
     let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
+    // Requests are tiny JSON lines. Cap the read so a client (any member of the
+    // `linhello` group, given the 0660 socket) cannot stream an unterminated
+    // line and exhaust the privileged daemon's memory. On overflow the read
+    // returns a truncated, newline-less buffer that fails to parse — handled as
+    // a malformed request below, never an OOM.
+    const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+    let mut reader = BufReader::new(read.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
@@ -240,8 +246,10 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .unwrap_or_else(err)
         }
         // Metadata only (names, sample counts) — no biometrics, unprivileged.
+        // The `has_password` flag is a sensitive oracle, so it is populated only
+        // for callers entitled to act as the profile's user (see do_list_profiles).
         Request::ListProfiles => {
-            task::spawn_blocking(do_list_profiles).await.unwrap_or_else(err)
+            task::spawn_blocking(move || do_list_profiles(peer_uid)).await.unwrap_or_else(err)
         }
         // 1:N identification is an identity oracle, so it is root-only —
         // an administrative/setup operation, like Enroll.
@@ -493,14 +501,18 @@ fn profile_sample_count(user: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn do_list_profiles() -> Response {
+fn do_list_profiles(peer_uid: Option<u32>) -> Response {
     let profiles = enrolled_profiles()
         .into_iter()
         .map(|user| {
-            let has_password = std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
-                .join(&user)
-                .join("password_envelope.json")
-                .exists();
+            // Whether a user has sealed their login password is a sensitive
+            // oracle. Only reveal it to callers entitled to act as that user
+            // (root, or the user themselves); others always see `false`.
+            let has_password = users::peer_may_act_as(peer_uid, &user)
+                && std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+                    .join(&user)
+                    .join("password_envelope.json")
+                    .exists();
             ProfileInfo {
                 name: read_profile_name(&user),
                 samples: profile_sample_count(&user),
