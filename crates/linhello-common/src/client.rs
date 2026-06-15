@@ -25,11 +25,30 @@ pub fn request(req: &Request) -> Result<Response> {
 }
 
 pub fn request_with_timeout(req: &Request, timeout: Duration) -> Result<Response> {
-    request_at(Path::new(SOCKET_PATH), req, timeout)
+    request_at(&socket_path(), req, timeout)
+}
+
+/// Connect to the socket with a bounded wait. `UnixStream::connect` itself has
+/// no timeout, so a stalled listener (backlog full, accept() stuck) would
+/// otherwise hang the caller — e.g. freeze a login/sudo prompt — indefinitely.
+/// We connect on a detached helper thread and give up after `timeout`.
+fn connect_with_timeout(path: &Path, timeout: Duration) -> Result<UnixStream> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(&p));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res.map_err(LinuxHelloError::Io),
+        Err(_) => Err(LinuxHelloError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out connecting to linhello daemon socket",
+        ))),
+    }
 }
 
 pub fn request_at(path: &Path, req: &Request, timeout: Duration) -> Result<Response> {
-    let mut stream = UnixStream::connect(path)?;
+    let mut stream = connect_with_timeout(path, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 

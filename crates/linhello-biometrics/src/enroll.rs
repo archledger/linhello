@@ -77,7 +77,7 @@ pub fn parse_raw_embeddings(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
             EMBEDDING_DIM
         )));
     }
-    let samples = bytes
+    let mut samples: Vec<Vec<f32>> = bytes
         .chunks_exact(STRIDE_BYTES)
         .map(|chunk| {
             chunk
@@ -86,6 +86,23 @@ pub fn parse_raw_embeddings(bytes: &[u8]) -> Result<Vec<Vec<f32>>> {
                 .collect::<Vec<f32>>()
         })
         .collect();
+    // Defense in depth: matcher::cosine is a bare dot product that assumes
+    // unit-length inputs. A corrupt or crafted template with magnitude >> 1
+    // would otherwise score above the threshold and match any live face.
+    // Reject non-finite / degenerate samples and re-normalize each stored
+    // template to unit length so cosine stays bounded to [-1, 1].
+    for s in samples.iter_mut() {
+        if !s.iter().all(|x| x.is_finite()) {
+            return Err(bio_err("enrollment contains non-finite values"));
+        }
+        let norm = s.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if !(norm.is_finite() && norm > 1e-6) {
+            return Err(bio_err("enrollment sample has a degenerate (near-zero) norm"));
+        }
+        for x in s.iter_mut() {
+            *x /= norm;
+        }
+    }
     Ok(samples)
 }
 
@@ -105,4 +122,36 @@ pub fn sample_count(user: &str) -> Result<usize> {
         .map_err(|e| bio_err(format!("stat {}: {e}", path.display())))?
         .len() as usize;
     Ok(len / STRIDE_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn to_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn parse_renormalizes_non_unit_sample() {
+        // A stored template with magnitude >> 1 must be re-normalized so a bare
+        // dot-product cosine cannot exceed the match threshold on magnitude
+        // alone (which would match any live face).
+        let parsed = parse_raw_embeddings(&to_bytes(&vec![10.0f32; EMBEDDING_DIM])).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let norm: f32 = parsed[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
+    }
+
+    #[test]
+    fn parse_rejects_zero_norm_sample() {
+        assert!(parse_raw_embeddings(&to_bytes(&vec![0.0f32; EMBEDDING_DIM])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_finite_sample() {
+        let mut raw = vec![0.1f32; EMBEDDING_DIM];
+        raw[0] = f32::NAN;
+        assert!(parse_raw_embeddings(&to_bytes(&raw)).is_err());
+    }
 }

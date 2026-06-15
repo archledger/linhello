@@ -97,13 +97,25 @@ impl Detector {
         for (i, &stride) in STRIDES.iter().enumerate() {
             let grid_w = INPUT_SIZE / stride;
             let grid_h = INPUT_SIZE / stride;
-            decode_stride(
-                stride, grid_w, grid_h,
-                &all[i],       // scores
-                &all[i + 3],   // bboxes
-                &all[i + 6],   // kps
-                &mut faces,
-            );
+            let total = (grid_w as usize) * (grid_h as usize) * NUM_ANCHORS;
+            let (scores, bboxes, kpses) = (&all[i], &all[i + 3], &all[i + 6]);
+            // A swapped or version-mismatched model can return shorter tensors
+            // than the hardcoded grid assumes. Validate up front and fail with a
+            // clear error rather than panicking on an out-of-bounds slice (which
+            // would crash the daemon on every auth attempt).
+            if scores.len() < total || bboxes.len() < total * 4 || kpses.len() < total * 10 {
+                return Err(bio_err(format!(
+                    "scrfd output too small at stride {stride}: \
+                     scores={} bboxes={} kps={} (need {}/{}/{})",
+                    scores.len(),
+                    bboxes.len(),
+                    kpses.len(),
+                    total,
+                    total * 4,
+                    total * 10,
+                )));
+            }
+            decode_stride(stride, grid_w, grid_h, scores, bboxes, kpses, &mut faces);
         }
 
         for f in &mut faces {
@@ -130,7 +142,7 @@ fn decode_stride(
     kpses: &[f32],
     out: &mut Vec<Face>,
 ) {
-    let total = (grid_w * grid_h) as usize * NUM_ANCHORS;
+    let total = (grid_w as usize) * (grid_h as usize) * NUM_ANCHORS;
     for i in 0..total {
         let s = scores[i];
         if s < SCORE_THRESHOLD {

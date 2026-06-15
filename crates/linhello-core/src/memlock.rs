@@ -14,12 +14,21 @@ pub fn lock_slice(buf: &[u8]) -> Result<()> {
     let ptr = buf.as_ptr() as *mut libc::c_void;
     let len = buf.len();
     unsafe {
-        // Best-effort; RLIMIT_MEMLOCK may reject small allocations for unprivileged users.
+        // Best-effort; RLIMIT_MEMLOCK may reject allocations for unprivileged
+        // users. Surface failures at warn level (not debug): when this fails the
+        // plaintext secret can be paged to swap or land in a core dump, which
+        // the caller's API contract otherwise implies cannot happen.
         if libc::mlock(ptr, len) != 0 {
-            tracing::debug!("mlock failed: {}", std::io::Error::last_os_error());
+            tracing::warn!(
+                "mlock failed ({}); secret may be swappable — raise RLIMIT_MEMLOCK",
+                std::io::Error::last_os_error()
+            );
         }
         if libc::madvise(ptr, len, libc::MADV_DONTDUMP) != 0 {
-            tracing::debug!("madvise DONTDUMP failed: {}", std::io::Error::last_os_error());
+            tracing::warn!(
+                "madvise DONTDUMP failed ({}); secret may appear in core dumps",
+                std::io::Error::last_os_error()
+            );
         }
     }
     Ok(())
