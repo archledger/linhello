@@ -11,8 +11,19 @@ pub fn lock_slice(buf: &[u8]) -> Result<()> {
     if buf.is_empty() {
         return Ok(());
     }
-    let ptr = buf.as_ptr() as *mut libc::c_void;
-    let len = buf.len();
+    // `mlock` tolerates an unaligned start (it rounds down to the page), but
+    // `madvise(MADV_DONTDUMP)` returns EINVAL unless the address is page-aligned
+    // — so passing a raw Vec pointer silently failed the DONTDUMP protection.
+    // Align the start down to the page boundary and extend the length to cover
+    // the whole range, so both calls act on the pages backing the secret.
+    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as usize,
+        _ => 4096,
+    };
+    let start = buf.as_ptr() as usize;
+    let aligned_start = start & !(page - 1);
+    let len = (start - aligned_start) + buf.len();
+    let ptr = aligned_start as *mut libc::c_void;
     unsafe {
         // Best-effort; RLIMIT_MEMLOCK may reject allocations for unprivileged
         // users. Surface failures at warn level (not debug): when this fails the

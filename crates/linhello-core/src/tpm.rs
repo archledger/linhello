@@ -404,6 +404,19 @@ fn unseal_authorized(
     pubkey_pem: &str,
     policy_ref: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
+    // The object's authPolicy commits only to the signing key's Name, NOT to a
+    // concrete PCR set — so the PCR set replayed below is taken from the
+    // (on-disk, tamperable) envelope. Pin it to the constant the authorized
+    // path always seals with, so a rewritten envelope cannot steer unsealing
+    // onto an attacker-chosen PCR set for which they happen to hold a signed
+    // policy.
+    if env.pcrs.as_slice() != crate::policy::AUTHORIZED_PCRS {
+        return Err(LinuxHelloError::Policy(format!(
+            "authorized envelope binds unexpected PCR set {:?} (expected {:?}); refusing to unseal",
+            env.pcrs,
+            crate::policy::AUTHORIZED_PCRS,
+        )));
+    }
     let mut ctx = open_context()?;
 
     with_handle(&mut ctx, create_srk, |ctx, srk| {
