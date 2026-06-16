@@ -12,7 +12,7 @@ mod users;
 
 /// Unix group whose members may reach the socket for unprivileged ops
 /// (status / verify / liveness-test). Privileged ops still require uid 0.
-const SOCKET_GROUP: &str = "linhello";
+use linhello_common::SOCKET_GROUP;
 
 static TEMPLATE_KEY_CACHE: std::sync::OnceLock<Mutex<HashMap<String, zeroize::Zeroizing<Vec<u8>>>>> =
     std::sync::OnceLock::new();

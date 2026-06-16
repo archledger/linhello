@@ -1,7 +1,7 @@
 [Unit]
 Description=LinuxHello face-auth daemon
 Documentation=https://github.com/archledger/linhello
-After=systemd-tmpfiles-setup.service
+After=systemd-tmpfiles-setup.service systemd-sysusers.service
 RequiresMountsFor=/run /etc/linhello
 
 [Service]

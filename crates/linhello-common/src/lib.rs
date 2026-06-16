@@ -40,3 +40,6 @@ pub enum BootMode {
 
 pub const SOCKET_PATH: &str = "/run/linhello.sock";
 pub const CONFIG_ROOT: &str = "/etc/linhello";
+/// Unix group that owns the control socket (0660 root:linhello); members run
+/// the unprivileged CLI without sudo. Created via sysusers.d.
+pub const SOCKET_GROUP: &str = "linhello";

@@ -62,6 +62,14 @@ install: all
 	install -Dm755 $(PAM_SO)                $(DESTDIR)$(PAMDIR)/pam_linhello.so
 	sed 's|/usr/local/bin|$(BINDIR)|g' etc/systemd/linhellod.service \
 	    | install -Dm644 /dev/stdin $(DESTDIR)$(SYSTEMDDIR)/linhellod.service
+	# Declarative `linhello` system group (socket access for the unprivileged
+	# CLI). systemd-sysusers creates it from this file the same way packaging
+	# does; harmless + idempotent. DESTDIR builds (packaging) skip the immediate
+	# create — the package's %sysusers scriptlet runs it.
+	install -Dm644 etc/sysusers.d/linhello.conf \
+	    $(DESTDIR)$(PREFIX)/lib/sysusers.d/linhello.conf
+	[ -n "$(DESTDIR)" ] || ! command -v systemd-sysusers >/dev/null 2>&1 \
+	    || systemd-sysusers $(PREFIX)/lib/sysusers.d/linhello.conf
 	install -Dm644 etc/pam.d/linhello-auth \
 	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/linhello-auth
 	install -Dm644 etc/pam.d/examples/gdm-password \

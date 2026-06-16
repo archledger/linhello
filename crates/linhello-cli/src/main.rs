@@ -3,6 +3,7 @@
 
 use linhello_common::client;
 use linhello_common::ipc::{CapabilityReport, CapabilityStatus, Request, Response, SecretBytes};
+use linhello_common::SOCKET_GROUP;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write as _;
@@ -704,12 +705,13 @@ fn run_setup() -> Result<()> {
     }
     println!();
 
-    // Step 2 — platform integration: the SELinux policy (greeter/lock access)
-    // and the post-update reseal trigger. Both are per-distro gated; each is a
-    // no-op where it doesn't apply.
-    println!("Step 2/5 — platform integration (SELinux, reseal hook)");
+    // Step 2 — platform integration: the SELinux policy (greeter/lock access),
+    // the post-update reseal trigger, and the socket-group membership. The first
+    // two are per-distro gated; each is a no-op where it doesn't apply.
+    println!("Step 2/5 — platform integration (SELinux, reseal hook, group)");
     selinux_setup_step()?;
     reseal_hook_setup_step()?;
+    group_membership_setup_step();
     println!();
 
     // Step 3 — camera selection, persisted to cameras.conf.
@@ -1471,6 +1473,53 @@ fn reseal_hook_uninstall_cmd(dry_run: bool) -> Result<()> {
         println!("not installed — nothing to remove ({})", plan.hook_path.display());
     }
     Ok(())
+}
+
+/// `setup` step: add the current login user to the `linhello` group so they can
+/// run the unprivileged CLI without sudo. The group itself is created
+/// declaratively (sysusers.d, via `make install` / packaging); this only adds
+/// membership, which takes effect at the user's next login. Uniform across
+/// distros (systemd everywhere), so not gated.
+fn group_membership_setup_step() {
+    let user = current_user().unwrap_or_default();
+    if user.is_empty() || user == "root" {
+        return;
+    }
+    let group_exists = Command::new("getent")
+        .args(["group", SOCKET_GROUP])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !group_exists {
+        println!(
+            "  '{SOCKET_GROUP}' group missing — create it with: \
+             sudo systemd-sysusers (or sudo groupadd -r {SOCKET_GROUP})"
+        );
+        return;
+    }
+    let already = Command::new("id")
+        .args(["-nG", &user])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == SOCKET_GROUP)
+        })
+        .unwrap_or(false);
+    if already {
+        println!("  '{user}' is already in the {SOCKET_GROUP} group.");
+        return;
+    }
+    match Command::new("usermod").args(["-aG", SOCKET_GROUP, &user]).status() {
+        Ok(s) if s.success() => println!(
+            "  added '{user}' to the {SOCKET_GROUP} group — log out and back in for the \
+             unprivileged CLI (sudo works now)."
+        ),
+        _ => println!(
+            "  could not add '{user}' to the {SOCKET_GROUP} group — run: \
+             sudo usermod -aG {SOCKET_GROUP} {user}"
+        ),
+    }
 }
 
 /// `setup` step: install the post-update reseal trigger for this distro, gated
