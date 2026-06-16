@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
+      # fedora:latest ships no git, so actions/checkout would silently fall back
+      # to a tarball download (no .git) and `git verify-tag` later fails with
+      # "not a git repository". Install git BEFORE checkout so it does a real clone.
+      - name: Install git for a real checkout
+        run: dnf -y install git
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -24,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y \
-            cargo rust clang clang-devel gcc make pkgconf-pkg-config git gnupg2 \
+            cargo rust clang clang-devel gcc make pkgconf-pkg-config gnupg2 \
             tpm2-tss-devel openssl-devel pam-devel \
             selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy
 
