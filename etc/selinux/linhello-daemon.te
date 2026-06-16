@@ -21,11 +21,10 @@ policy_module(linhello-daemon, 1.0.0)
 # in packaging/fedora). Under ENFORCING SELinux the daemon transitions init_t ->
 # linhellod_t, creates the socket as linhellod_runtime_t, and TPM seal/unseal
 # (reseal-user-envelopes), config reads and socket IPC all succeed with ZERO
-# AVCs. The init_nnp_daemon_domain() call below was REQUIRED and only surfaced
-# at runtime: the unit's NoNewPrivileges=yes blocks the domain transition
-# without it. NOT exercised: the V4L camera path (no camera attached during
-# validation) — dev_*_video_dev are included by inspection; confirm with
-# `ausearch -m avc -c linhellod` on a box with a camera.
+# AVCs. The V4L camera path is validated too: liveness-test captures RGB+IR
+# (NexiGo N930W, IR emitter activation) under enforcing with zero AVCs. The
+# init_nnp_daemon_domain() call below was REQUIRED and only surfaced at runtime:
+# the unit's NoNewPrivileges=yes blocks the domain transition without it.
 #
 
 ########################################
