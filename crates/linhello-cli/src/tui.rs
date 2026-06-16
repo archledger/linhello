@@ -2221,7 +2221,12 @@ impl App {
 
     fn body_pam(&self, frame: &mut Frame, area: Rect) {
         let distro = platform::distro_family().as_str();
-        let greeter_on = self.pam.iter().any(|s| pam_role(&s.path) == "login screen" && s.wired);
+        // Face login is wired when any non-sudo PAM target is wired. On
+        // Fedora/Debian that's system-auth/password-auth/common-auth — which the
+        // greeter includes — not a per-service "login screen" file; on Arch it
+        // is those per-service files. sudo is the only optional extra, so only
+        // it is excluded here.
+        let greeter_on = self.pam.iter().any(|s| s.wired && pam_role(&s.path) != "sudo");
         let mut lines = vec![
             Line::from("Login wiring — connect face auth into your login".bold()),
             Line::from(""),
