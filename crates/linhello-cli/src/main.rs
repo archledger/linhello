@@ -1281,12 +1281,13 @@ fn run_shell(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a linhello SELinux policy is loaded — the minimal greeter-access
-/// module OR the packaged confined-daemon module (`linhello-daemon`), since
-/// either satisfies greeter access. `None` when it can't be determined —
-/// semodule missing, or the policy store isn't readable (it's root-only, so an
-/// unprivileged query returns `None`, not a false `false`).
-fn selinux_module_loaded() -> Option<bool> {
+/// Which linhello SELinux policy is loaded — the packaged confined-daemon module
+/// (`linhello-daemon`) or the minimal greeter-access module (`linhello`); either
+/// satisfies greeter access. Returns the loaded module's name. The outer `None`
+/// means it can't be determined (semodule missing, or the policy store isn't
+/// readable — it's root-only, so an unprivileged query returns `None`, not a
+/// false "not loaded"); `Some(None)` means determined-and-not-loaded.
+fn selinux_module_loaded() -> Option<Option<&'static str>> {
     use linhello_common::platform::{SELINUX_DAEMON_MODULE_NAME, SELINUX_MODULE_NAME};
     if !on_path("semodule") {
         return None;
@@ -1295,10 +1296,16 @@ fn selinux_module_loaded() -> Option<bool> {
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| {
-        let m = l.trim();
-        m == SELINUX_MODULE_NAME || m == SELINUX_DAEMON_MODULE_NAME
-    }))
+    let text = String::from_utf8_lossy(&out.stdout);
+    let loaded = |name: &str| text.lines().any(|l| l.trim() == name);
+    // Prefer the daemon module name when both happen to be present.
+    Some(if loaded(SELINUX_DAEMON_MODULE_NAME) {
+        Some(SELINUX_DAEMON_MODULE_NAME)
+    } else if loaded(SELINUX_MODULE_NAME) {
+        Some(SELINUX_MODULE_NAME)
+    } else {
+        None
+    })
 }
 
 fn selinux_status_cmd() {
@@ -1307,14 +1314,14 @@ fn selinux_status_cmd() {
     println!("LSM            : {}", lsm.as_str());
     println!("policy needed  : {}", lsm.needs_selinux_policy());
     match selinux_module_loaded() {
-        Some(true) => println!("module loaded  : yes ({})", platform::SELINUX_MODULE_NAME),
-        Some(false) => println!("module loaded  : no"),
+        Some(Some(name)) => println!("module loaded  : yes ({name})"),
+        Some(None) => println!("module loaded  : no"),
         None => println!("module loaded  : unknown (run as root, or semodule unavailable)"),
     }
     if std::fs::metadata("/run/linhello.sock").is_ok() {
         println!("socket         : /run/linhello.sock present");
     }
-    if lsm.needs_selinux_policy() && selinux_module_loaded() == Some(false) {
+    if lsm.needs_selinux_policy() && selinux_module_loaded() == Some(None) {
         println!();
         println!("Greeter/lock face-auth needs the policy here. Install it with:");
         println!("  sudo linhello selinux install");
@@ -1664,8 +1671,8 @@ fn selinux_setup_step() -> Result<()> {
         println!("  SELinux not in use on this system — no policy needed.");
         return Ok(());
     };
-    if selinux_module_loaded() == Some(true) {
-        println!("  SELinux policy `{}` already installed.", plan.module_name);
+    if let Some(Some(name)) = selinux_module_loaded() {
+        println!("  SELinux policy `{name}` already installed.");
         return Ok(());
     }
     if !plan.source_te.exists() {
@@ -1697,7 +1704,7 @@ fn selinux_uninstall_cmd(dry_run: bool) -> Result<()> {
         return Ok(());
     }
     require_root("selinux uninstall")?;
-    if selinux_module_loaded() == Some(false) {
+    if selinux_module_loaded() == Some(None) {
         println!("Module `{module}` is not loaded — nothing to do.");
         return Ok(());
     }
