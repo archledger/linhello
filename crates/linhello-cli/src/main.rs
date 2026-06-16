@@ -6,6 +6,7 @@ use linhello_common::ipc::{CapabilityReport, CapabilityStatus, Request, Response
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -117,6 +118,13 @@ enum Cmd {
         #[command(subcommand)]
         action: PamAction,
     },
+    /// Manage the SELinux policy module that lets the GDM greeter / GNOME lock
+    /// screen reach the daemon (needed only on SELinux systems — Fedora/RHEL).
+    /// A no-op by design on Arch / AppArmor distros.
+    Selinux {
+        #[command(subcommand)]
+        action: SelinuxAction,
+    },
     /// Live face-framing guide: shows whether the camera sees your face and
     /// guides you into position (distance, centering, head angle) before you
     /// enroll — so you don't have to open a separate camera app first. Polls
@@ -193,6 +201,30 @@ enum PamAction {
     },
     /// Remove face-auth from the PAM stacks.
     Disable {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SelinuxAction {
+    /// Show the active LSM, whether the policy is needed here, and whether the
+    /// linhello module is currently loaded.
+    Status,
+    /// Build and load the linhello SELinux policy module. No-op on non-SELinux
+    /// systems. Requires root unless --dry-run.
+    Install {
+        /// Show the exact commands without running anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Path to linhello.te to build from. Defaults to the installed policy
+        /// source; use this to point at the repo's etc/selinux/linhello.te
+        /// before packaging ships it to a system location.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Unload the linhello SELinux policy module. Requires root unless --dry-run.
+    Uninstall {
         #[arg(long)]
         dry_run: bool,
     },
@@ -1109,6 +1141,11 @@ fn main() -> Result<()> {
             PamAction::Enable { sudo, dry_run } => pam_enable_cmd(sudo, dry_run)?,
             PamAction::Disable { dry_run } => pam_disable_cmd(dry_run)?,
         },
+        Cmd::Selinux { action } => match action {
+            SelinuxAction::Status => selinux_status_cmd(),
+            SelinuxAction::Install { dry_run, from } => selinux_install_cmd(dry_run, from)?,
+            SelinuxAction::Uninstall { dry_run } => selinux_uninstall_cmd(dry_run)?,
+        },
     }
     Ok(())
 }
@@ -1147,6 +1184,165 @@ fn pam_disable_cmd(dry_run: bool) -> Result<()> {
     }
     for c in pamwire::disable(dry_run)? {
         println!("  {}", c.describe());
+    }
+    Ok(())
+}
+
+/// True if `bin` is found in any PATH directory (no execution).
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(bin).exists()))
+        .unwrap_or(false)
+}
+
+/// Run a shell command string, streaming its output; error if it fails.
+fn run_shell(cmd: &str) -> Result<()> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .with_context(|| format!("spawning: {cmd}"))?;
+    if !status.success() {
+        bail!("command failed ({status}): {cmd}");
+    }
+    Ok(())
+}
+
+/// Whether the linhello SELinux module is currently loaded (`semodule -l`).
+/// `None` when it can't be determined — semodule missing, or the policy store
+/// isn't readable (it's root-only, so an unprivileged query returns `None`,
+/// not a false `false`).
+fn selinux_module_loaded() -> Option<bool> {
+    if !on_path("semodule") {
+        return None;
+    }
+    let out = Command::new("semodule").arg("-l").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.trim() == linhello_common::platform::SELINUX_MODULE_NAME),
+    )
+}
+
+fn selinux_status_cmd() {
+    use linhello_common::platform;
+    let lsm = platform::security_module();
+    println!("LSM            : {}", lsm.as_str());
+    println!("policy needed  : {}", lsm.needs_selinux_policy());
+    match selinux_module_loaded() {
+        Some(true) => println!("module loaded  : yes ({})", platform::SELINUX_MODULE_NAME),
+        Some(false) => println!("module loaded  : no"),
+        None => println!("module loaded  : unknown (run as root, or semodule unavailable)"),
+    }
+    if std::fs::metadata("/run/linhello.sock").is_ok() {
+        println!("socket         : /run/linhello.sock present");
+    }
+    if lsm.needs_selinux_policy() && selinux_module_loaded() == Some(false) {
+        println!();
+        println!("Greeter/lock face-auth needs the policy here. Install it with:");
+        println!("  sudo linhello selinux install");
+    }
+}
+
+fn selinux_install_cmd(dry_run: bool, from: Option<String>) -> Result<()> {
+    use linhello_common::platform;
+
+    let Some(mut plan) = platform::selinux_policy_plan() else {
+        println!(
+            "This system does not use SELinux ({}) — no policy to install.",
+            platform::security_module().as_str()
+        );
+        return Ok(());
+    };
+    if let Some(p) = from {
+        plan.source_te = PathBuf::from(p);
+    }
+    if !plan.source_te.exists() {
+        bail!(
+            "policy source not found at {} — pass --from <path to linhello.te> \
+             (e.g. the repo's etc/selinux/linhello.te) or install the linhello data files",
+            plan.source_te.display()
+        );
+    }
+    for tool in ["checkmodule", "semodule_package", "semodule"] {
+        if !on_path(tool) {
+            bail!(
+                "required tool `{tool}` not found — install the SELinux policy tools \
+                 (Fedora: `dnf install checkpolicy policycoreutils`)"
+            );
+        }
+    }
+
+    // Build artifacts go in a scratch dir, not next to the (possibly read-only)
+    // source. Used for both dry-run display and real execution.
+    let build = std::env::temp_dir().join(format!("linhello-selinux-{}", std::process::id()));
+    let cmds = plan.commands(&build);
+
+    if dry_run {
+        println!(
+            "Would install SELinux module `{}` (source {}, enforcing={}):",
+            plan.module_name,
+            plan.source_te.display(),
+            plan.enforcing
+        );
+        for c in &cmds {
+            println!("  {c}");
+        }
+        println!();
+        println!("Re-run as root without --dry-run to apply.");
+        return Ok(());
+    }
+
+    require_root("selinux install")?;
+    std::fs::create_dir_all(&build)
+        .with_context(|| format!("creating build dir {}", build.display()))?;
+    println!(
+        "Installing SELinux module `{}` from {} …",
+        plan.module_name,
+        plan.source_te.display()
+    );
+    let result = (|| {
+        for c in &cmds {
+            println!("  $ {c}");
+            run_shell(c)?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+    let _ = std::fs::remove_dir_all(&build);
+    result?;
+
+    println!();
+    println!("Done. Verify with:  ls -Z /run/linhello.sock   (expect …:linhello_runtime_t)");
+    if !plan.enforcing {
+        println!("Note: SELinux is permissive now; the module is in place for when you enforce.");
+    }
+    Ok(())
+}
+
+fn selinux_uninstall_cmd(dry_run: bool) -> Result<()> {
+    let module = linhello_common::platform::SELINUX_MODULE_NAME;
+    let cmds = [
+        format!("semodule -r {module}"),
+        "systemctl restart linhellod".to_string(),
+    ];
+    if dry_run {
+        println!("Would unload SELinux module `{module}`:");
+        for c in &cmds {
+            println!("  {c}");
+        }
+        return Ok(());
+    }
+    require_root("selinux uninstall")?;
+    if selinux_module_loaded() == Some(false) {
+        println!("Module `{module}` is not loaded — nothing to do.");
+        return Ok(());
+    }
+    for c in &cmds {
+        println!("  $ {c}");
+        run_shell(c)?;
     }
     Ok(())
 }

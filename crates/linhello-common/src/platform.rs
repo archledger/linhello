@@ -371,20 +371,18 @@ pub struct SelinuxPolicyPlan {
 }
 
 impl SelinuxPolicyPlan {
-    /// The ordered shell steps to build and load the module from `source_te`.
-    pub fn commands(&self) -> Vec<String> {
-        let te = self.source_te.display().to_string();
-        let dir = self
-            .source_te
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+    /// The ordered shell steps to build `source_te` and load the module, with
+    /// build artifacts written under `build_dir` (a scratch dir — the source
+    /// may live in a read-only location). The same list is used for `--dry-run`
+    /// display and for execution, so what's printed is exactly what runs.
+    pub fn commands(&self, build_dir: &Path) -> Vec<String> {
+        let te = self.source_te.display();
+        let b = build_dir.display();
+        let m = self.module_name;
         vec![
-            format!("checkmodule -M -m -o {dir}/{SELINUX_MODULE_NAME}.mod {te}"),
-            format!(
-                "semodule_package -o {dir}/{SELINUX_MODULE_NAME}.pp -m {dir}/{SELINUX_MODULE_NAME}.mod"
-            ),
-            format!("semodule -i {dir}/{SELINUX_MODULE_NAME}.pp"),
+            format!("checkmodule -M -m -o {b}/{m}.mod {te}"),
+            format!("semodule_package -o {b}/{m}.pp -m {b}/{m}.mod"),
+            format!("semodule -i {b}/{m}.pp"),
             // Restart so the socket is recreated and relabeled by the policy's
             // file-type transition.
             "systemctl restart linhellod".to_string(),
@@ -580,9 +578,9 @@ mod tests {
             source_te: PathBuf::from("/usr/share/linhello/selinux/linhello.te"),
             enforcing: true,
         };
-        let cmds = plan.commands();
+        let cmds = plan.commands(Path::new("/tmp/build"));
         assert!(cmds.iter().any(|c| c.contains("linhello.te")));
-        assert!(cmds.iter().any(|c| c.starts_with("semodule -i")));
+        assert!(cmds.iter().any(|c| c.starts_with("semodule -i /tmp/build/linhello.pp")));
         assert!(cmds.last().unwrap().contains("restart linhellod"));
     }
 }
