@@ -297,6 +297,14 @@ fn capture_ir_from_blocking(path: &str) -> Result<IrFrame> {
 
     let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| bio_err(format!("stream init: {e}")))?;
+    // Light the active-IR emitter before warming up: on many Windows-Hello USB
+    // modules the NIR illuminator is gated behind a vendor UVC extension-unit
+    // control that `uvcvideo` never drives, so without this the warmup/burst
+    // frames come back black. Best-effort and device-wide on the open fd.
+    {
+        let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+        crate::ir_emitter::enable(dev.handle().fd(), &card);
+    }
     for _ in 0..ae_warmup_ir() {
         stream
             .next()
@@ -377,11 +385,46 @@ fn capture_from_blocking(path: &str) -> Result<Frame> {
                 .next()
                 .map_err(|e| bio_err(format!("warmup: {e}")))?;
         }
-        let (buf, _meta) = stream.next().map_err(|e| bio_err(format!("stream next: {e}")))?;
-        return decode(&fmt.fourcc, buf, fmt.width, fmt.height);
+        // Some UVC modules (e.g. the NexiGo N930W) intermittently deliver torn /
+        // incomplete MJPG frames — a single grab then fails the whole capture
+        // ("illegal start bytes", truncated DHT). Grab a few and return the first
+        // that decodes; skip obviously-incomplete JPEGs cheaply before decoding.
+        let mut decode_err: Option<crate::LinuxHelloError> = None;
+        for _ in 0..RGB_DECODE_ATTEMPTS {
+            let (buf, _meta) = stream
+                .next()
+                .map_err(|e| bio_err(format!("stream next: {e}")))?;
+            if &fmt.fourcc.repr == b"MJPG" && !is_complete_jpeg(buf) {
+                decode_err = Some(bio_err("incomplete MJPG frame"));
+                continue;
+            }
+            match decode(&fmt.fourcc, buf, fmt.width, fmt.height) {
+                Ok(frame) => return Ok(frame),
+                Err(e) => decode_err = Some(e),
+            }
+        }
+        // Every attempt at this pixel format failed to decode — fall through to
+        // the next preference (MJPG → YUYV, which is uncompressed and can't tear).
+        last_err = decode_err;
     }
     Err(last_err
         .unwrap_or_else(|| bio_err("no usable pixel format (camera offers neither MJPG nor YUYV)")))
+}
+
+/// Frames to try per pixel format before giving up / falling back. At 30fps the
+/// worst case adds ~130ms, well within the capture deadline, and a couple of
+/// retries reliably clears the N930W's occasional torn-MJPG frames.
+const RGB_DECODE_ATTEMPTS: usize = 4;
+
+/// Cheap structural check that a buffer is a *complete* JPEG: starts with the
+/// SOI marker (`FF D8`) and ends with EOI (`FF D9`). Catches the torn/desynced
+/// MJPG frames some UVC cameras emit without paying for a full decode attempt.
+fn is_complete_jpeg(buf: &[u8]) -> bool {
+    buf.len() > 4
+        && buf[0] == 0xFF
+        && buf[1] == 0xD8
+        && buf[buf.len() - 2] == 0xFF
+        && buf[buf.len() - 1] == 0xD9
 }
 
 fn decode(fourcc: &FourCC, buf: &[u8], w: u32, h: u32) -> Result<Frame> {
@@ -433,6 +476,18 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn complete_jpeg_detection() {
+        // SOI ... EOI
+        assert!(is_complete_jpeg(&[0xFF, 0xD8, 0x00, 0x11, 0xFF, 0xD9]));
+        // missing SOI (torn/desynced frame — the N930W failure mode)
+        assert!(!is_complete_jpeg(&[0x58, 0xCB, 0x00, 0x11, 0xFF, 0xD9]));
+        // truncated (no EOI)
+        assert!(!is_complete_jpeg(&[0xFF, 0xD8, 0x00, 0x11, 0x00, 0x00]));
+        // too short
+        assert!(!is_complete_jpeg(&[0xFF, 0xD8]));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub mod align;
 pub mod camera;
 pub mod detect;
+pub mod ir_emitter;
 pub mod embed;
 pub mod enroll;
 pub mod matcher;
@@ -46,11 +47,13 @@ pub struct AuthResult {
 /// Returns the frame + face on success; errors (with a human-readable reason)
 /// when no face is visible or liveness rejects.
 fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
-    // Parallel RGB + IR capture: IR warmup (~530ms) runs in a background
-    // thread while RGB capture + face detection happen in the foreground.
-    // Saves ~500ms vs. sequential.
-    let ir_handle = std::thread::spawn(|| camera::capture_ir_frame().ok().flatten());
-
+    // Capture RGB + detect FIRST, then IR — never concurrently. On shared-USB
+    // Windows-Hello modules (e.g. NexiGo N930W: RGB + IR are one USB device) a
+    // simultaneous IR grab starves the RGB stream, producing slow/torn frames
+    // and multi-second auth latency (observed ~17s on the N930W). The enrollment
+    // position guide (`capture_position_sample`) serialises for the same reason;
+    // the auth path must too. The lost overlap (~500ms IR warmup) is a fair price
+    // on dedicated-bus cameras for reliable, fast capture on shared-USB ones.
     let frame = camera::capture_frame()?;
     let detector = detect::Detector::cached()?;
     let faces = detector.detect(&frame)?;
@@ -59,7 +62,7 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
         .next()
         .ok_or_else(|| bio_err("no face detected"))?;
 
-    let ir = ir_handle.join().unwrap_or(None);
+    let ir = camera::capture_ir_frame().ok().flatten();
 
     let evaluator = linhello_liveness::LivenessEvaluator::cached()?;
     let report = evaluator.evaluate(

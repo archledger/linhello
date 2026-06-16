@@ -694,6 +694,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
+ "libc",
  "linhello-common",
  "linhello-liveness",
  "ndarray",
