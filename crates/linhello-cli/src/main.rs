@@ -666,7 +666,7 @@ fn run_setup() -> Result<()> {
     println!("================\n");
 
     // Step 1 — readiness (reuse the daemon's capability report).
-    println!("Step 1/4 — checking hardware & software readiness");
+    println!("Step 1/5 — checking hardware & software readiness");
     match send(Request::Probe) {
         Ok(Response::Capabilities { report }) => {
             print_capability_report(&report);
@@ -680,8 +680,14 @@ fn run_setup() -> Result<()> {
     }
     println!();
 
-    // Step 2 — camera selection, persisted to cameras.conf.
-    println!("Step 2/4 — choose your camera");
+    // Step 2 — SELinux policy (gated; no-op off SELinux). Infrastructure for the
+    // greeter/lock PAM path, so it goes early alongside readiness.
+    println!("Step 2/5 — SELinux policy");
+    selinux_setup_step()?;
+    println!();
+
+    // Step 3 — camera selection, persisted to cameras.conf.
+    println!("Step 3/5 — choose your camera");
     let cams = linhello_biometrics::camera::enumerate();
     let (rgb, ir) = choose_cameras(&cams)?;
     linhello_biometrics::camera::write_cameras_conf(&rgb, ir.as_deref())?;
@@ -692,10 +698,10 @@ fn run_setup() -> Result<()> {
     restart_daemon()?; // bind the chosen devices before calibrating
     println!();
 
-    // Step 3 — threshold calibration (needs an existing enrollment to score
+    // Step 4 — threshold calibration (needs an existing enrollment to score
     // against; if none, we skip and let enrollment happen first).
     let user = current_user()?;
-    println!("Step 3/4 — calibrate the match threshold");
+    println!("Step 4/5 — calibrate the match threshold");
     if prompt_yes(&format!(
         "  calibrate against {user}'s enrolled face now? (skip if not enrolled yet) [y/N] "
     )) {
@@ -706,8 +712,8 @@ fn run_setup() -> Result<()> {
     }
     println!();
 
-    // Step 4 — optional enrollment.
-    println!("Step 4/4 — enrollment");
+    // Step 5 — optional enrollment.
+    println!("Step 5/5 — enrollment");
     if prompt_yes(&format!("  enroll {user}'s face now? [y/N] ")) {
         enroll_guided(&user, false, 5)?;
     } else {
@@ -1267,28 +1273,15 @@ fn selinux_install_cmd(dry_run: bool, from: Option<String>) -> Result<()> {
             plan.source_te.display()
         );
     }
-    for tool in ["checkmodule", "semodule_package", "semodule"] {
-        if !on_path(tool) {
-            bail!(
-                "required tool `{tool}` not found — install the SELinux policy tools \
-                 (Fedora: `dnf install checkpolicy policycoreutils`)"
-            );
-        }
-    }
-
-    // Build artifacts go in a scratch dir, not next to the (possibly read-only)
-    // source. Used for both dry-run display and real execution.
-    let build = std::env::temp_dir().join(format!("linhello-selinux-{}", std::process::id()));
-    let cmds = plan.commands(&build);
-
     if dry_run {
+        let build = std::env::temp_dir().join(format!("linhello-selinux-{}", std::process::id()));
         println!(
             "Would install SELinux module `{}` (source {}, enforcing={}):",
             plan.module_name,
             plan.source_te.display(),
             plan.enforcing
         );
-        for c in &cmds {
+        for c in &plan.commands(&build) {
             println!("  {c}");
         }
         println!();
@@ -1297,27 +1290,72 @@ fn selinux_install_cmd(dry_run: bool, from: Option<String>) -> Result<()> {
     }
 
     require_root("selinux install")?;
-    std::fs::create_dir_all(&build)
-        .with_context(|| format!("creating build dir {}", build.display()))?;
     println!(
         "Installing SELinux module `{}` from {} …",
         plan.module_name,
         plan.source_te.display()
     );
+    apply_selinux_plan(&plan)?;
+
+    println!();
+    println!("Done. Verify with:  ls -Z /run/linhello.sock   (expect …:linhello_runtime_t)");
+    if !plan.enforcing {
+        println!("Note: SELinux is permissive now; the module is in place for when you enforce.");
+    }
+    Ok(())
+}
+
+/// Build and load the policy described by `plan`: verify tooling, build in a
+/// scratch dir, run the commands, clean up. Assumes root and a present source;
+/// shared by `selinux install` and the `setup` step.
+fn apply_selinux_plan(plan: &linhello_common::platform::SelinuxPolicyPlan) -> Result<()> {
+    for tool in ["checkmodule", "semodule_package", "semodule"] {
+        if !on_path(tool) {
+            bail!(
+                "required tool `{tool}` not found — install the SELinux policy tools \
+                 (Fedora: `dnf install checkpolicy policycoreutils`)"
+            );
+        }
+    }
+    let build = std::env::temp_dir().join(format!("linhello-selinux-{}", std::process::id()));
+    std::fs::create_dir_all(&build)
+        .with_context(|| format!("creating build dir {}", build.display()))?;
     let result = (|| {
-        for c in &cmds {
+        for c in &plan.commands(&build) {
             println!("  $ {c}");
             run_shell(c)?;
         }
         Ok::<(), anyhow::Error>(())
     })();
     let _ = std::fs::remove_dir_all(&build);
-    result?;
+    result
+}
 
-    println!();
-    println!("Done. Verify with:  ls -Z /run/linhello.sock   (expect …:linhello_runtime_t)");
-    if !plan.enforcing {
-        println!("Note: SELinux is permissive now; the module is in place for when you enforce.");
+/// `setup` step: install the SELinux policy if this is a SELinux system and it
+/// isn't already loaded. Gated via `selinux_policy_plan()` — a silent no-op on
+/// Arch / AppArmor. Never fails setup over a missing source; it points the user
+/// at the manual command instead.
+fn selinux_setup_step() -> Result<()> {
+    use linhello_common::platform;
+    let Some(plan) = platform::selinux_policy_plan() else {
+        println!("  SELinux not in use on this system — no policy needed.");
+        return Ok(());
+    };
+    if selinux_module_loaded() == Some(true) {
+        println!("  SELinux policy `{}` already installed.", plan.module_name);
+        return Ok(());
+    }
+    if !plan.source_te.exists() {
+        println!("  policy source not found at {} —", plan.source_te.display());
+        println!("  install later with: sudo linhello selinux install --from <path to linhello.te>");
+        return Ok(());
+    }
+    println!("  the greeter/lock screen needs the linhello SELinux policy to reach the daemon.");
+    if prompt_yes("  install it now? [y/N] ") {
+        apply_selinux_plan(&plan)?;
+        println!("  installed — socket relabeled to linhello_runtime_t.");
+    } else {
+        println!("  skipped — run `sudo linhello selinux install` before greeter/lock face login.");
     }
     Ok(())
 }

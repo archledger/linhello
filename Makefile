@@ -82,6 +82,9 @@ install: all
 	# Ship the Apache-2.0 anti-spoof models so install needs no PyTorch/convert.
 	install -Dm644 models/antispoof.onnx   $(DESTDIR)$(CONFDIR)/antispoof.onnx
 	install -Dm644 models/antispoof_4.onnx $(DESTDIR)$(CONFDIR)/antispoof_4.onnx
+	# SELinux policy source. Harmless to ship everywhere; it is built+loaded only
+	# on SELinux systems (`linhello selinux install`, also run from `setup`).
+	install -Dm644 etc/selinux/linhello.te $(DESTDIR)$(CONFDIR)/selinux/linhello.te
 	@echo
 	@echo "Installed (incl. anti-spoof models). Next — fetch buffalo_l (InsightFace):"
 	@echo "  systemctl daemon-reload && systemctl enable --now linhellod"
