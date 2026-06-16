@@ -17,11 +17,15 @@ policy_module(linhello-daemon, 1.0.0)
 #   sudo semodule -i linhello-daemon.pp
 #   sudo restorecon -v /usr/bin/linhellod /etc/linhello /run/linhello.sock
 #
-# VALIDATION STATUS: compiles against the Fedora refpolicy headers. Runtime
-# confinement is NOT yet validated on a real packaged install (the dev/test box
-# runs the daemon from /usr/local/bin as unconfined_service_t). Confirm with
-# `ausearch -m avc -c linhellod` after a packaged deployment and fold in any
-# additional accesses before shipping in a package.
+# VALIDATION STATUS: runtime-validated on a packaged Fedora 44 install (the RPM
+# in packaging/fedora). Under ENFORCING SELinux the daemon transitions init_t ->
+# linhellod_t, creates the socket as linhellod_runtime_t, and TPM seal/unseal
+# (reseal-user-envelopes), config reads and socket IPC all succeed with ZERO
+# AVCs. The init_nnp_daemon_domain() call below was REQUIRED and only surfaced
+# at runtime: the unit's NoNewPrivileges=yes blocks the domain transition
+# without it. NOT exercised: the V4L camera path (no camera attached during
+# validation) — dev_*_video_dev are included by inspection; confirm with
+# `ausearch -m avc -c linhellod` on a box with a camera.
 #
 
 ########################################
@@ -32,6 +36,10 @@ policy_module(linhello-daemon, 1.0.0)
 type linhellod_t;
 type linhellod_exec_t;
 init_daemon_domain(linhellod_t, linhellod_exec_t)
+# The unit runs with NoNewPrivileges=yes (hardening), which blocks the SELinux
+# domain transition unless it's explicitly allowed — without this the daemon
+# stays in init_t. Validated on a packaged install: this is required.
+init_nnp_daemon_domain(linhellod_t)
 
 # Runtime socket /run/linhello.sock — its own type so the display manager can be
 # granted narrow access to just this socket.
