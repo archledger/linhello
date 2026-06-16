@@ -140,6 +140,17 @@ enum Cmd {
         #[arg(long, value_parser = ["build", "runtime"])]
         only: Option<String>,
     },
+    /// Build the native package for this distro (rpm/deb/pkg, auto-detected) from
+    /// the source checkout. With --install, install it via the package manager
+    /// (needs root). This is what `update` uses to pick the right package.
+    Package {
+        /// Override the auto-detected format.
+        #[arg(long, value_parser = ["auto", "rpm", "deb", "pkg"])]
+        format: Option<String>,
+        /// Install the built package via the native package manager.
+        #[arg(long)]
+        install: bool,
+    },
     /// Live face-framing guide: shows whether the camera sees your face and
     /// guides you into position (distance, centering, head angle) before you
     /// enroll — so you don't have to open a separate camera app first. Polls
@@ -1193,6 +1204,7 @@ fn main() -> Result<()> {
             ResealHookAction::Uninstall { dry_run } => reseal_hook_uninstall_cmd(dry_run)?,
         },
         Cmd::Deps { only } => deps_cmd(only.as_deref()),
+        Cmd::Package { format, install } => package_cmd(format.as_deref(), install)?,
     }
     Ok(())
 }
@@ -1479,6 +1491,39 @@ fn reseal_hook_uninstall_cmd(dry_run: bool) -> Result<()> {
         println!("removed {}", plan.hook_path.display());
     } else {
         println!("not installed — nothing to remove ({})", plan.hook_path.display());
+    }
+    Ok(())
+}
+
+/// `linhello package` — build (and optionally install) the native package for
+/// this distro, picked by detection.
+fn package_cmd(format: Option<&str>, install: bool) -> Result<()> {
+    use linhello_common::platform::{self, PackageFormat};
+    let fmt = match format {
+        None | Some("auto") => platform::package_format(),
+        Some("rpm") => PackageFormat::Rpm,
+        Some("deb") => PackageFormat::Deb,
+        Some("pkg") => PackageFormat::Pkg,
+        Some(o) => bail!("unknown format `{o}`"),
+    };
+    if fmt == PackageFormat::Unknown {
+        bail!("no native package format for this distro ({})", platform::distro_family().as_str());
+    }
+    if install {
+        require_root("package --install")?;
+    }
+    let root = install::source_root()
+        .ok_or_else(|| anyhow::anyhow!("no source checkout found to build from"))?;
+    let (pkg, log) = install::build_native_package(&root, fmt).map_err(|e| anyhow::anyhow!(e))?;
+    for l in log {
+        println!("  {l}");
+    }
+    if install {
+        for l in install::install_native_package(&pkg, fmt).map_err(|e| anyhow::anyhow!(e))? {
+            println!("  {l}");
+        }
+    } else {
+        println!("\nBuilt: {}\nInstall it with: sudo linhello package --install", pkg.display());
     }
     Ok(())
 }

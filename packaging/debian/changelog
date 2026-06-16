@@ -1,0 +1,7 @@
+linhello (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging: daemon, PAM module, systemd unit, sysusers group.
+    Reseal trigger (kernel postinst.d) installed via `linhello reseal-hook
+    install` in postinst. Face login wired via `linhello pam enable`.
+
+ -- Ben <archledger236@gmail.com>  Tue, 16 Jun 2026 00:00:00 +0000

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+case "$1" in
+    configure)
+        # Install the per-distro reseal trigger (gated -> kernel postinst.d on
+        # Debian). Best-effort; failure must not break package configuration.
+        linhello reseal-hook install >/dev/null 2>&1 || true
+        ;;
+esac
+#DEBHELPER#
+exit 0

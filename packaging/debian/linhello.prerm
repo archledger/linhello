@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+case "$1" in
+    remove)
+        linhello reseal-hook uninstall >/dev/null 2>&1 || true
+        ;;
+esac
+#DEBHELPER#
+exit 0

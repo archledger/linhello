@@ -538,6 +538,66 @@ pub const DEPENDENCIES: &[Dep] = &[
     Dep { need: "PAM headers", runtime: false, arch: "pam", debian: "libpam0g-dev", fedora: "pam-devel" },
 ];
 
+/// Native package format for this distro family — what `linhello` builds and
+/// installs for the running OS, so each family gets a package specific to it
+/// rather than a one-size source install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageFormat {
+    /// `.rpm` (rpmbuild + dnf) — Fedora/RHEL.
+    Rpm,
+    /// `.deb` (dpkg-buildpackage + apt) — Debian/Ubuntu.
+    Deb,
+    /// `.pkg.tar.zst` (makepkg + pacman) — Arch.
+    Pkg,
+    /// No known native packaging.
+    Unknown,
+}
+
+impl PackageFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageFormat::Rpm => "rpm",
+            PackageFormat::Deb => "deb",
+            PackageFormat::Pkg => "pkg",
+            PackageFormat::Unknown => "unknown",
+        }
+    }
+
+    /// In-repo packaging definition directory for this format.
+    pub fn packaging_dir(self) -> Option<&'static str> {
+        match self {
+            PackageFormat::Rpm => Some("packaging/fedora"),
+            PackageFormat::Deb => Some("packaging/debian"),
+            PackageFormat::Pkg => Some("packaging/arch"),
+            PackageFormat::Unknown => None,
+        }
+    }
+
+    /// The tool that builds this package format (used to gate the native path).
+    pub fn build_tool(self) -> Option<&'static str> {
+        match self {
+            PackageFormat::Rpm => Some("rpmbuild"),
+            PackageFormat::Deb => Some("dpkg-buildpackage"),
+            PackageFormat::Pkg => Some("makepkg"),
+            PackageFormat::Unknown => None,
+        }
+    }
+}
+
+fn package_format_for(family: DistroFamily) -> PackageFormat {
+    match family {
+        DistroFamily::Fedora => PackageFormat::Rpm,
+        DistroFamily::Debian => PackageFormat::Deb,
+        DistroFamily::Arch => PackageFormat::Pkg,
+        DistroFamily::Other => PackageFormat::Unknown,
+    }
+}
+
+/// Native package format for the running OS.
+pub fn package_format() -> PackageFormat {
+    package_format_for(distro_family())
+}
+
 /// The package-install command prefix for this distro family, e.g.
 /// `sudo dnf install`. `None` when the package manager is unknown.
 pub fn package_install_prefix() -> Option<&'static str> {
@@ -739,6 +799,17 @@ mod tests {
         assert!(SecurityModule::SeLinux { enforcing: false }.needs_selinux_policy());
         assert!(!SecurityModule::AppArmor.needs_selinux_policy());
         assert!(!SecurityModule::None.needs_selinux_policy());
+    }
+
+    #[test]
+    fn package_format_is_per_family() {
+        assert_eq!(package_format_for(DistroFamily::Fedora), PackageFormat::Rpm);
+        assert_eq!(package_format_for(DistroFamily::Debian), PackageFormat::Deb);
+        assert_eq!(package_format_for(DistroFamily::Arch), PackageFormat::Pkg);
+        assert_eq!(package_format_for(DistroFamily::Other), PackageFormat::Unknown);
+        assert_eq!(PackageFormat::Rpm.packaging_dir(), Some("packaging/fedora"));
+        assert_eq!(PackageFormat::Deb.build_tool(), Some("dpkg-buildpackage"));
+        assert_eq!(PackageFormat::Unknown.packaging_dir(), None);
     }
 
     #[test]

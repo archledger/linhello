@@ -1,0 +1,36 @@
+Source: linhello
+Section: admin
+Priority: optional
+Maintainer: Ben <archledger236@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ clang,
+ libclang-dev,
+ pkg-config,
+ libtss2-dev,
+ libssl-dev,
+ libpam0g-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/archledger/linhello
+Rules-Requires-Root: no
+
+Package: linhello
+Architecture: amd64 arm64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libtss2-tcti-device0,
+ libpam0g,
+ libv4l-0
+Description: TPM-backed face authentication for Linux (Windows Hello-style)
+ LinuxHello adds Windows Hello-style face login to Linux: a small daemon
+ performs IR/RGB face recognition with anti-spoofing and unseals a TPM-sealed
+ copy of your password to satisfy PAM, so the greeter, lock screen and sudo can
+ authenticate by face while the password remains a fallback.
+ .
+ ONNX Runtime is required at run time but is not packaged in Debian; build or
+ download libonnxruntime.so and set ORT_DYLIB_PATH (see `linhello deps`). Face
+ login is not wired into PAM automatically — run `linhello pam enable` and
+ `linhello setup` after install.

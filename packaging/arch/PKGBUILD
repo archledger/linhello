@@ -42,6 +42,11 @@ package() {
         SYSTEMDDIR=/usr/lib/systemd/system \
         CARGO_TARGET_DIR="$srcdir/target"
 
+    # SELinux policy sources shipped by `make install` are inert on Arch (no
+    # SELinux); drop them so the package stays clean. The sysusers.d group file
+    # and systemd unit installed by `make install` are kept as-is.
+    rm -rf "$pkgdir/etc/linhello/selinux" "$pkgdir/usr/share/linhello/selinux"
+
     # Models are not packaged — user installs their own InsightFace buffalo_l
     # weights. Ship an empty config dir and the models README as docs.
     install -dm755 "$pkgdir/etc/linhello"

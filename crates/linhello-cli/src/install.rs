@@ -7,6 +7,7 @@
 //! detecting state never changes it.
 
 use linhello_common::config;
+use linhello_common::platform::{self, PackageFormat};
 use linhello_common::CONFIG_ROOT;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -445,10 +446,32 @@ pub fn update(user: &str) -> Result<Vec<String>, String> {
     run_streamed(owner, &root, "git", &["checkout", "--quiet", "--detach", &tag])?;
     log.push(format!("checked out {tag} ({})", short(&tag_commit)));
 
-    log.push("building (cargo build --release)…".to_string());
-    run_streamed(owner, &root, "cargo", &["build", "--release"])?;
-
-    log.extend(deploy_from(&root, user)?);
+    // Install the way this distro expects: build + install the native package
+    // (rpm/deb/pkg) when its build tooling is present, so the system tracks a
+    // real package; otherwise fall back to the from-source `make install`.
+    let fmt = platform::package_format();
+    let native = fmt
+        .build_tool()
+        .map(on_path)
+        .unwrap_or(false)
+        .then(|| build_native_package(&root, fmt))
+        .and_then(|r| r.ok());
+    match native {
+        Some((pkg, blog)) => {
+            log.push(format!("distro {}: native {} package", platform::distro_family().as_str(), fmt.as_str()));
+            log.extend(blog);
+            log.extend(install_native_package(&pkg, fmt)?);
+        }
+        None => {
+            log.push(format!(
+                "no native {} build tooling — installing from source (make install)",
+                fmt.as_str()
+            ));
+            log.push("building (cargo build --release)…".to_string());
+            run_streamed(owner, &root, "cargo", &["build", "--release"])?;
+            log.extend(deploy_from(&root, user)?);
+        }
+    }
 
     // Extend login wiring only when the operator had already opted in: re-run
     // enable (idempotent) so services this version newly supports get wired;
@@ -475,6 +498,149 @@ pub fn update(user: &str) -> Result<Vec<String>, String> {
 fn dir_owner(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).ok().map(|m| m.uid()).filter(|&u| u != 0)
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).exists()))
+        .unwrap_or(false)
+}
+
+/// Workspace version from Cargo.toml at `root` (e.g. "0.1.0").
+fn workspace_version(root: &Path) -> String {
+    std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with("version"))
+                .and_then(|l| l.split('"').nth(1).map(str::to_string))
+        })
+        .unwrap_or_else(|| "0.0.0".to_string())
+}
+
+/// Newest file under `dir` (recursively, one level into subdirs) whose name
+/// starts with `prefix` and ends with `suffix`.
+fn newest_built(dir: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+    fn collect(dir: &Path, prefix: &str, suffix: &str, depth: u8, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth > 0 {
+                collect(&p, prefix, suffix, depth - 1, out);
+            } else if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                if n.starts_with(prefix) && n.ends_with(suffix) {
+                    out.push(p.clone());
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    collect(dir, prefix, suffix, 2, &mut hits);
+    hits.sort();
+    hits.pop()
+}
+
+/// Build the native package (rpm/deb/pkg) for `fmt` from the source at `root`,
+/// returning its path. Gated on the build tool being present; the Fedora (rpm)
+/// path is validated, the deb/pkg paths are authored but not yet build-tested.
+pub fn build_native_package(
+    root: &Path,
+    fmt: PackageFormat,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let tool = fmt
+        .build_tool()
+        .ok_or_else(|| "no native package format for this distro".to_string())?;
+    if !on_path(tool) {
+        return Err(format!(
+            "`{tool}` not found — install it to build a {} package",
+            fmt.as_str()
+        ));
+    }
+    // When invoked as root (e.g. from `update`), drop to the repo owner so the
+    // user-owned dev tree stays free of root-owned artifacts and git's
+    // dubious-ownership check doesn't trip. When already running as the user,
+    // build directly.
+    let owner = if unsafe { libc::geteuid() } == 0 {
+        dir_owner(root)
+    } else {
+        None
+    };
+    let ver = workspace_version(root);
+    let mut log = vec![format!("building {} package v{ver}", fmt.as_str())];
+    match fmt {
+        PackageFormat::Rpm => {
+            let top = root.join("target/rpmbuild");
+            for d in ["SOURCES", "SPECS", "BUILD", "RPMS", "SRPMS", "BUILDROOT"] {
+                std::fs::create_dir_all(top.join(d)).map_err(|e| e.to_string())?;
+            }
+            let tar = top.join(format!("SOURCES/linhello-{ver}.tar.gz"));
+            run_streamed(
+                owner,
+                root,
+                "git",
+                &[
+                    "archive",
+                    "--format=tar.gz",
+                    &format!("--prefix=linhello-{ver}/"),
+                    "-o",
+                    &tar.to_string_lossy(),
+                    "HEAD",
+                ],
+            )?;
+            run_streamed(
+                owner,
+                root,
+                "rpmbuild",
+                &[
+                    "-bb",
+                    "--nodeps",
+                    "--define",
+                    &format!("_topdir {}", top.display()),
+                    "packaging/fedora/linhello.spec",
+                ],
+            )?;
+            let rpm = newest_built(&top.join("RPMS"), "linhello-", ".rpm")
+                .ok_or_else(|| "rpmbuild produced no rpm".to_string())?;
+            log.push(format!("built {}", rpm.display()));
+            Ok((rpm, log))
+        }
+        PackageFormat::Pkg => {
+            run_streamed(owner, root, "make", &["dist"])?;
+            let archdir = root.join("packaging/arch");
+            run_streamed(owner, &archdir, "makepkg", &["-f", "--noconfirm"])?;
+            let pkg = newest_built(&archdir, "linhello-", ".pkg.tar.zst")
+                .ok_or_else(|| "makepkg produced no package".to_string())?;
+            log.push(format!("built {}", pkg.display()));
+            Ok((pkg, log))
+        }
+        PackageFormat::Deb => {
+            // dpkg-buildpackage expects ./debian at the source root.
+            let dst = root.join("debian");
+            run_streamed(owner, root, "cp", &["-rT", "packaging/debian", "debian"])?;
+            let r = run_streamed(owner, root, "dpkg-buildpackage", &["-b", "-us", "-uc"]);
+            let _ = std::fs::remove_dir_all(&dst);
+            r?;
+            let parent = root.parent().ok_or("no parent dir for .deb output")?;
+            let deb = newest_built(parent, "linhello_", ".deb")
+                .ok_or_else(|| "dpkg-buildpackage produced no .deb".to_string())?;
+            log.push(format!("built {}", deb.display()));
+            Ok((deb, log))
+        }
+        PackageFormat::Unknown => Err("no native package format for this distro".to_string()),
+    }
+}
+
+/// Install a built native package via the distro's package manager (root).
+pub fn install_native_package(pkg: &Path, fmt: PackageFormat) -> Result<Vec<String>, String> {
+    let p = pkg.to_string_lossy().to_string();
+    let (mgr, args): (&str, Vec<&str>) = match fmt {
+        PackageFormat::Rpm => ("dnf", vec!["install", "-y", &p]),
+        PackageFormat::Deb => ("apt-get", vec!["install", "-y", &p]),
+        PackageFormat::Pkg => ("pacman", vec!["-U", "--noconfirm", &p]),
+        PackageFormat::Unknown => return Err("no native package manager".to_string()),
+    };
+    run_streamed(None, Path::new("/"), mgr, &args)?;
+    Ok(vec![format!("installed {} via {mgr}", pkg.display())])
 }
 
 /// Run `prog args` in `cwd`, output inherited (the user watches git/cargo

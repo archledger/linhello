@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+# Debian packaging for LinuxHello. Authored to mirror the Fedora spec and the
+# Arch PKGBUILD; reuses the project's DESTDIR-safe `make install` with Debian
+# multiarch paths. NOTE: not yet build-tested on a Debian box.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) all PREFIX=/usr
+
+override_dh_auto_test:
+	# Hardware-free unit tests only (camera/TPM tests need devices).
+	cargo test --release -p linhello-common -p linhello-core
+
+override_dh_auto_install:
+	$(MAKE) install \
+	    DESTDIR=$(CURDIR)/debian/linhello \
+	    PREFIX=/usr \
+	    PAMDIR=/usr/lib/$(DEB_HOST_MULTIARCH)/security \
+	    SYSTEMDDIR=/usr/lib/systemd/system \
+	    CONFDIR=/etc/linhello
+	# SELinux policy sources shipped by `make install` are inert on Debian
+	# (which uses AppArmor); drop them to keep the .deb clean.
+	rm -rf $(CURDIR)/debian/linhello/etc/linhello/selinux \
+	       $(CURDIR)/debian/linhello/usr/share/linhello/selinux
+
+# The systemd unit, sysusers file and PAM module are picked up automatically by
+# dh_installsystemd / dh_installsysusers from their installed locations.

@@ -168,8 +168,9 @@ fn platform_check() -> CapabilityCheck {
         ""
     };
     let detail = format!(
-        "{} · PAM modules: {} · initramfs: {} · reseal: {} · LSM: {}{}",
+        "{} · pkg: {} · PAM modules: {} · initramfs: {} · reseal: {} · LSM: {}{}",
         platform::distro_family().as_str(),
+        platform::package_format().as_str(),
         platform::pam_module_dir(),
         platform::initramfs_tool(),
         platform::reseal_trigger().as_str(),

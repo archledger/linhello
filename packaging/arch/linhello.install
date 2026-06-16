@@ -1,5 +1,9 @@
 post_install() {
     systemctl daemon-reload || true
+    # Create the `linhello` group from the shipped sysusers.d file, and install
+    # the per-distro reseal trigger (gated -> pacman hook on Arch).
+    systemd-sysusers /usr/lib/sysusers.d/linhello.conf 2>/dev/null || true
+    linhello reseal-hook install >/dev/null 2>&1 || true
     cat <<'EOF'
 
 LinuxHello installed. Next steps:
@@ -25,5 +29,6 @@ post_upgrade() {
 }
 
 post_remove() {
+    linhello reseal-hook uninstall >/dev/null 2>&1 || true
     systemctl daemon-reload || true
 }
