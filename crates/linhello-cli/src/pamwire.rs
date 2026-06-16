@@ -16,12 +16,15 @@
 //!   symlinks; hand-edits get clobbered. The correct mechanism is an
 //!   `authselect` custom profile/feature.
 //!
-//! This module automates the Arch path (with backups, idempotent) and, for
-//! Debian/Fedora, returns the manual steps rather than performing untested
-//! edits of the login stack — a wrong edit there is a lockout. Two safety
-//! invariants are always preserved: the face line is `sufficient`/`[success=1]`
-//! so a camera/TPM failure falls through to the password, and the TTY stack
-//! (`/etc/pam.d/login`) is never touched, leaving a password escape hatch.
+//! This module automates all three paths idempotently, each through the
+//! distro's *sanctioned* mechanism (never raw edits of the shared stack):
+//! Arch edits the per-service files directly (with backups); Debian/Ubuntu ship
+//! a `pam-auth-update` profile and run `pam-auth-update --package`; Fedora bases
+//! an `authselect` custom profile on the live one and `authselect select`s it.
+//! Two safety invariants are always preserved: the face line is
+//! `sufficient`/`[success=1]`/Primary so a camera/TPM failure falls through to
+//! the password, and revert is one command (`linhello pam disable`). The
+//! Debian/Fedora paths are EXPERIMENTAL pending validation on real hardware.
 
 use anyhow::Result;
 use linhello_common::platform::{self, DistroFamily};
@@ -35,6 +38,9 @@ const BACKUP_SUFFIX: &str = ".pre-linhello";
 const DEBIAN_PROFILE_PATH: &str = "/usr/share/pam-configs/linhello";
 /// Fedora/RHEL: authselect custom profile directory.
 const FEDORA_CUSTOM_DIR: &str = "/etc/authselect/custom/linhello";
+/// Records the authselect profile that was active before we selected
+/// `custom/linhello`, so `disable` can revert to it cleanly.
+const FEDORA_BASE_MARKER: &str = "/etc/linhello/authselect-base";
 
 /// Greeter line: keep `pam_gnome_keyring` reachable so the keyring unlocks.
 const GREETER_STANZA: &str = "auth       [success=1 default=ignore]   pam_linhello.so";
@@ -426,10 +432,12 @@ fn debian_disable(dry_run: bool) -> Result<Vec<Change>> {
 //
 // authselect renders system-auth/password-auth from a profile's templates.
 // We base a `custom/linhello` profile on the active one, inject the face line
-// into its templates (harmless — nothing changes until selected), and hand back
-// the exact `authselect select` command. We deliberately DO NOT run the select
-// ourselves: it is the one lockout-critical, untested-by-us step, so it stays a
-// reviewed manual action. EXPERIMENTAL — validate on a Fedora host.
+// (`auth sufficient pam_linhello.so`, ahead of pam_unix/pam_sss — the
+// pam_fprintd biometric pattern) into its templates, then `authselect select`
+// it with `--force`, recording the prior profile for a clean revert. Activation
+// is safe-by-construction: the face line is `sufficient`, so a missing or failed
+// face module falls through to the password prompt. EXPERIMENTAL — validate the
+// authselect round-trip on real Fedora hardware before relying on it.
 
 fn fedora_enable(dry_run: bool) -> Result<Vec<Change>> {
     let current = run_capture("authselect", &["current"]).unwrap_or_default();
@@ -473,19 +481,42 @@ fn fedora_enable(dry_run: bool) -> Result<Vec<Change>> {
             changes.push(Change::AlreadyWired(p));
         }
     }
-    let mut sel = String::from("authselect select custom/linhello");
-    for f in &features {
-        sel.push(' ');
-        sel.push_str(f);
-    }
-    sel.push_str(" --force");
+    // Remember where we came from, then activate. authselect validates the
+    // templates and regenerates system-auth/password-auth; `--force` is required
+    // because we based the profile on the live one. The face line is
+    // `sufficient`, so a missing/failed face module falls through to the
+    // password prompt — activating cannot lock the user out.
+    store_authselect_base(&base)?;
+    let feat_refs: Vec<&str> = features.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = vec!["select", "custom/linhello"];
+    args.extend(feat_refs.iter().copied());
+    args.push("--force");
+    run("authselect", &args)?;
     changes.push(Change::Manual(format!(
-        "profile staged. ACTIVATE with:  {sel}"
+        "activated custom/linhello (was '{base}') — face login is live; password still works"
     )));
-    changes.push(Change::Manual(format!(
-        "revert with:  authselect select {base}  (your previous profile)"
-    )));
+    changes.push(Change::Manual(
+        "revert any time with:  linhello pam disable".to_string(),
+    ));
     Ok(changes)
+}
+
+/// Persist the pre-linhello authselect profile id for a clean revert.
+fn store_authselect_base(base: &str) -> Result<()> {
+    if let Some(parent) = Path::new(FEDORA_BASE_MARKER).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(FEDORA_BASE_MARKER, format!("{base}\n"))
+        .map_err(|e| anyhow::anyhow!("writing {FEDORA_BASE_MARKER}: {e}"))
+}
+
+/// Read the remembered base profile, defaulting to Fedora's stock `sssd`.
+fn load_authselect_base() -> String {
+    std::fs::read_to_string(FEDORA_BASE_MARKER)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sssd".to_string())
 }
 
 fn fedora_disable(dry_run: bool) -> Result<Vec<Change>> {
@@ -493,9 +524,20 @@ fn fedora_disable(dry_run: bool) -> Result<Vec<Change>> {
     if dry_run {
         return Ok(vec![Change::WouldRemove(dir)]);
     }
-    let mut changes = vec![Change::Manual(
-        "if active, switch back first:  authselect select <your-base-profile>".to_string(),
-    )];
+    let mut changes = Vec::new();
+    // If custom/linhello is the active profile, switch back to the remembered
+    // base FIRST (so we never delete the profile out from under a live stack).
+    let current = run_capture("authselect", &["current"]).unwrap_or_default();
+    let (active, features) = parse_authselect_current(&current);
+    if active.as_deref() == Some("custom/linhello") {
+        let base = load_authselect_base();
+        let feat_refs: Vec<&str> = features.iter().map(String::as_str).collect();
+        let mut args: Vec<&str> = vec!["select", base.as_str()];
+        args.extend(feat_refs.iter().copied());
+        args.push("--force");
+        run("authselect", &args)?;
+        changes.push(Change::Manual(format!("switched back to '{base}'")));
+    }
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| anyhow::anyhow!("removing {}: {e}", dir.display()))?;
@@ -503,6 +545,7 @@ fn fedora_disable(dry_run: bool) -> Result<Vec<Change>> {
     } else {
         changes.push(Change::NotWired(dir));
     }
+    let _ = std::fs::remove_file(FEDORA_BASE_MARKER);
     Ok(changes)
 }
 
