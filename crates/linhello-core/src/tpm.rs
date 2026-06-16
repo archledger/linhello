@@ -248,6 +248,47 @@ fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
     PersistentTpmHandle::new(raw).map_err(tpm_err)
 }
 
+/// True iff `public` is linhello's own SRK — RSA, our [`srk_template`]
+/// attributes, SHA-256 name hash, an empty authPolicy, and a 2048-bit key. The
+/// derived `unique` field is intentionally ignored: our primary is
+/// deterministic, so any key matching the template is bit-identical to ours. A
+/// non-match means another stack's key is squatting our persistent handle —
+/// e.g. a clevis or systemd-cryptenroll key, which carry a non-empty authPolicy
+/// (and may be ECC), so they fail the comparison.
+fn is_linhello_srk(public: &Public) -> Result<bool> {
+    let Public::Rsa {
+        object_attributes,
+        name_hashing_algorithm,
+        auth_policy,
+        parameters,
+        ..
+    } = public
+    else {
+        return Ok(false);
+    };
+    let Public::Rsa {
+        object_attributes: want_attrs,
+        name_hashing_algorithm: want_hash,
+        auth_policy: want_policy,
+        parameters: want_params,
+        ..
+    } = srk_template()?
+    else {
+        return Ok(false);
+    };
+    // NB: compare key size, not the whole `parameters` struct. A TPM normalizes
+    // the template's default RSA exponent (0) to 65537 on read-back (confirmed
+    // via tpm2_readpublic on the real persisted SRK), so a full `parameters`
+    // equality check would reject our OWN key and force the slow transient path
+    // on every call. Attributes + empty authPolicy + RSA-2048 is already an
+    // unambiguous signature: foreign keys (clevis / systemd-cryptenroll) carry
+    // adminWithPolicy or a non-empty authPolicy, or are ECC.
+    Ok(*object_attributes == want_attrs
+        && *name_hashing_algorithm == want_hash
+        && *auth_policy == want_policy
+        && parameters.key_bits() == want_params.key_bits())
+}
+
 /// Get linhello's SRK, persisting it on first use.
 ///
 /// `create_primary` over [`srk_template`] is deterministic (same owner seed +
@@ -264,14 +305,34 @@ fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
 fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
     let persistent = persistent_srk_handle()?;
 
-    // Fast path: already persisted — get an ESYS handle for the persistent key.
+    // Fast path: something is already at the handle. Use it ONLY if it is
+    // actually our SRK. On a machine where this owner persistent handle is
+    // already taken by another stack (e.g. clevis / systemd-cryptenroll persist
+    // a policy-bound key), using or — worse — evicting it would be wrong. If it
+    // is not ours, leave it untouched and fall back to a transient SRK: correct,
+    // just slower (re-derives the primary each call).
     if let Ok(object) = ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)) {
-        // ESYS only tracks an entity's auth for handles IT created; a handle
-        // obtained via tr_from_tpm_public starts with no auth, so loading a
-        // child under it fails with TPM_RC_AUTH_UNAVAILABLE. Our SRK was created
-        // with an empty authValue, so tell ESYS exactly that.
-        ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
-        return Ok((KeyHandle::from(ESYS_TR::from(object)), true));
+        let key_handle = KeyHandle::from(ESYS_TR::from(object));
+        let is_ours = match ctx.read_public(key_handle) {
+            Ok((public, _, _)) => is_linhello_srk(&public)?,
+            Err(_) => false,
+        };
+        if is_ours {
+            // ESYS only tracks an entity's auth for handles IT created; a handle
+            // obtained via tr_from_tpm_public starts with no auth, so loading a
+            // child under it fails with TPM_RC_AUTH_UNAVAILABLE. Our SRK was
+            // created with an empty authValue, so tell ESYS exactly that.
+            ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
+            return Ok((key_handle, true));
+        }
+        tracing::warn!(
+            "TPM persistent SRK handle is occupied by a key that is not linhello's \
+             (or its public area is unreadable); using a transient SRK this run, which \
+             makes seal/unseal slower. Set LINHELLO_SRK_HANDLE to a free owner \
+             persistent handle (hex) to restore fast operations."
+        );
+        let transient = create_srk(ctx)?;
+        return Ok((transient, false));
     }
 
     // First run: derive the primary (the one-time slow step) and persist it so
@@ -723,6 +784,64 @@ mod tests {
             .expect("pem");
         // Building the Public must succeed (modulus size + exponent handling).
         assert!(rsa_pem_to_public(&pem).is_ok());
+    }
+
+    #[test]
+    fn srk_identity_match_accepts_ours_rejects_foreign() {
+        // Our own template is recognized as ours.
+        assert!(is_linhello_srk(&srk_template().unwrap()).unwrap());
+
+        // A different object type (the sealed keyed-hash object) is not our SRK.
+        let sealed = sealed_template(Digest::default()).unwrap();
+        assert!(!is_linhello_srk(&sealed).unwrap());
+
+        // An RSA key with our shape but a non-empty authPolicy — the hallmark of
+        // a clevis / systemd-cryptenroll persistent key — must be rejected.
+        let policy = Digest::try_from(vec![0x11u8; 32]).unwrap();
+        let foreign = match srk_template().unwrap() {
+            Public::Rsa {
+                object_attributes,
+                name_hashing_algorithm,
+                parameters,
+                unique,
+                ..
+            } => Public::Rsa {
+                object_attributes,
+                name_hashing_algorithm,
+                auth_policy: policy,
+                parameters,
+                unique,
+            },
+            _ => unreachable!("srk_template is RSA"),
+        };
+        assert!(!is_linhello_srk(&foreign).unwrap());
+
+        // Our OWN key read back from a TPM reports exponent 65537, not the
+        // template's default 0. The match must still accept it (regression
+        // guard: comparing the full parameters struct would wrongly reject it
+        // and force the slow transient path on every unseal).
+        let read_back = match srk_template().unwrap() {
+            Public::Rsa {
+                object_attributes,
+                name_hashing_algorithm,
+                auth_policy,
+                parameters,
+                unique,
+            } => Public::Rsa {
+                object_attributes,
+                name_hashing_algorithm,
+                auth_policy,
+                parameters: PublicRsaParameters::new(
+                    parameters.symmetric_definition_object(),
+                    parameters.rsa_scheme(),
+                    parameters.key_bits(),
+                    RsaExponent::create(65537).unwrap(),
+                ),
+                unique,
+            },
+            _ => unreachable!("srk_template is RSA"),
+        };
+        assert!(is_linhello_srk(&read_back).unwrap());
     }
 }
 
