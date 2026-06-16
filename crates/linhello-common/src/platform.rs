@@ -282,6 +282,136 @@ pub fn pam_method() -> PamMethod {
     pam_method_for(distro_family())
 }
 
+/// Linux Security Module governing this system, detected at runtime. This is
+/// the axis that decides whether LinuxHello's SELinux policy module
+/// (`etc/selinux/linhello.te`) applies: it MUST be loaded on SELinux systems
+/// (Fedora/RHEL — without it the greeter/lock PAM domain `xdm_t` is denied the
+/// daemon socket and face-auth silently falls back to a password) and must
+/// NEVER be touched on others (Arch ships no such LSM; Debian/Ubuntu use
+/// AppArmor). Detected from the kernel, not the distro family, so it stays
+/// correct on derivatives and custom setups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityModule {
+    /// SELinux is active. `enforcing` distinguishes enforcing from permissive.
+    SeLinux { enforcing: bool },
+    /// AppArmor is the active LSM.
+    AppArmor,
+    /// No major LSM detected (only DAC / capabilities).
+    None,
+}
+
+impl SecurityModule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecurityModule::SeLinux { enforcing: true } => "selinux (enforcing)",
+            SecurityModule::SeLinux { enforcing: false } => "selinux (permissive)",
+            SecurityModule::AppArmor => "apparmor",
+            SecurityModule::None => "none",
+        }
+    }
+
+    /// Whether LinuxHello's SELinux policy module should be installed here. True
+    /// iff SELinux is active — enforcing OR permissive. We install on permissive
+    /// too: a box can be switched to enforcing later, which would silently break
+    /// greeter/lock face-auth if the policy were absent. False on AppArmor / no
+    /// LSM, so the installer skips Arch, Ubuntu, etc. *by construction*.
+    pub fn needs_selinux_policy(self) -> bool {
+        matches!(self, SecurityModule::SeLinux { .. })
+    }
+}
+
+/// Pure classifier (unit-testable, no filesystem). SELinux wins when selinuxfs's
+/// `enforce` node is readable (it exists only when SELinux is enabled); else
+/// AppArmor when its module flag reads `Y`; else none.
+fn classify_security_module(
+    selinux_enforce: Option<&str>,
+    apparmor_enabled: Option<&str>,
+) -> SecurityModule {
+    if let Some(enforce) = selinux_enforce {
+        return SecurityModule::SeLinux {
+            enforcing: enforce.trim() == "1",
+        };
+    }
+    if matches!(apparmor_enabled.map(str::trim), Some("Y") | Some("y")) {
+        return SecurityModule::AppArmor;
+    }
+    SecurityModule::None
+}
+
+/// Detect the active LSM. SELinux via `/sys/fs/selinux/enforce` (present only
+/// when selinuxfs is mounted, i.e. SELinux enabled); AppArmor via
+/// `/sys/module/apparmor/parameters/enabled`.
+pub fn security_module() -> SecurityModule {
+    let selinux = std::fs::read_to_string("/sys/fs/selinux/enforce").ok();
+    let apparmor = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled").ok();
+    classify_security_module(selinux.as_deref(), apparmor.as_deref())
+}
+
+/// Loadable-module name LinuxHello's policy registers as (`semodule -l`).
+pub const SELINUX_MODULE_NAME: &str = "linhello";
+
+/// Candidate install locations of the shipped policy source `linhello.te`, in
+/// resolution order — where `make install` will drop it once the SELinux step
+/// is wired into packaging.
+const SELINUX_TE_CANDIDATES: &[&str] = &[
+    "/usr/share/linhello/selinux/linhello.te",
+    "/etc/linhello/selinux/linhello.te",
+];
+
+/// A gated plan for installing the SELinux policy module. Obtained ONLY via
+/// [`selinux_policy_plan`], which returns `None` on every non-SELinux system —
+/// so an installer that drives it cannot run `semodule` on Arch / AppArmor
+/// boxes even by mistake. The build/load steps are returned as data so a wizard
+/// can print them (dry-run) or an installer can execute them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelinuxPolicyPlan {
+    pub module_name: &'static str,
+    pub source_te: PathBuf,
+    pub enforcing: bool,
+}
+
+impl SelinuxPolicyPlan {
+    /// The ordered shell steps to build and load the module from `source_te`.
+    pub fn commands(&self) -> Vec<String> {
+        let te = self.source_te.display().to_string();
+        let dir = self
+            .source_te
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        vec![
+            format!("checkmodule -M -m -o {dir}/{SELINUX_MODULE_NAME}.mod {te}"),
+            format!(
+                "semodule_package -o {dir}/{SELINUX_MODULE_NAME}.pp -m {dir}/{SELINUX_MODULE_NAME}.mod"
+            ),
+            format!("semodule -i {dir}/{SELINUX_MODULE_NAME}.pp"),
+            // Restart so the socket is recreated and relabeled by the policy's
+            // file-type transition.
+            "systemctl restart linhellod".to_string(),
+        ]
+    }
+}
+
+/// Install plan for LinuxHello's SELinux policy, gated on detection. `None`
+/// (skip entirely) unless SELinux is active; otherwise the resolved source
+/// `.te` (first existing candidate, else the primary default) and whether the
+/// system is currently enforcing.
+pub fn selinux_policy_plan() -> Option<SelinuxPolicyPlan> {
+    let SecurityModule::SeLinux { enforcing } = security_module() else {
+        return None;
+    };
+    let source_te = SELINUX_TE_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(SELINUX_TE_CANDIDATES[0]));
+    Some(SelinuxPolicyPlan {
+        module_name: SELINUX_MODULE_NAME,
+        source_te,
+        enforcing,
+    })
+}
+
 /// The resolved, human-readable setup choices for the running OS — i.e. exactly
 /// what LinuxHello will do on *this* machine. Surfaced in the wizard so a first
 /// run on a new distro (Fedora, Ubuntu, …) shows which mechanisms apply before
@@ -290,6 +420,7 @@ pub fn pam_method() -> PamMethod {
 pub struct SetupProfile {
     pub os_label: String,
     pub family: DistroFamily,
+    pub security_module: SecurityModule,
     pub pam_method: PamMethod,
     pub initramfs_tool: &'static str,
     pub pam_module_dir: String,
@@ -301,6 +432,7 @@ pub fn setup_profile() -> SetupProfile {
     SetupProfile {
         os_label: os.label(),
         family: os.family(),
+        security_module: security_module(),
         pam_method: pam_method(),
         initramfs_tool: initramfs_tool(),
         pam_module_dir: pam_module_dir(),
@@ -398,5 +530,59 @@ mod tests {
     #[test]
     fn empty_os_release_label_is_generic() {
         assert_eq!(parse_os_release("").label(), "Linux (unknown)");
+    }
+
+    #[test]
+    fn selinux_enforce_node_classifies_enforcing_vs_permissive() {
+        assert_eq!(
+            classify_security_module(Some("1\n"), None),
+            SecurityModule::SeLinux { enforcing: true }
+        );
+        assert_eq!(
+            classify_security_module(Some("0"), None),
+            SecurityModule::SeLinux { enforcing: false }
+        );
+    }
+
+    #[test]
+    fn apparmor_flag_classifies_only_when_no_selinux() {
+        assert_eq!(
+            classify_security_module(None, Some("Y\n")),
+            SecurityModule::AppArmor
+        );
+        // SELinux present wins even if AppArmor flag is also set.
+        assert_eq!(
+            classify_security_module(Some("1"), Some("Y")),
+            SecurityModule::SeLinux { enforcing: true }
+        );
+    }
+
+    #[test]
+    fn no_lsm_is_none() {
+        assert_eq!(classify_security_module(None, None), SecurityModule::None);
+        assert_eq!(classify_security_module(None, Some("N")), SecurityModule::None);
+    }
+
+    #[test]
+    fn selinux_policy_gate_is_selinux_only() {
+        // The whole point: install on SELinux (either mode), never elsewhere —
+        // so Fedora/Ubuntu work doesn't reach the Arch / AppArmor path.
+        assert!(SecurityModule::SeLinux { enforcing: true }.needs_selinux_policy());
+        assert!(SecurityModule::SeLinux { enforcing: false }.needs_selinux_policy());
+        assert!(!SecurityModule::AppArmor.needs_selinux_policy());
+        assert!(!SecurityModule::None.needs_selinux_policy());
+    }
+
+    #[test]
+    fn selinux_plan_commands_reference_the_te_and_module() {
+        let plan = SelinuxPolicyPlan {
+            module_name: SELINUX_MODULE_NAME,
+            source_te: PathBuf::from("/usr/share/linhello/selinux/linhello.te"),
+            enforcing: true,
+        };
+        let cmds = plan.commands();
+        assert!(cmds.iter().any(|c| c.contains("linhello.te")));
+        assert!(cmds.iter().any(|c| c.starts_with("semodule -i")));
+        assert!(cmds.last().unwrap().contains("restart linhellod"));
     }
 }

@@ -1488,6 +1488,11 @@ impl App {
         let onnx = p
             .onnxruntime
             .unwrap_or_else(|| "not found — install onnxruntime".to_string());
+        let security = if p.security_module.needs_selinux_policy() {
+            format!("{}  (SELinux policy module will be installed)", p.security_module.as_str())
+        } else {
+            format!("{}  (no SELinux policy needed)", p.security_module.as_str())
+        };
         vec![
             Line::from(vec![
                 Span::styled("Detected OS:   ", Style::default().fg(Color::DarkGray)),
@@ -1505,6 +1510,7 @@ impl App {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!("  PAM wiring     {pam}")),
+            Line::from(format!("  security       {security}")),
             Line::from(format!("  initramfs/UKI  {}", p.initramfs_tool)),
             Line::from(format!("  PAM modules    {}", p.pam_module_dir)),
             Line::from(format!("  onnxruntime    {onnx}")),

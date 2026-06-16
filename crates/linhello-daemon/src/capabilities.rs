@@ -161,11 +161,19 @@ fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
 
 fn platform_check() -> CapabilityCheck {
     use linhello_common::platform;
+    let lsm = platform::security_module();
+    let selinux = if lsm.needs_selinux_policy() {
+        " · SELinux policy module required"
+    } else {
+        ""
+    };
     let detail = format!(
-        "{} · PAM modules: {} · initramfs: {}",
+        "{} · PAM modules: {} · initramfs: {} · LSM: {}{}",
         platform::distro_family().as_str(),
         platform::pam_module_dir(),
         platform::initramfs_tool(),
+        lsm.as_str(),
+        selinux,
     );
     check("Platform", CapabilityStatus::Ok, false, detail)
 }
