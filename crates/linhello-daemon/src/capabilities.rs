@@ -206,10 +206,17 @@ fn model_path(env: &str, default: &str) -> String {
     std::env::var(env).unwrap_or_else(|_| default.to_string())
 }
 
+/// Where to get the buffalo_l detector/recognizer (not redistributed). Shown on
+/// a missing-model FAIL so a fresh install is self-explanatory.
+const BUFFALO_HINT: &str = " — in InsightFace buffalo_l (v0.7); \
+    `linhello setup` installs it automatically if found in $LINHELLO_MODELS_DIR, \
+    <repo>/models, or /usr/share/linhello/models — else fetch buffalo_l.zip from \
+    github.com/deepinsight/insightface/releases/tag/v0.7";
+
 fn model_checks() -> Vec<CapabilityCheck> {
     let models = [
-        ("Face detector model", "LINHELLO_DET_MODEL", "/etc/linhello/det_10g.onnx", true, ""),
-        ("Face embedder model", "LINHELLO_MODEL_PATH", "/etc/linhello/face.onnx", true, ""),
+        ("Face detector model", "LINHELLO_DET_MODEL", "/etc/linhello/det_10g.onnx", true, BUFFALO_HINT),
+        ("Face embedder model", "LINHELLO_MODEL_PATH", "/etc/linhello/face.onnx", true, BUFFALO_HINT),
         (
             "Anti-spoof model",
             "LINHELLO_ANTISPOOF_MODEL",
