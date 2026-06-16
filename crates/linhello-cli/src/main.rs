@@ -125,6 +125,13 @@ enum Cmd {
         #[command(subcommand)]
         action: SelinuxAction,
     },
+    /// Manage the post-update reseal trigger that refreshes TPM envelopes after
+    /// kernel/boot changes. Installs the right mechanism per distro (pacman hook
+    /// on Arch, kernel-install on Fedora, postinst.d on Debian).
+    ResealHook {
+        #[command(subcommand)]
+        action: ResealHookAction,
+    },
     /// Live face-framing guide: shows whether the camera sees your face and
     /// guides you into position (distance, centering, head angle) before you
     /// enroll — so you don't have to open a separate camera app first. Polls
@@ -224,6 +231,23 @@ enum SelinuxAction {
         from: Option<String>,
     },
     /// Unload the linhello SELinux policy module. Requires root unless --dry-run.
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResealHookAction {
+    /// Show the per-distro trigger mechanism and whether it's installed.
+    Status,
+    /// Install the post-update reseal trigger for this distro. No-op on distros
+    /// with no known mechanism. Requires root unless --dry-run.
+    Install {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the reseal trigger. Requires root unless --dry-run.
     Uninstall {
         #[arg(long)]
         dry_run: bool,
@@ -680,10 +704,12 @@ fn run_setup() -> Result<()> {
     }
     println!();
 
-    // Step 2 — SELinux policy (gated; no-op off SELinux). Infrastructure for the
-    // greeter/lock PAM path, so it goes early alongside readiness.
-    println!("Step 2/5 — SELinux policy");
+    // Step 2 — platform integration: the SELinux policy (greeter/lock access)
+    // and the post-update reseal trigger. Both are per-distro gated; each is a
+    // no-op where it doesn't apply.
+    println!("Step 2/5 — platform integration (SELinux, reseal hook)");
     selinux_setup_step()?;
+    reseal_hook_setup_step()?;
     println!();
 
     // Step 3 — camera selection, persisted to cameras.conf.
@@ -1152,6 +1178,11 @@ fn main() -> Result<()> {
             SelinuxAction::Install { dry_run, from } => selinux_install_cmd(dry_run, from)?,
             SelinuxAction::Uninstall { dry_run } => selinux_uninstall_cmd(dry_run)?,
         },
+        Cmd::ResealHook { action } => match action {
+            ResealHookAction::Status => reseal_hook_status_cmd(),
+            ResealHookAction::Install { dry_run } => reseal_hook_install_cmd(dry_run)?,
+            ResealHookAction::Uninstall { dry_run } => reseal_hook_uninstall_cmd(dry_run)?,
+        },
     }
     Ok(())
 }
@@ -1329,6 +1360,143 @@ fn apply_selinux_plan(plan: &linhello_common::platform::SelinuxPolicyPlan) -> Re
     })();
     let _ = std::fs::remove_dir_all(&build);
     result
+}
+
+/// Embedded trigger template for a given reseal mechanism (shipped in the repo
+/// under etc/; baked into the binary so install needs no companion files).
+fn reseal_hook_template(trigger: linhello_common::platform::ResealTrigger) -> &'static str {
+    use linhello_common::platform::ResealTrigger;
+    match trigger {
+        ResealTrigger::PacmanHook => {
+            include_str!("../../../etc/pacman.d/hooks/linhello-reseal.hook")
+        }
+        ResealTrigger::KernelInstall => {
+            include_str!("../../../etc/kernel/install.d/95-linhello.install")
+        }
+        ResealTrigger::KernelPostinst => include_str!("../../../etc/kernel/postinst.d/zz-linhello"),
+        ResealTrigger::Manual => "",
+    }
+}
+
+/// Write the reseal trigger to its active path. The kernel-install / postinst
+/// scripts must be executable; the pacman hook is a plain config file.
+fn write_reseal_hook(plan: &linhello_common::platform::ResealHookPlan) -> Result<()> {
+    use linhello_common::platform::ResealTrigger;
+    use std::os::unix::fs::PermissionsExt;
+
+    let content = reseal_hook_template(plan.trigger)
+        .replace("/usr/local/bin/linhello-reseal-hook", &plan.script_path.display().to_string());
+    if let Some(parent) = plan.hook_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&plan.hook_path, content)
+        .with_context(|| format!("writing {}", plan.hook_path.display()))?;
+    let mode = match plan.trigger {
+        ResealTrigger::KernelInstall | ResealTrigger::KernelPostinst => 0o755,
+        _ => 0o644,
+    };
+    std::fs::set_permissions(&plan.hook_path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {} {}", mode, plan.hook_path.display()))?;
+    Ok(())
+}
+
+fn reseal_hook_status_cmd() {
+    use linhello_common::platform;
+    match platform::reseal_hook_plan() {
+        None => println!(
+            "reseal trigger : none for this distro ({}) — reseal manually after kernel updates",
+            platform::distro_family().as_str()
+        ),
+        Some(plan) => {
+            println!("reseal trigger : {} ({})", plan.trigger.as_str(), plan.hook_path.display());
+            println!("installed      : {}", if plan.hook_path.exists() { "yes" } else { "no" });
+            println!(
+                "reseal script  : {} ({})",
+                plan.script_path.display(),
+                if plan.script_path.exists() { "present" } else { "MISSING" }
+            );
+        }
+    }
+}
+
+fn reseal_hook_install_cmd(dry_run: bool) -> Result<()> {
+    use linhello_common::platform;
+    let Some(plan) = platform::reseal_hook_plan() else {
+        println!(
+            "No known reseal trigger for this distro ({}) — nothing to install. \
+             Reseal manually after kernel updates with `sudo linhello reseal-user-envelopes`.",
+            platform::distro_family().as_str()
+        );
+        return Ok(());
+    };
+    if dry_run {
+        println!(
+            "Would install the {} → {} (invokes {}).",
+            plan.trigger.as_str(),
+            plan.hook_path.display(),
+            plan.script_path.display()
+        );
+        return Ok(());
+    }
+    require_root("reseal-hook install")?;
+    if !plan.script_path.exists() {
+        println!(
+            "note: reseal script not found at {} yet — install it (make install) so the \
+             trigger has something to run.",
+            plan.script_path.display()
+        );
+    }
+    write_reseal_hook(&plan)?;
+    println!("installed {} → {}", plan.trigger.as_str(), plan.hook_path.display());
+    Ok(())
+}
+
+fn reseal_hook_uninstall_cmd(dry_run: bool) -> Result<()> {
+    use linhello_common::platform;
+    let Some(plan) = platform::reseal_hook_plan() else {
+        println!("No known reseal trigger for this distro — nothing to remove.");
+        return Ok(());
+    };
+    if dry_run {
+        println!("Would remove {}", plan.hook_path.display());
+        return Ok(());
+    }
+    require_root("reseal-hook uninstall")?;
+    if plan.hook_path.exists() {
+        std::fs::remove_file(&plan.hook_path)
+            .with_context(|| format!("removing {}", plan.hook_path.display()))?;
+        println!("removed {}", plan.hook_path.display());
+    } else {
+        println!("not installed — nothing to remove ({})", plan.hook_path.display());
+    }
+    Ok(())
+}
+
+/// `setup` step: install the post-update reseal trigger for this distro, gated
+/// via `reseal_hook_plan()`. Silent skip when the distro has no known mechanism;
+/// never fails setup.
+fn reseal_hook_setup_step() -> Result<()> {
+    use linhello_common::platform;
+    let Some(plan) = platform::reseal_hook_plan() else {
+        println!("  no known kernel-update trigger for this distro — reseal manually after updates.");
+        return Ok(());
+    };
+    if plan.hook_path.exists() {
+        println!("  reseal trigger already installed ({}).", plan.trigger.as_str());
+        return Ok(());
+    }
+    println!(
+        "  keeps TPM envelopes valid across kernel/boot updates via the {}.",
+        plan.trigger.as_str()
+    );
+    if prompt_yes("  install it now? [y/N] ") {
+        write_reseal_hook(&plan)?;
+        println!("  installed → {}", plan.hook_path.display());
+    } else {
+        println!("  skipped — run `sudo linhello reseal-hook install` later.");
+    }
+    Ok(())
 }
 
 /// `setup` step: install the SELinux policy if this is a SELinux system and it

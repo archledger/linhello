@@ -1511,6 +1511,7 @@ impl App {
             )),
             Line::from(format!("  PAM wiring     {pam}")),
             Line::from(format!("  security       {security}")),
+            Line::from(format!("  reseal hook    {}", p.reseal_trigger.as_str())),
             Line::from(format!("  initramfs/UKI  {}", p.initramfs_tool)),
             Line::from(format!("  PAM modules    {}", p.pam_module_dir)),
             Line::from(format!("  onnxruntime    {onnx}")),

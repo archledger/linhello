@@ -1,0 +1,17 @@
+#!/bin/bash
+# Debian/Ubuntu kernel postinst.d hook. Run by the kernel package's postinst
+# (and update-initramfs) after a new kernel is installed; refreshes LinuxHello's
+# TPM envelopes for the updated boot components via the distro-agnostic
+# linhello-reseal-hook script. The Fedora equivalent is the kernel-install
+# plugin; the Arch one is the pacman hook.
+#
+# postinst.d hooks are called as: <hook> KERNEL-VERSION KERNEL-IMAGE-PATH
+set -euo pipefail
+
+for c in /usr/local/bin/linhello-reseal-hook /usr/bin/linhello-reseal-hook; do
+    if [ -x "$c" ]; then
+        "$c" < /dev/null || true
+        break
+    fi
+done
+exit 0

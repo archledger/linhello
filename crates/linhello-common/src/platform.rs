@@ -410,6 +410,92 @@ pub fn selinux_policy_plan() -> Option<SelinuxPolicyPlan> {
     })
 }
 
+/// How this distro triggers the post-update reseal of LinuxHello's TPM
+/// envelopes after a kernel / bootloader / Secure-Boot change. The reseal
+/// *script* is distro-agnostic; only the trigger mechanism that runs it varies,
+/// which is why the Arch pacman hook must NOT be dropped on Fedora/Debian (it's
+/// a dead file there) and vice-versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResealTrigger {
+    /// Arch & derivatives: a libalpm hook in `/etc/pacman.d/hooks`.
+    PacmanHook,
+    /// Fedora/RHEL and other `kernel-install`-based distros: a plugin in
+    /// `/etc/kernel/install.d` (dnf runs `kernel-install` on kernel changes).
+    KernelInstall,
+    /// Debian/Ubuntu: a kernel `postinst.d` script.
+    KernelPostinst,
+    /// Unknown distro — the user must wire a trigger manually.
+    Manual,
+}
+
+impl ResealTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResealTrigger::PacmanHook => "pacman hook",
+            ResealTrigger::KernelInstall => "kernel-install plugin",
+            ResealTrigger::KernelPostinst => "kernel postinst.d script",
+            ResealTrigger::Manual => "manual",
+        }
+    }
+
+    /// Active install path of the trigger file for this mechanism, or `None`
+    /// for `Manual`.
+    pub fn hook_path(self) -> Option<&'static str> {
+        match self {
+            ResealTrigger::PacmanHook => Some("/etc/pacman.d/hooks/linhello-reseal.hook"),
+            ResealTrigger::KernelInstall => Some("/etc/kernel/install.d/95-linhello.install"),
+            ResealTrigger::KernelPostinst => Some("/etc/kernel/postinst.d/zz-linhello"),
+            ResealTrigger::Manual => None,
+        }
+    }
+}
+
+fn reseal_trigger_for(family: DistroFamily) -> ResealTrigger {
+    match family {
+        DistroFamily::Arch => ResealTrigger::PacmanHook,
+        DistroFamily::Fedora => ResealTrigger::KernelInstall,
+        DistroFamily::Debian => ResealTrigger::KernelPostinst,
+        DistroFamily::Other => ResealTrigger::Manual,
+    }
+}
+
+/// Reseal trigger mechanism for the running OS.
+pub fn reseal_trigger() -> ResealTrigger {
+    reseal_trigger_for(distro_family())
+}
+
+/// Candidate install locations of the shared, distro-agnostic reseal script
+/// (`make install` puts it in BINDIR), in resolution order.
+const RESEAL_SCRIPT_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/linhello-reseal-hook",
+    "/usr/bin/linhello-reseal-hook",
+];
+
+/// A gated plan for installing the post-update reseal trigger. `None` when the
+/// distro has no known mechanism (so callers skip rather than drop a dead file),
+/// else the trigger's active path and the resolved reseal-script it invokes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResealHookPlan {
+    pub trigger: ResealTrigger,
+    pub hook_path: PathBuf,
+    pub script_path: PathBuf,
+}
+
+pub fn reseal_hook_plan() -> Option<ResealHookPlan> {
+    let trigger = reseal_trigger();
+    let hook_path = PathBuf::from(trigger.hook_path()?);
+    let script_path = RESEAL_SCRIPT_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(RESEAL_SCRIPT_CANDIDATES[0]));
+    Some(ResealHookPlan {
+        trigger,
+        hook_path,
+        script_path,
+    })
+}
+
 /// The resolved, human-readable setup choices for the running OS — i.e. exactly
 /// what LinuxHello will do on *this* machine. Surfaced in the wizard so a first
 /// run on a new distro (Fedora, Ubuntu, …) shows which mechanisms apply before
@@ -420,6 +506,7 @@ pub struct SetupProfile {
     pub family: DistroFamily,
     pub security_module: SecurityModule,
     pub pam_method: PamMethod,
+    pub reseal_trigger: ResealTrigger,
     pub initramfs_tool: &'static str,
     pub pam_module_dir: String,
     pub onnxruntime: Option<String>,
@@ -432,6 +519,7 @@ pub fn setup_profile() -> SetupProfile {
         family: os.family(),
         security_module: security_module(),
         pam_method: pam_method(),
+        reseal_trigger: reseal_trigger(),
         initramfs_tool: initramfs_tool(),
         pam_module_dir: pam_module_dir(),
         onnxruntime: onnxruntime_dylib(),
@@ -569,6 +657,20 @@ mod tests {
         assert!(SecurityModule::SeLinux { enforcing: false }.needs_selinux_policy());
         assert!(!SecurityModule::AppArmor.needs_selinux_policy());
         assert!(!SecurityModule::None.needs_selinux_policy());
+    }
+
+    #[test]
+    fn reseal_trigger_is_per_family() {
+        // The whole point: the Arch pacman hook is never chosen on Fedora/Debian.
+        assert_eq!(reseal_trigger_for(DistroFamily::Arch), ResealTrigger::PacmanHook);
+        assert_eq!(reseal_trigger_for(DistroFamily::Fedora), ResealTrigger::KernelInstall);
+        assert_eq!(reseal_trigger_for(DistroFamily::Debian), ResealTrigger::KernelPostinst);
+        assert_eq!(reseal_trigger_for(DistroFamily::Other), ResealTrigger::Manual);
+        // Each concrete mechanism maps to a distinct active install path.
+        assert!(ResealTrigger::PacmanHook.hook_path().unwrap().contains("pacman.d"));
+        assert!(ResealTrigger::KernelInstall.hook_path().unwrap().contains("kernel/install.d"));
+        assert!(ResealTrigger::KernelPostinst.hook_path().unwrap().contains("postinst.d"));
+        assert_eq!(ResealTrigger::Manual.hook_path(), None);
     }
 
     #[test]

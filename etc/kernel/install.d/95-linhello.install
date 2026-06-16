@@ -1,0 +1,25 @@
+#!/bin/bash
+# kernel-install plugin (Fedora/RHEL and other systemd kernel-install distros).
+# Runs on kernel add/remove — dnf invokes `kernel-install` after a kernel update
+# — and refreshes LinuxHello's TPM envelopes for the new boot components. The
+# real work is in the distro-agnostic linhello-reseal-hook script; this is just
+# the Fedora-side trigger (the Arch equivalent is the pacman hook).
+#
+# kernel-install calls plugins as: <plugin> COMMAND KERNEL-VERSION [...]
+set -euo pipefail
+
+COMMAND="${1:-}"
+case "$COMMAND" in
+    add) ;;                 # new kernel installed → reseal
+    *) exit 0 ;;            # remove/other → nothing to do
+esac
+
+# Resolve the shared reseal script (BINDIR varies by install prefix).
+for c in /usr/local/bin/linhello-reseal-hook /usr/bin/linhello-reseal-hook; do
+    if [ -x "$c" ]; then
+        # The script drains stdin (pacman passes a package list); give it none.
+        "$c" < /dev/null || true
+        break
+    fi
+done
+exit 0

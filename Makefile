@@ -76,8 +76,11 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/linhello/pam.d/examples/system-login
 	install -Dm755 scripts/linhello-reseal-hook \
 	    $(DESTDIR)$(BINDIR)/linhello-reseal-hook
-	sed 's|/usr/local/bin|$(BINDIR)|g' etc/pacman.d/hooks/linhello-reseal.hook \
-	    | install -Dm644 /dev/stdin $(DESTDIR)/etc/pacman.d/hooks/linhello-reseal.hook
+	# The post-update reseal TRIGGER is distro-specific (pacman hook on Arch,
+	# kernel-install on Fedora, postinst.d on Debian). It is no longer dropped
+	# unconditionally here (that left a dead pacman hook on non-Arch). Install
+	# the right one, gated on detection, via `linhello reseal-hook install`
+	# (also offered by `linhello setup`).
 	install -dm755 $(DESTDIR)$(CONFDIR)
 	# Ship the Apache-2.0 anti-spoof models so install needs no PyTorch/convert.
 	install -Dm644 models/antispoof.onnx   $(DESTDIR)$(CONFDIR)/antispoof.onnx
