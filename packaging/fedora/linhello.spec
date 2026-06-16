@@ -59,8 +59,10 @@ enable` (and `linhello setup`) after install.
 
 %build
 # Rust workspace + the C PAM shim (cargo fetches crates; needs network — vendor
-# or use rust2rpm for an offline Koji build).
-%make_build all
+# or use rust2rpm for an offline Koji build). PAMDIR must match %install: it is
+# baked into pam_linhello.so's RUNPATH so it can dlopen liblinhello_pam.so from
+# the 64-bit security dir.
+%make_build all PAMDIR=%{_libdir}/security
 
 # SELinux daemon-confinement policy module (linhellod_t).
 make -C etc/selinux -f %{_datadir}/selinux/devel/Makefile linhello-daemon.pp

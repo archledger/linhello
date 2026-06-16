@@ -11,7 +11,9 @@ export CARGO_TARGET_DIR = $(CURDIR)/target
 	dh $@
 
 override_dh_auto_build:
-	$(MAKE) all PREFIX=/usr
+	# PAMDIR must match dh_auto_install below: it is baked into pam_linhello.so's
+	# RUNPATH so it can dlopen liblinhello_pam.so from the multiarch security dir.
+	$(MAKE) all PREFIX=/usr PAMDIR=/usr/lib/$(DEB_HOST_MULTIARCH)/security
 
 override_dh_auto_test:
 	# Hardware-free unit tests only (camera/TPM tests need devices).
