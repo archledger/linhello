@@ -1,3 +1,10 @@
+linhello (0.2.0-1) unstable; urgency=medium
+
+  * Version bump for the Fedora-port milestone (shared codebase). Debian
+    packaging remains authored-but-not-yet-build-tested.
+
+ -- Ben <archledger236@gmail.com>  Tue, 16 Jun 2026 12:00:00 +0000
+
 linhello (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian packaging: daemon, PAM module, systemd unit, sysusers group.

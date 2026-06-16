@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -59,9 +59,9 @@ enable` (and `linhello setup`) after install.
 
 %build
 # Rust workspace + the C PAM shim (cargo fetches crates; needs network — vendor
-# or use rust2rpm for an offline Koji build). PAMDIR must match %install: it is
-# baked into pam_linhello.so's RUNPATH so it can dlopen liblinhello_pam.so from
-# the 64-bit security dir.
+# or use rust2rpm for an offline Koji build). PAMDIR must match the install
+# step: it is baked into pam_linhello.so's RUNPATH so it can dlopen
+# liblinhello_pam.so from the 64-bit security dir.
 %make_build all PAMDIR=%{_libdir}/security
 
 # SELinux daemon-confinement policy module (linhellod_t).
@@ -141,6 +141,11 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Tue Jun 16 2026 archledger <archledger236@gmail.com> - 0.2.0-1
+- Fedora port milestone: confined daemon SELinux domain (linhellod_t,
+  runtime-validated), per-distro reseal trigger, sysusers group, dependency
+  surfacing, `linhello fetch-models`, PAM rpath fix, TUI wiring-status fix.
+
 * Tue Jun 16 2026 archledger <archledger236@gmail.com> - 0.1.0-1
 - Initial Fedora package: confined daemon (linhellod_t), sysusers group,
   systemd unit, PAM module. Face login wired via `linhello pam enable`.
