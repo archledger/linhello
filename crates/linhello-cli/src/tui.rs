@@ -25,12 +25,31 @@ use zeroize::Zeroize;
 use linhello_common::platform;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, List, ListItem, Padding, Paragraph, Wrap},
     Frame,
 };
+
+/// Shared chrome styling so every screen reads as one cohesive, premium surface.
+/// Soft rounded corners + a muted hairline border + generous interior padding —
+/// the breathing room is what makes the TUI feel composed rather than like a
+/// raw log.
+const HAIRLINE: Color = Color::DarkGray;
+/// Max content width. We deliberately do NOT stretch to fill wide monitors; a
+/// focused, centered column reads far cleaner.
+const MAX_WIDTH: u16 = 90;
+/// Max content height, so the app floats centered with margin on tall screens
+/// instead of pinning to the top-left corner.
+const MAX_HEIGHT: u16 = 40;
+
+/// A rounded, hairline-bordered block — the base for every framed surface.
+fn surface() -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(HAIRLINE))
+}
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -333,8 +352,9 @@ impl App {
     }
 
     fn next(&mut self) {
-        if let Err(reason) = self.gate() {
-            self.status = format!("⛔ {reason}");
+        // The footer shows the lock + reason live, so a blocked step just stays
+        // put — no transient status stamp needed.
+        if self.gate().is_err() {
             return;
         }
         let i = self.step_index();
@@ -356,6 +376,10 @@ impl App {
     /// state every time so the wizard reflects reality live (e.g. right after an
     /// uninstall or install), rather than a stale snapshot from startup.
     fn on_enter(&mut self) {
+        // Start each step on a clean slate: drop any stale status from the
+        // previous screen and close any half-open inline edit.
+        self.status.clear();
+        self.name_input = None;
         self.install = crate::install::InstallState::detect();
         match self.screen {
             Screen::Doctor if self.report.is_none() => self.refresh_probe(),
@@ -441,8 +465,30 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
-        // Text-entry modes swallow keys first, so 'q'/Tab become input or
-        // local actions rather than quitting/navigating.
+        // Uninstall is a modal side-screen with its own keys (Esc leaves it);
+        // wizard navigation does not apply there.
+        if self.screen == Screen::Uninstall {
+            self.uninstall_key(code);
+            return;
+        }
+
+        // Universal step navigation — arrows OR Tab, on EVERY step (including
+        // text-entry ones; arrows/Tab are never valid text input). This is the
+        // single consistent way to move, and it's what the footer advertises.
+        match code {
+            KeyCode::Tab | KeyCode::Right => {
+                self.next();
+                return;
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.prev();
+                return;
+            }
+            _ => {}
+        }
+
+        // Focused text-entry sub-states consume the remaining keys (Char /
+        // Backspace / Enter / Esc); navigation above already had first refusal.
         if self.screen == Screen::Profiles && self.name_input.is_some() {
             self.name_edit_key(code);
             return;
@@ -452,15 +498,8 @@ impl App {
             self.install_key(code);
             return;
         }
-        if self.screen == Screen::Password
-            && matches!(self.password, PasswordStep::Entry { .. })
-            && !matches!(code, KeyCode::Tab | KeyCode::BackTab)
-        {
+        if self.screen == Screen::Password && matches!(self.password, PasswordStep::Entry { .. }) {
             self.password_key(code);
-            return;
-        }
-        if self.screen == Screen::Uninstall {
-            self.uninstall_key(code);
             return;
         }
 
@@ -468,14 +507,6 @@ impl App {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
-                return;
-            }
-            KeyCode::Tab => {
-                self.next();
-                return;
-            }
-            KeyCode::BackTab => {
-                self.prev();
                 return;
             }
             _ => {}
@@ -1183,13 +1214,23 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
+        // Constrain to a focused, centered column instead of stretching edge to
+        // edge — the single biggest lever for a calm, premium feel on wide and
+        // tall monitors alike.
+        let [area] = Layout::horizontal([Constraint::Max(MAX_WIDTH)])
+            .flex(Flex::Center)
+            .areas(frame.area());
+        let [area] = Layout::vertical([Constraint::Max(MAX_HEIGHT)])
+            .flex(Flex::Center)
+            .areas(area);
+
         let chunks = Layout::vertical([
             Constraint::Length(3), // header
             Constraint::Min(0),    // body
             Constraint::Length(6), // activity bar
-            Constraint::Length(3), // footer
+            Constraint::Length(5), // footer (nav + actions + status legend)
         ])
-        .split(frame.area());
+        .split(area);
 
         let header_line = if self.screen == Screen::Uninstall {
             Line::from(vec![Span::styled(
@@ -1198,37 +1239,155 @@ impl App {
             )])
         } else {
             Line::from(vec![
-                Span::raw(format!(" step {}/{}: ", self.step_index() + 1, ORDER.len())),
+                Span::styled(
+                    format!(" step {}/{} ", self.step_index() + 1, ORDER.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("  "),
                 Span::styled(
                     self.screen.name(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
         };
-        let header =
-            Paragraph::new(header_line).block(Block::bordered().title(" LinuxHello setup "));
+        let header = Paragraph::new(header_line).block(
+            surface()
+                .title(" LinuxHello setup ")
+                .padding(Padding::horizontal(2)),
+        );
         frame.render_widget(header, chunks[0]);
 
         self.render_body(frame, chunks[1]);
         self.render_activity(frame, chunks[2]);
 
-        let key = |k: &'static str| {
+        self.render_footer(frame, chunks[3]);
+    }
+
+    /// The always-visible key legend — the single source of truth for how to
+    /// move and what each step lets you do, plus a live "can I continue?" line.
+    /// Three rows so a first-time user is never left guessing.
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let key = |s: &'static str| {
             Span::styled(
-                format!(" {k} "),
-                Style::default().fg(Color::Black).bg(Color::Gray),
+                s,
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
             )
         };
-        let footer = Paragraph::new(Line::from(vec![
+        let dim = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
+        let lab = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
+
+        // Uninstall is a modal with different rules — show its own legend.
+        if self.screen == Screen::Uninstall {
+            let lines = vec![
+                Line::from(vec![key("Esc"), dim("   cancel and return to Welcome")]),
+                Line::from(vec![
+                    key("x"),
+                    dim("  arm, then type "),
+                    key("REMOVE"),
+                    dim("  to confirm"),
+                ]),
+                Line::from(Span::styled(
+                    "⚠ permanently deletes enrolled faces + config",
+                    Style::default().fg(Color::Red),
+                )),
+            ];
+            let p = Paragraph::new(lines).block(surface().padding(Padding::horizontal(2)));
+            frame.render_widget(p, area);
+            return;
+        }
+
+        // Row 1 — universal navigation, identical on every step.
+        let nav = Line::from(vec![
+            key("←"),
+            dim(" back    "),
+            key("→"),
+            dim(" next    "),
             key("Tab"),
-            Span::raw(" next  "),
+            dim("/"),
             key("⇧Tab"),
-            Span::raw(" back  "),
+            dim(" move    "),
+            key("Enter"),
+            dim(" confirm    "),
             key("q"),
-            Span::raw(" quit    "),
-            Span::styled(self.status.clone(), Style::default().fg(Color::DarkGray)),
-        ]))
-        .block(Block::bordered());
-        frame.render_widget(footer, chunks[3]);
+            dim(" quit"),
+        ]);
+
+        // Row 2 — what THIS step lets you do.
+        let hints = self.key_hints();
+        let actions = if hints.is_empty() {
+            Line::from(dim("on this step:   nothing to set — just continue"))
+        } else {
+            let mut spans = vec![dim("on this step:   ")];
+            for (i, (k, label)) in hints.iter().enumerate() {
+                if i > 0 {
+                    spans.push(dim("    "));
+                }
+                spans.push(key(k));
+                spans.push(Span::raw(" "));
+                spans.push(lab(label));
+            }
+            Line::from(spans)
+        };
+
+        // Row 3 — live "can I move on?" feedback. The gate reason names the exact
+        // key to press, so a blocked user is never stuck.
+        let status = match self.gate() {
+            Err(reason) => Line::from(vec![
+                Span::styled("🔒 ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    reason,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Ok(()) if !self.status.is_empty() => Line::from(vec![
+                dim("• "),
+                Span::styled(self.status.clone(), Style::default().fg(Color::Gray)),
+            ]),
+            Ok(()) => Line::from(vec![
+                Span::styled("✓ ", Style::default().fg(Color::Green)),
+                dim("ready — press "),
+                key("→"),
+                dim(" or "),
+                key("Tab"),
+                dim(" to continue"),
+            ]),
+        };
+
+        let p =
+            Paragraph::new(vec![nav, actions, status]).block(surface().padding(Padding::horizontal(2)));
+        frame.render_widget(p, area);
+    }
+
+    /// Per-step action keys (excluding the universal nav keys), surfaced in the
+    /// footer so every actionable key is discoverable.
+    fn key_hints(&self) -> Vec<(&'static str, &'static str)> {
+        match self.screen {
+            Screen::Welcome => vec![("u", "uninstall")],
+            Screen::Install => vec![("i", "deploy / start"), ("m", "copy models")],
+            Screen::Doctor => vec![("r", "re-probe"), ("s", "start daemon")],
+            Screen::Cameras => vec![
+                ("↑↓", "highlight"),
+                ("r", "set RGB"),
+                ("i", "set IR"),
+                ("n", "clear IR"),
+                ("s", "save"),
+            ],
+            Screen::Profiles => vec![
+                ("↑↓", "highlight"),
+                ("s", "set enroll target"),
+                ("n", "rename"),
+                ("r", "refresh"),
+            ],
+            Screen::Enroll => vec![("Enter", "start enrolling")],
+            Screen::Calibrate => vec![("c", "calibrate")],
+            Screen::Identify => vec![("Enter", "identify me")],
+            Screen::Password => vec![("type", "password"), ("Enter", "seal"), ("Esc", "clear")],
+            Screen::Pam => vec![("e", "enable greeter"), ("a", "enable + sudo"), ("d", "disable")],
+            Screen::Done => vec![],
+            Screen::Uninstall => vec![],
+        }
     }
 
     /// The activity bar: a live, plain-language feed of every change the
@@ -1237,9 +1396,10 @@ impl App {
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
         let title =
             " ● Activity — what LinuxHello is doing to your system (newest last) ".to_string();
-        let block = Block::bordered()
+        let block = surface()
             .title(title)
-            .border_style(Style::default().fg(Color::Blue));
+            .border_style(Style::default().fg(Color::Blue))
+            .padding(Padding::horizontal(2));
         let inner_rows = area.height.saturating_sub(2) as usize;
         let lines: Vec<Line> = if self.activity.is_empty() {
             vec![Line::from(
@@ -1301,6 +1461,56 @@ impl App {
         }
     }
 
+    /// One-line "Detected OS → setup path" summary for the Welcome screen.
+    fn os_summary_line(&self) -> Line<'static> {
+        let p = platform::setup_profile();
+        Line::from(vec![
+            Span::styled("Detected OS: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                p.os_label,
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   ·   setup: {} · PAM via {}", p.family.as_str(), p.pam_method.label()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    }
+
+    /// Full "what LinuxHello will do on this OS" panel for the Host-check screen.
+    fn os_setup_panel(&self) -> Vec<Line<'static>> {
+        let p = platform::setup_profile();
+        let pam = if p.pam_method.automated() {
+            format!("{}  (applied automatically)", p.pam_method.label())
+        } else {
+            format!("{}  (guided steps — not auto-applied yet)", p.pam_method.label())
+        };
+        let onnx = p
+            .onnxruntime
+            .unwrap_or_else(|| "not found — install onnxruntime".to_string());
+        vec![
+            Line::from(vec![
+                Span::styled("Detected OS:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    p.os_label,
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("   (family: {})", p.family.as_str()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Setup path for this OS:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  PAM wiring     {pam}")),
+            Line::from(format!("  initramfs/UKI  {}", p.initramfs_tool)),
+            Line::from(format!("  PAM modules    {}", p.pam_module_dir)),
+            Line::from(format!("  onnxruntime    {onnx}")),
+        ]
+    }
+
     fn body_welcome(&self, frame: &mut Frame, area: Rect) {
         let st = &self.install;
         let headline = st.headline();
@@ -1313,6 +1523,8 @@ impl App {
         };
         let mut lines = vec![
             Line::from("Welcome to LinuxHello — TPM-backed face login.".bold()),
+            Line::from(""),
+            self.os_summary_line(),
             Line::from(""),
             Line::from(Span::styled(
                 headline,
@@ -1675,10 +1887,26 @@ impl App {
     }
 
     fn body_paragraph(&self, frame: &mut Frame, area: Rect, lines: Vec<Line>) {
-        let p = Paragraph::new(lines)
-            .block(Block::bordered())
-            .wrap(Wrap { trim: false });
-        frame.render_widget(p, area);
+        // Generous interior whitespace (4 cols / 1 row) is what gives every text
+        // screen its clean, Apple-like margin — text never touches the frame.
+        let block = surface().padding(Padding::symmetric(4, 1));
+
+        // Size the card to its content and float it centered, so the frame hugs
+        // the text instead of trapping a tall void beneath it. Width budget =
+        // borders (2) + horizontal padding (4+4); height = wrap-aware row count
+        // + vertical padding (1+1) + borders (2).
+        let inner_w = area.width.saturating_sub(2 + 8).max(1);
+        let rows: u16 = lines
+            .iter()
+            .map(|l| (l.width() as u16).max(1).div_ceil(inner_w))
+            .sum();
+        let card_h = rows.saturating_add(4).min(area.height);
+        let [card] = Layout::vertical([Constraint::Length(card_h)])
+            .flex(Flex::Center)
+            .areas(area);
+
+        let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(p, card);
     }
 
     fn body_doctor(&self, frame: &mut Frame, area: Rect) {
@@ -1705,24 +1933,21 @@ impl App {
                 ],
             ),
             Some(Ok(report)) => {
-                let mut items: Vec<ListItem> = report
-                    .checks
-                    .iter()
-                    .map(|c| {
-                        let (sym, color) = match c.status {
-                            CapabilityStatus::Ok => ("[ OK ]", Color::Green),
-                            CapabilityStatus::Warn => ("[WARN]", Color::Yellow),
-                            CapabilityStatus::Missing => ("[FAIL]", Color::Red),
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                sym,
-                                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(format!("  {:<20} {}", c.name, c.detail)),
-                        ]))
-                    })
-                    .collect();
+                // Lead with the detected-OS / setup-path panel, then the probe.
+                let mut items: Vec<ListItem> =
+                    self.os_setup_panel().into_iter().map(ListItem::new).collect();
+                items.push(ListItem::new(Line::from("")));
+                items.extend(report.checks.iter().map(|c| {
+                    let (sym, color) = match c.status {
+                        CapabilityStatus::Ok => ("[ OK ]", Color::Green),
+                        CapabilityStatus::Warn => ("[WARN]", Color::Yellow),
+                        CapabilityStatus::Missing => ("[FAIL]", Color::Red),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(sym, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("  {:<20} {}", c.name, c.detail)),
+                    ]))
+                }));
                 let verdict = if !report.can_run() {
                     Line::from("verdict: CANNOT RUN — a required capability is missing.".red().bold())
                 } else if report.degraded() {
@@ -1732,7 +1957,11 @@ impl App {
                 };
                 items.push(ListItem::new(Line::from("")));
                 items.push(ListItem::new(verdict));
-                let list = List::new(items).block(Block::bordered().title(" host capabilities (r: re-probe) "));
+                let list = List::new(items).block(
+                    surface()
+                        .title(" host capabilities (r: re-probe) ")
+                        .padding(Padding::symmetric(4, 1)),
+                );
                 frame.render_widget(list, area);
             }
         }
@@ -1783,7 +2012,9 @@ impl App {
             self.sel_rgb.as_deref().unwrap_or("none"),
             self.sel_ir.as_deref().unwrap_or("none"),
         );
-        let list = List::new(items).block(Block::bordered().title(title));
+        let list = List::new(items).block(
+            surface().title(title).padding(Padding::symmetric(4, 1)),
+        );
         frame.render_widget(list, area);
     }
 

@@ -42,17 +42,66 @@ pub fn distro_family() -> DistroFamily {
 }
 
 fn classify_os_release(text: &str) -> DistroFamily {
-    let mut id = String::new();
-    let mut id_like = String::new();
+    let o = parse_os_release(text);
+    classify(&o.id, &o.id_like)
+}
+
+/// The identifying subset of `/etc/os-release`. `family()` derives the coarse
+/// family; `label()` gives the best human name+version for display.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OsRelease {
+    pub id: String,
+    pub id_like: String,
+    pub name: String,
+    pub pretty_name: String,
+    pub version_id: String,
+}
+
+impl OsRelease {
+    pub fn family(&self) -> DistroFamily {
+        classify(&self.id, &self.id_like)
+    }
+
+    /// Best human label: `PRETTY_NAME`, else `NAME VERSION_ID`, else `ID`,
+    /// else a generic fallback. E.g. "Fedora Linux 41 (Workstation Edition)".
+    pub fn label(&self) -> String {
+        if !self.pretty_name.is_empty() {
+            return self.pretty_name.clone();
+        }
+        let nv = format!("{} {}", self.name, self.version_id);
+        let nv = nv.trim();
+        if !nv.is_empty() {
+            return nv.to_string();
+        }
+        if !self.id.is_empty() {
+            return self.id.clone();
+        }
+        "Linux (unknown)".to_string()
+    }
+}
+
+/// Read and parse `/etc/os-release` for full OS identity.
+pub fn os_release() -> OsRelease {
+    parse_os_release(&std::fs::read_to_string("/etc/os-release").unwrap_or_default())
+}
+
+fn parse_os_release(text: &str) -> OsRelease {
+    let mut o = OsRelease::default();
     for line in text.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("ID=") {
-            id = unquote(v);
-        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
-            id_like = unquote(v);
+        let Some((k, v)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let v = unquote(v);
+        match k {
+            "ID" => o.id = v,
+            "ID_LIKE" => o.id_like = v,
+            "NAME" => o.name = v,
+            "PRETTY_NAME" => o.pretty_name = v,
+            "VERSION_ID" => o.version_id = v,
+            _ => {}
         }
     }
-    classify(&id, &id_like)
+    o
 }
 
 fn classify(id: &str, id_like: &str) -> DistroFamily {
@@ -188,6 +237,77 @@ fn on_path(bin: &str) -> bool {
     std::env::split_paths(&paths).any(|dir| dir.join(bin).exists())
 }
 
+/// How face login is wired into PAM, which is the most distro-specific setup
+/// step. See `linhello-cli`'s `pamwire` for the implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PamMethod {
+    /// Edit per-service `/etc/pam.d` files directly — automated. Arch & kin.
+    EditPamD,
+    /// A `pam-auth-update` profile woven into `common-auth`. Debian/Ubuntu.
+    PamAuthUpdate,
+    /// An `authselect` custom profile/feature. Fedora/RHEL.
+    Authselect,
+    /// No known mechanism — guided manual edit. Other.
+    Manual,
+}
+
+impl PamMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            PamMethod::EditPamD => "direct /etc/pam.d edits",
+            PamMethod::PamAuthUpdate => "pam-auth-update profile",
+            PamMethod::Authselect => "authselect custom profile",
+            PamMethod::Manual => "manual PAM edit",
+        }
+    }
+
+    /// True when LinuxHello applies the wiring itself; false when it prints
+    /// guided steps for the user to run (the untested distro paths).
+    pub fn automated(self) -> bool {
+        matches!(self, PamMethod::EditPamD)
+    }
+}
+
+fn pam_method_for(family: DistroFamily) -> PamMethod {
+    match family {
+        DistroFamily::Arch => PamMethod::EditPamD,
+        DistroFamily::Debian => PamMethod::PamAuthUpdate,
+        DistroFamily::Fedora => PamMethod::Authselect,
+        DistroFamily::Other => PamMethod::Manual,
+    }
+}
+
+/// PAM wiring method for the running OS.
+pub fn pam_method() -> PamMethod {
+    pam_method_for(distro_family())
+}
+
+/// The resolved, human-readable setup choices for the running OS — i.e. exactly
+/// what LinuxHello will do on *this* machine. Surfaced in the wizard so a first
+/// run on a new distro (Fedora, Ubuntu, …) shows which mechanisms apply before
+/// anything is changed.
+#[derive(Debug, Clone)]
+pub struct SetupProfile {
+    pub os_label: String,
+    pub family: DistroFamily,
+    pub pam_method: PamMethod,
+    pub initramfs_tool: &'static str,
+    pub pam_module_dir: String,
+    pub onnxruntime: Option<String>,
+}
+
+pub fn setup_profile() -> SetupProfile {
+    let os = os_release();
+    SetupProfile {
+        os_label: os.label(),
+        family: os.family(),
+        pam_method: pam_method(),
+        initramfs_tool: initramfs_tool(),
+        pam_module_dir: pam_module_dir(),
+        onnxruntime: onnxruntime_dylib(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +363,40 @@ mod tests {
     fn quotes_are_stripped() {
         let os = "ID=\"fedora\"\n";
         assert_eq!(classify_os_release(os), DistroFamily::Fedora);
+    }
+
+    #[test]
+    fn parses_fedora_label_and_version() {
+        let os = "NAME=\"Fedora Linux\"\nVERSION_ID=41\n\
+                  PRETTY_NAME=\"Fedora Linux 41 (Workstation Edition)\"\nID=fedora\n";
+        let o = parse_os_release(os);
+        assert_eq!(o.label(), "Fedora Linux 41 (Workstation Edition)");
+        assert_eq!(o.version_id, "41");
+        assert_eq!(o.family(), DistroFamily::Fedora);
+        assert_eq!(pam_method_for(o.family()), PamMethod::Authselect);
+    }
+
+    #[test]
+    fn ubuntu_label_falls_back_to_name_version_without_pretty_name() {
+        let os = "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\nID_LIKE=debian\n";
+        let o = parse_os_release(os);
+        assert_eq!(o.label(), "Ubuntu 24.04");
+        assert_eq!(o.family(), DistroFamily::Debian);
+        assert_eq!(pam_method_for(o.family()), PamMethod::PamAuthUpdate);
+        assert!(!pam_method_for(o.family()).automated());
+    }
+
+    #[test]
+    fn arch_pam_is_automated() {
+        let os = "PRETTY_NAME=\"Arch Linux\"\nID=arch\n";
+        let o = parse_os_release(os);
+        assert_eq!(o.label(), "Arch Linux");
+        assert_eq!(pam_method_for(o.family()), PamMethod::EditPamD);
+        assert!(pam_method_for(o.family()).automated());
+    }
+
+    #[test]
+    fn empty_os_release_label_is_generic() {
+        assert_eq!(parse_os_release("").label(), "Linux (unknown)");
     }
 }
