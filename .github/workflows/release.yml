@@ -29,10 +29,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          dnf install -y \
-            cargo rust clang clang-devel gcc make pkgconf-pkg-config gnupg2 \
-            tpm2-tss-devel openssl-devel pam-devel systemd-devel \
-            selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy
+          # Resolve the spec's BuildRequires through the package manager (incl.
+          # macro-expanded ones like pkgconfig(systemd)) instead of hand-listing.
+          dnf install -y 'dnf-command(builddep)' rpm-build gnupg2 checkpolicy
+          dnf builddep -y packaging/fedora/linhello.spec
 
       - name: Verify the tag signature against the pinned key
         run: |
