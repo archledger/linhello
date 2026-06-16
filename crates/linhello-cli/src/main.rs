@@ -1267,11 +1267,13 @@ fn run_shell(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether the linhello SELinux module is currently loaded (`semodule -l`).
-/// `None` when it can't be determined — semodule missing, or the policy store
-/// isn't readable (it's root-only, so an unprivileged query returns `None`,
-/// not a false `false`).
+/// Whether a linhello SELinux policy is loaded — the minimal greeter-access
+/// module OR the packaged confined-daemon module (`linhello-daemon`), since
+/// either satisfies greeter access. `None` when it can't be determined —
+/// semodule missing, or the policy store isn't readable (it's root-only, so an
+/// unprivileged query returns `None`, not a false `false`).
 fn selinux_module_loaded() -> Option<bool> {
+    use linhello_common::platform::{SELINUX_DAEMON_MODULE_NAME, SELINUX_MODULE_NAME};
     if !on_path("semodule") {
         return None;
     }
@@ -1279,11 +1281,10 @@ fn selinux_module_loaded() -> Option<bool> {
     if !out.status.success() {
         return None;
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|l| l.trim() == linhello_common::platform::SELINUX_MODULE_NAME),
-    )
+    Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| {
+        let m = l.trim();
+        m == SELINUX_MODULE_NAME || m == SELINUX_DAEMON_MODULE_NAME
+    }))
 }
 
 fn selinux_status_cmd() {

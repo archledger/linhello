@@ -91,6 +91,10 @@ kernel_read_system_state(linhellod_t)
 auth_use_nsswitch(linhellod_t)
 logging_send_syslog_msg(linhellod_t)
 miscfiles_read_localization(linhellod_t)
+# Read the SELinux enforce mode so `doctor`'s platform check reports the active
+# LSM correctly (otherwise the confined daemon is dontaudit-denied and reports
+# "none").
+selinux_get_enforce_mode(linhellod_t)
 
 ########################################
 #

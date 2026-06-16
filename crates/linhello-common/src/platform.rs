@@ -347,8 +347,13 @@ pub fn security_module() -> SecurityModule {
     classify_security_module(selinux.as_deref(), apparmor.as_deref())
 }
 
-/// Loadable-module name LinuxHello's policy registers as (`semodule -l`).
+/// Loadable-module name of the minimal greeter-access policy (`linhello selinux
+/// install` / from-source installs where the daemon runs unconfined).
 pub const SELINUX_MODULE_NAME: &str = "linhello";
+
+/// Loadable-module name of the confined-daemon policy shipped by packages. It
+/// supersedes [`SELINUX_MODULE_NAME`]; either one satisfies greeter access.
+pub const SELINUX_DAEMON_MODULE_NAME: &str = "linhello-daemon";
 
 /// Candidate install locations of the shipped policy source `linhello.te`, in
 /// resolution order — where `make install` will drop it once the SELinux step
