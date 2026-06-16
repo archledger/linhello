@@ -28,6 +28,15 @@ Anti-spoof is a separate model from `minivision-ai/Silent-Face-Anti-Spoofing`.
 
 ## Installing buffalo_l
 
+Easiest — let LinuxHello fetch, verify (SHA-256) and install them from the
+official InsightFace release:
+
+```sh
+sudo linhello fetch-models
+```
+
+Or by hand:
+
 ```sh
 # ~250 MB download
 curl -L -o /tmp/buffalo_l.zip \

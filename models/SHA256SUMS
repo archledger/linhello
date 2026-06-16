@@ -1,2 +1,5 @@
 ff77b9e4b73325ace4fdc4dd0930459ae6059589d72832c19194d53146c44141  antispoof.onnx
 3bcd5c6d1da2252cd58959c112c41e94d0e58402f7e4dd1c90c9232acf3f07b2  antispoof_4.onnx
+# buffalo_l (InsightFace v0.7) — user-fetched via `linhello fetch-models`, not shipped.
+5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91  det_10g.onnx
+4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43  w600k_r50.onnx

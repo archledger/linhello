@@ -630,6 +630,114 @@ pub fn build_native_package(
     }
 }
 
+/// Official InsightFace buffalo_l pack (detector + recognizer). HTTPS from the
+/// upstream release is the trust anchor; the SHA-256s below pin the exact files.
+const BUFFALO_URL: &str =
+    "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip";
+/// Pinned SHA-256 of the two models we install (InsightFace buffalo_l v0.7).
+/// Empty/PLACEHOLDER => verification skipped and the computed hash is printed.
+const DET_SHA256: &str = "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91";
+const REC_SHA256: &str = "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43";
+
+fn sha256_of(path: &Path) -> Result<String, String> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("sha256sum: {e}"))?;
+    if !out.status.success() {
+        return Err("sha256sum failed".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string())
+}
+
+fn find_under(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, name: &str, depth: u8, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && depth > 0 {
+                walk(&p, name, depth - 1, out);
+            } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                out.push(p);
+            }
+        }
+    }
+    walk(dir, name, 4, &mut out);
+    out.pop()
+}
+
+fn verify_model(path: &Path, label: &str, pinned: &str, log: &mut Vec<String>) -> Result<(), String> {
+    let got = sha256_of(path)?;
+    if pinned.is_empty() || pinned.ends_with("PLACEHOLDER") {
+        log.push(format!("{label} sha256 {got} (not pinned — verification skipped)"));
+        return Ok(());
+    }
+    if got != pinned {
+        return Err(format!(
+            "{label} sha256 mismatch: got {got}, expected {pinned} — refusing to install"
+        ));
+    }
+    log.push(format!("{label} sha256 verified"));
+    Ok(())
+}
+
+/// `linhello fetch-models` — download the buffalo_l detector + recognizer from
+/// the official InsightFace release, verify, and install them to /etc/linhello
+/// (det_10g.onnx + face.onnx). The anti-spoof model already ships with the
+/// package. Requires root.
+pub fn fetch_models(force: bool) -> Result<Vec<String>, String> {
+    let conf = Path::new(CONFIG_ROOT);
+    let det = conf.join("det_10g.onnx");
+    let face = conf.join("face.onnx");
+    if !force && det.exists() && face.exists() {
+        return Ok(vec![
+            "buffalo_l models already present in /etc/linhello (use --force to re-fetch)".to_string(),
+        ]);
+    }
+    for t in ["curl", "unzip", "sha256sum"] {
+        if !on_path(t) {
+            return Err(format!("`{t}` not found — install it and retry"));
+        }
+    }
+    let mut log = Vec::new();
+    let tmp = std::env::temp_dir().join(format!("linhello-models-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {e}"))?;
+    let result = (|| -> Result<Vec<String>, String> {
+        let zip = tmp.join("buffalo_l.zip");
+        log.push("downloading buffalo_l (~250 MB) from InsightFace v0.7…".to_string());
+        run_streamed(
+            None,
+            &tmp,
+            "curl",
+            &["-fL", "--proto", "=https", "--tlsv1.2", "-o", &zip.to_string_lossy(), BUFFALO_URL],
+        )?;
+        let ex = tmp.join("x");
+        run_streamed(None, &tmp, "unzip", &["-oq", &zip.to_string_lossy(), "-d", &ex.to_string_lossy()])?;
+        let det_src = find_under(&ex, "det_10g.onnx").ok_or("det_10g.onnx not found in archive")?;
+        let rec_src = find_under(&ex, "w600k_r50.onnx").ok_or("w600k_r50.onnx not found in archive")?;
+        verify_model(&det_src, "detector (det_10g.onnx)", DET_SHA256, &mut log)?;
+        verify_model(&rec_src, "recognizer (w600k_r50.onnx)", REC_SHA256, &mut log)?;
+        std::fs::create_dir_all(conf).map_err(|e| format!("mkdir {}: {e}", conf.display()))?;
+        for (src, dst) in [(&det_src, &det), (&rec_src, &face)] {
+            std::fs::copy(src, dst).map_err(|e| format!("install {}: {e}", dst.display()))?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
+        }
+        log.push(format!("installed {} + {}", det.display(), face.display()));
+        // Pick up the new models without a manual restart.
+        let _ = run_streamed(None, Path::new("/"), "systemctl", &["try-restart", "linhellod"]);
+        log.push("restarted linhellod".to_string());
+        Ok(log.clone())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
 /// Install a built native package via the distro's package manager (root).
 pub fn install_native_package(pkg: &Path, fmt: PackageFormat) -> Result<Vec<String>, String> {
     let p = pkg.to_string_lossy().to_string();

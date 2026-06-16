@@ -140,6 +140,14 @@ enum Cmd {
         #[arg(long, value_parser = ["build", "runtime"])]
         only: Option<String>,
     },
+    /// Download the buffalo_l face models (detector + recognizer) from the
+    /// official InsightFace release, verify, and install them to /etc/linhello.
+    /// The anti-spoof model already ships with the package. Requires root.
+    FetchModels {
+        /// Re-fetch even if the models are already present.
+        #[arg(long)]
+        force: bool,
+    },
     /// Build the native package for this distro (rpm/deb/pkg, auto-detected) from
     /// the source checkout. With --install, install it via the package manager
     /// (needs root). This is what `update` uses to pick the right package.
@@ -1204,6 +1212,12 @@ fn main() -> Result<()> {
             ResealHookAction::Uninstall { dry_run } => reseal_hook_uninstall_cmd(dry_run)?,
         },
         Cmd::Deps { only } => deps_cmd(only.as_deref()),
+        Cmd::FetchModels { force } => {
+            require_root("fetch-models")?;
+            for l in install::fetch_models(force).map_err(|e| anyhow::anyhow!(e))? {
+                println!("  {l}");
+            }
+        }
         Cmd::Package { format, install } => package_cmd(format.as_deref(), install)?,
     }
     Ok(())
