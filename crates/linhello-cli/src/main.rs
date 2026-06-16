@@ -133,6 +133,13 @@ enum Cmd {
         #[command(subcommand)]
         action: ResealHookAction,
     },
+    /// List LinuxHello's build + runtime dependencies with this distro's package
+    /// names and the install command. Read-only; no daemon/root needed.
+    Deps {
+        /// Show only build-time or only runtime dependencies.
+        #[arg(long, value_parser = ["build", "runtime"])]
+        only: Option<String>,
+    },
     /// Live face-framing guide: shows whether the camera sees your face and
     /// guides you into position (distance, centering, head angle) before you
     /// enroll — so you don't have to open a separate camera app first. Polls
@@ -1185,6 +1192,7 @@ fn main() -> Result<()> {
             ResealHookAction::Install { dry_run } => reseal_hook_install_cmd(dry_run)?,
             ResealHookAction::Uninstall { dry_run } => reseal_hook_uninstall_cmd(dry_run)?,
         },
+        Cmd::Deps { only } => deps_cmd(only.as_deref()),
     }
     Ok(())
 }
@@ -1473,6 +1481,44 @@ fn reseal_hook_uninstall_cmd(dry_run: bool) -> Result<()> {
         println!("not installed — nothing to remove ({})", plan.hook_path.display());
     }
     Ok(())
+}
+
+/// `linhello deps` — per-distro dependency package names + the install command.
+fn deps_cmd(only: Option<&str>) {
+    use linhello_common::platform;
+    let family = platform::distro_family();
+    println!("Dependencies for {} ({})", platform::os_release().label(), family.as_str());
+    let sections: &[(&str, bool)] = match only {
+        Some("runtime") => &[("Runtime", true)],
+        Some("build") => &[("Build-time", false)],
+        _ => &[("Runtime", true), ("Build-time", false)],
+    };
+    for (title, runtime) in sections {
+        println!("\n{title}:");
+        let mut pkgs: Vec<&str> = Vec::new();
+        for d in platform::DEPENDENCIES.iter().filter(|d| d.runtime == *runtime) {
+            let p = d.package(family);
+            let shown = if p.is_empty() {
+                "(no distro package — build/fetch upstream)"
+            } else {
+                p
+            };
+            println!("  {:<22} {shown}", d.need);
+            if !p.is_empty() {
+                pkgs.push(p);
+            }
+        }
+        match platform::install_command(&pkgs) {
+            Some(cmd) => println!("  → {cmd}"),
+            None => println!("  → install the above with your package manager"),
+        }
+    }
+    if family == platform::DistroFamily::Debian {
+        println!(
+            "\nnote: ONNX Runtime isn't packaged in Debian — build/download \
+             libonnxruntime.so and set ORT_DYLIB_PATH."
+        );
+    }
 }
 
 /// `setup` step: add the current login user to the `linhello` group so they can

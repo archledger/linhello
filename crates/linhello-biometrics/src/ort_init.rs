@@ -20,13 +20,12 @@ pub fn ensure_initialized() -> Result<()> {
                 Some(path) => std::env::set_var("ORT_DYLIB_PATH", path),
                 None => {
                     // Make the most common fresh-install failure actionable
-                    // instead of a bare dlopen error.
-                    return Err(
-                        "libonnxruntime.so not found — install the ONNX Runtime package \
-                         (Arch: `pacman -S onnxruntime`; Debian/Ubuntu: libonnxruntime; \
-                         Fedora: onnxruntime), or set ORT_DYLIB_PATH"
-                            .to_string(),
-                    );
+                    // instead of a bare dlopen error — with this distro's
+                    // package name / install command.
+                    return Err(format!(
+                        "libonnxruntime.so not found — {}",
+                        linhello_common::platform::onnxruntime_install_hint()
+                    ));
                 }
             }
         }

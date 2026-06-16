@@ -496,6 +496,88 @@ pub fn reseal_hook_plan() -> Option<ResealHookPlan> {
     })
 }
 
+/// A build- or run-time dependency and its package name on each supported
+/// distro family. Source: docs/design/cross-platform-and-setup-ux.md plus the
+/// Fedora build deps validated during the port. An empty package name means
+/// "no distro package — build it or fetch upstream" (notably Debian's ONNX
+/// Runtime, which isn't in main).
+#[derive(Debug, Clone, Copy)]
+pub struct Dep {
+    pub need: &'static str,
+    /// true = needed to run the daemon; false = build-time only.
+    pub runtime: bool,
+    arch: &'static str,
+    debian: &'static str,
+    fedora: &'static str,
+}
+
+impl Dep {
+    /// Package name on `family`, or `""` when there's no distro package.
+    pub fn package(&self, family: DistroFamily) -> &'static str {
+        match family {
+            DistroFamily::Arch => self.arch,
+            DistroFamily::Debian => self.debian,
+            DistroFamily::Fedora => self.fedora,
+            DistroFamily::Other => "",
+        }
+    }
+}
+
+/// LinuxHello's build + runtime dependencies with per-distro package names.
+pub const DEPENDENCIES: &[Dep] = &[
+    // Runtime.
+    Dep { need: "TPM 2.0 TSS runtime", runtime: true, arch: "tpm2-tss", debian: "libtss2-tcti-device0", fedora: "tpm2-tss" },
+    Dep { need: "ONNX Runtime", runtime: true, arch: "onnxruntime", debian: "", fedora: "onnxruntime" },
+    Dep { need: "PAM runtime", runtime: true, arch: "pam", debian: "libpam0g", fedora: "pam" },
+    Dep { need: "V4L cameras", runtime: true, arch: "v4l-utils", debian: "libv4l-0", fedora: "libv4l" },
+    // Build-time (matches the validated Fedora deps: tpm2-tss-devel, openssl-devel, clang-devel, pam-devel).
+    Dep { need: "Rust toolchain", runtime: false, arch: "rust", debian: "cargo", fedora: "cargo" },
+    Dep { need: "TPM TSS headers", runtime: false, arch: "tpm2-tss", debian: "libtss2-dev", fedora: "tpm2-tss-devel" },
+    Dep { need: "OpenSSL headers", runtime: false, arch: "openssl", debian: "libssl-dev", fedora: "openssl-devel" },
+    Dep { need: "clang/bindgen", runtime: false, arch: "clang", debian: "libclang-dev", fedora: "clang-devel" },
+    Dep { need: "PAM headers", runtime: false, arch: "pam", debian: "libpam0g-dev", fedora: "pam-devel" },
+];
+
+/// The package-install command prefix for this distro family, e.g.
+/// `sudo dnf install`. `None` when the package manager is unknown.
+pub fn package_install_prefix() -> Option<&'static str> {
+    match distro_family() {
+        DistroFamily::Arch => Some("sudo pacman -S --needed"),
+        DistroFamily::Debian => Some("sudo apt install"),
+        DistroFamily::Fedora => Some("sudo dnf install"),
+        DistroFamily::Other => None,
+    }
+}
+
+/// One-line install command for `packages` on the running distro, skipping
+/// empty names. `None` if the package manager is unknown or nothing's left.
+pub fn install_command(packages: &[&str]) -> Option<String> {
+    let prefix = package_install_prefix()?;
+    let names: Vec<&str> = packages.iter().copied().filter(|p| !p.is_empty()).collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix} {}", names.join(" ")))
+}
+
+/// Actionable hint for a missing ONNX Runtime on this distro (the most common
+/// fresh-install failure), e.g. `sudo dnf install onnxruntime`.
+pub fn onnxruntime_install_hint() -> String {
+    let family = distro_family();
+    let pkg = DEPENDENCIES
+        .iter()
+        .find(|d| d.need == "ONNX Runtime")
+        .map(|d| d.package(family))
+        .unwrap_or("");
+    match install_command(&[pkg]) {
+        Some(cmd) => cmd,
+        None if family == DistroFamily::Debian => {
+            "not packaged in Debian — build/download libonnxruntime.so and set ORT_DYLIB_PATH".into()
+        }
+        None => "install the onnxruntime package, or set ORT_DYLIB_PATH".into(),
+    }
+}
+
 /// The resolved, human-readable setup choices for the running OS — i.e. exactly
 /// what LinuxHello will do on *this* machine. Surfaced in the wizard so a first
 /// run on a new distro (Fedora, Ubuntu, …) shows which mechanisms apply before
@@ -657,6 +739,25 @@ mod tests {
         assert!(SecurityModule::SeLinux { enforcing: false }.needs_selinux_policy());
         assert!(!SecurityModule::AppArmor.needs_selinux_policy());
         assert!(!SecurityModule::None.needs_selinux_policy());
+    }
+
+    #[test]
+    fn dep_packages_and_install_command_are_per_family() {
+        let onnx = DEPENDENCIES.iter().find(|d| d.need == "ONNX Runtime").unwrap();
+        assert_eq!(onnx.package(DistroFamily::Fedora), "onnxruntime");
+        assert_eq!(onnx.package(DistroFamily::Arch), "onnxruntime");
+        assert_eq!(onnx.package(DistroFamily::Debian), ""); // not packaged
+        // install_command joins names after the family prefix and drops empties.
+        let cmd = install_command(&["onnxruntime", "", "tpm2-tss"]);
+        // (depends on the running distro's prefix; just assert structure if Some)
+        if let Some(c) = cmd {
+            assert!(c.contains("onnxruntime") && c.contains("tpm2-tss"));
+            assert!(!c.contains("  ")); // empty name didn't leave a double space
+        }
+        // Every build dep has a Fedora package name (validated set).
+        for d in DEPENDENCIES.iter().filter(|d| !d.runtime) {
+            assert!(!d.package(DistroFamily::Fedora).is_empty(), "{} missing Fedora pkg", d.need);
+        }
     }
 
     #[test]

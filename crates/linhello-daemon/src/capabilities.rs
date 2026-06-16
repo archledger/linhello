@@ -194,7 +194,10 @@ fn onnxruntime_check() -> CapabilityCheck {
         "ONNX runtime",
         CapabilityStatus::Missing,
         true,
-        "libonnxruntime.so not found — install the `onnxruntime` package",
+        format!(
+            "libonnxruntime.so not found — {}",
+            linhello_common::platform::onnxruntime_install_hint()
+        ),
     )
 }
 
