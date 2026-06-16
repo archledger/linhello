@@ -42,6 +42,10 @@ jobs:
             exit 1
           fi
           gpg --import packaging/trusted-signer.asc
+          # actions/checkout leaves the tag name resolving to the commit, not the
+          # annotated tag object, so verify-tag errors with "non-tag object of
+          # type commit". Re-fetch the real (signed) tag object, then verify.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           git verify-tag "${GITHUB_REF_NAME}"
 
       - name: Build the rpm
