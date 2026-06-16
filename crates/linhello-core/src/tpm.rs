@@ -24,15 +24,17 @@ use zeroize::Zeroizing;
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
 use tss_esapi::constants::SessionType;
-use tss_esapi::handles::{KeyHandle, ObjectHandle, SessionHandle};
+use tss_esapi::handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, SessionHandle, TpmHandle};
 use tss_esapi::interface_types::algorithm::{
     HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm,
 };
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
-use tss_esapi::interface_types::resource_handles::Hierarchy;
+use tss_esapi::interface_types::dynamic_handles::Persistent;
+use tss_esapi::interface_types::resource_handles::{Hierarchy, Provision};
+use tss_esapi::tss2_esys::ESYS_TR;
 use tss_esapi::interface_types::session_handles::{AuthSession, PolicySession};
 use tss_esapi::structures::{
-    Digest, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder, PcrSlot,
+    Auth, Digest, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder, PcrSlot,
     Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters, PublicRsaParameters,
     RsaExponent, RsaScheme, RsaSignature, SensitiveData, Signature, SymmetricDefinition,
     SymmetricDefinitionObject,
@@ -232,6 +234,80 @@ fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
     Ok(primary.key_handle)
 }
 
+/// Owner-hierarchy persistent handle where linhello caches its SRK. In the
+/// owner persistent range (0x81000000–0x817FFFFF) but deliberately distinct
+/// from the conventional 0x81000001 SRK, so we never collide with another
+/// stack's storage key. Override with `LINHELLO_SRK_HANDLE` (hex) if needed.
+const PERSISTENT_SRK_HANDLE: u32 = 0x8101_0001;
+
+fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
+    let raw = std::env::var("LINHELLO_SRK_HANDLE")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or(PERSISTENT_SRK_HANDLE);
+    PersistentTpmHandle::new(raw).map_err(tpm_err)
+}
+
+/// Get linhello's SRK, persisting it on first use.
+///
+/// `create_primary` over [`srk_template`] is deterministic (same owner seed +
+/// template ⇒ the same key), but on some TPMs — notably slow firmware TPMs —
+/// deriving an RSA-2048 primary costs >10s (measured 12.7s on one fTPM). Paying
+/// that on every seal/unseal made face-unlock exceed the PAM client's timeout.
+/// We instead derive it once and `evict_control` it to a persistent handle;
+/// every later call just loads that handle. The persisted key is bit-for-bit
+/// identical to the old transient one, so envelopes sealed before this change
+/// still load — no re-seal needed.
+///
+/// Returns the handle and whether it is persistent (a persistent handle must
+/// NOT be flushed by the caller).
+fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
+    let persistent = persistent_srk_handle()?;
+
+    // Fast path: already persisted — get an ESYS handle for the persistent key.
+    if let Ok(object) = ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)) {
+        // ESYS only tracks an entity's auth for handles IT created; a handle
+        // obtained via tr_from_tpm_public starts with no auth, so loading a
+        // child under it fails with TPM_RC_AUTH_UNAVAILABLE. Our SRK was created
+        // with an empty authValue, so tell ESYS exactly that.
+        ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
+        return Ok((KeyHandle::from(ESYS_TR::from(object)), true));
+    }
+
+    // First run: derive the primary (the one-time slow step) and persist it so
+    // every subsequent open is a cheap handle load.
+    let transient = create_srk(ctx)?;
+    let persisted = ctx
+        .execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                transient.into(),
+                Persistent::Persistent(persistent),
+            )
+        })
+        .map_err(tpm_err)?;
+    // Drop the transient copy; the persistent object now lives in TPM NV.
+    let _ = ctx.flush_context(transient.into());
+    // Same as above: set the empty auth on the freshly-persisted handle.
+    ctx.tr_set_auth(persisted, Auth::default()).map_err(tpm_err)?;
+    Ok((KeyHandle::from(ESYS_TR::from(persisted)), true))
+}
+
+/// Run `body` with linhello's persistent SRK as the parent key. Unlike
+/// [`with_handle`], it never flushes the SRK — persistence is the whole point
+/// (avoids re-deriving a slow RSA primary on every call).
+fn with_srk<T>(
+    ctx: &mut Context,
+    body: impl FnOnce(&mut Context, &KeyHandle) -> Result<T>,
+) -> Result<T> {
+    let (srk, persistent) = load_or_create_srk(ctx)?;
+    let result = body(ctx, &srk);
+    if !persistent {
+        let _ = ctx.flush_context(srk.into());
+    }
+    result
+}
+
 /// Seal `secret` under the policy plan chosen for this machine's current
 /// state ([`policy::plan`]). This is the entry point new code should use — it
 /// picks the signed (authorized) policy when available and falls back to a
@@ -266,7 +342,7 @@ fn seal_literal(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
 
     let pcr_values = read_pcr_values(&mut ctx, &pcrs)?;
 
-    with_handle(&mut ctx, create_srk, |ctx, srk| {
+    with_srk(&mut ctx, |ctx, srk| {
         let selection = if pcrs.is_empty() {
             None
         } else {
@@ -326,7 +402,7 @@ fn seal_authorized(
     )?;
     let auth_policy = authorize_policy_digest(key_name.value(), policy_ref)?;
 
-    with_handle(&mut ctx, create_srk, |ctx, srk| {
+    with_srk(&mut ctx, |ctx, srk| {
         let tmpl = sealed_template(auth_policy.clone())?;
         let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
         let created = ctx
@@ -366,7 +442,7 @@ pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
 fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
-    with_handle(&mut ctx, create_srk, |ctx, srk| {
+    with_srk(&mut ctx, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
 
@@ -429,7 +505,7 @@ fn unseal_authorized(
     crate::pcrsig::ensure_trusted_pubkey(pubkey_pem)?;
     let mut ctx = open_context()?;
 
-    with_handle(&mut ctx, create_srk, |ctx, srk| {
+    with_srk(&mut ctx, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
         let sealed_handle = ctx
