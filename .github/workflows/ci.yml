@@ -11,6 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
+      # fedora:latest ships no git, so actions/checkout would fall back to a
+      # tarball (no .git) and the later `git archive HEAD` fails with "not a git
+      # repository". Install git BEFORE checkout so it does a real clone.
+      - name: Install git for a real checkout
+        run: dnf -y install git
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -18,7 +24,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y \
-            cargo rust clang clang-devel gcc make pkgconf-pkg-config git \
+            cargo rust clang clang-devel gcc make pkgconf-pkg-config \
             tpm2-tss-devel openssl-devel pam-devel \
             selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy rpmlint
 
