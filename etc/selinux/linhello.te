@@ -1,0 +1,56 @@
+# SELinux policy module for LinuxHello (Fedora / RHEL / any enforcing-SELinux distro).
+#
+# WHY THIS IS NEEDED
+#   Display managers run their PAM auth conversation in a confined domain. On
+#   Fedora, gdm-session-worker (the GDM greeter AND the GNOME lock screen) runs
+#   as xdm_t. Under enforcing SELinux that domain is denied write/connect on the
+#   linhellod socket (/run/linhello.sock, default label var_run_t), so
+#   pam_linhello cannot reach the daemon and silently defers to the password
+#   prompt -- the camera never activates. `sudo` works only because it runs in
+#   the user's unconfined_t domain. This module closes that gap.
+#
+#   Symptom without it (journal):
+#     avc: denied { write } ... comm="gdm-session-wor" name="linhello.sock"
+#         scontext=...:xdm_t tcontext=...:var_run_t tclass=sock_file
+#     pam_linhello(gdm-password:auth): face auth declined ... deferring
+#
+# BUILD + INSTALL (no selinux-policy-devel required):
+#     checkmodule -M -m -o linhello.mod linhello.te
+#     semodule_package -o linhello.pp -m linhello.mod
+#     sudo semodule -i linhello.pp
+#     sudo systemctl restart linhellod   # so the type_transition relabels the socket
+#   Verify:  ls -Z /run/linhello.sock  ->  ...:linhello_runtime_t:s0
+#   Remove:  sudo semodule -r linhello
+#
+# NOTE: this assumes the daemon runs as unconfined_service_t (the case when
+# linhellod lives under /usr/local/bin). A packaged install that gives linhellod
+# its own SELinux domain should adjust the unconfined_service_t references.
+
+module linhello 1.0.0;
+
+require {
+    type xdm_t;
+    type unconfined_service_t;
+    type var_run_t;
+    attribute file_type;
+    class sock_file { create write unlink getattr setattr };
+    class unix_stream_socket connectto;
+}
+
+# Dedicated type for the daemon's runtime socket (/run/linhello.sock).
+type linhello_runtime_t;
+typeattribute linhello_runtime_t file_type;
+
+# The daemon (unconfined_service_t) creates /run/linhello.sock under /run
+# (var_run_t). Relabel it to its own type on creation so we can grant narrow
+# access to just this socket instead of every var_run_t socket.
+type_transition unconfined_service_t var_run_t:sock_file linhello_runtime_t "linhello.sock";
+allow unconfined_service_t linhello_runtime_t:sock_file { create write unlink getattr setattr };
+
+# The GDM greeter and GNOME lock screen drive PAM via gdm-session-worker, which
+# runs in the xdm_t domain. Without this it is denied { write } on the socket,
+# so pam_linhello cannot reach the daemon and silently defers to the password
+# prompt (the camera/IR never activates). Allow it to reach ONLY the linhello
+# socket and to connect to the daemon's listening socket.
+allow xdm_t linhello_runtime_t:sock_file { write getattr };
+allow xdm_t unconfined_service_t:unix_stream_socket connectto;
