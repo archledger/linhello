@@ -1,0 +1,103 @@
+policy_module(linhello-daemon, 1.0.0)
+
+########################################
+#
+# LinuxHello daemon confinement — for PACKAGED installs (RPM/deb), where the
+# daemon binary is installed to a system path and labeled linhellod_exec_t so
+# systemd transitions it into its own confined domain (linhellod_t).
+#
+# This is the counterpart to the minimal etc/selinux/linhello.te, which only
+# grants the display manager access to a daemon left running as the generic
+# unconfined_service_t (the case for a /usr/local/bin `make install`). A
+# packaged install should load THIS module instead of that one — it supersedes
+# it (full daemon confinement + the same greeter access).
+#
+# BUILD (needs selinux-policy-devel):
+#   make -f /usr/share/selinux/devel/Makefile linhello-daemon.pp
+#   sudo semodule -i linhello-daemon.pp
+#   sudo restorecon -v /usr/bin/linhellod /etc/linhello /run/linhello.sock
+#
+# VALIDATION STATUS: compiles against the Fedora refpolicy headers. Runtime
+# confinement is NOT yet validated on a real packaged install (the dev/test box
+# runs the daemon from /usr/local/bin as unconfined_service_t). Confirm with
+# `ausearch -m avc -c linhellod` after a packaged deployment and fold in any
+# additional accesses before shipping in a package.
+#
+
+########################################
+#
+# Declarations
+#
+
+type linhellod_t;
+type linhellod_exec_t;
+init_daemon_domain(linhellod_t, linhellod_exec_t)
+
+# Runtime socket /run/linhello.sock — its own type so the display manager can be
+# granted narrow access to just this socket.
+type linhellod_runtime_t;
+files_pid_file(linhellod_runtime_t)
+
+# Sealed envelopes + ONNX models under /etc/linhello.
+type linhello_conf_t;
+files_config_file(linhello_conf_t)
+
+########################################
+#
+# linhellod local policy
+#
+
+# CAP_CHOWN (chown the socket to the linhello group), CAP_DAC_OVERRIDE and
+# CAP_FOWNER (open device nodes / manage envelope files) — matches the unit's
+# CapabilityBoundingSet.
+allow linhellod_t self:capability { chown dac_override fowner };
+allow linhellod_t self:process { getsched setsched signal };
+allow linhellod_t self:fifo_file rw_fifo_file_perms;
+allow linhellod_t self:unix_stream_socket create_stream_socket_perms;
+
+# TPM resource manager (/dev/tpmrm0) for sealing/unsealing envelopes.
+dev_rw_tpm(linhellod_t)
+
+# V4L cameras (/dev/video*): read frames, including mmap'd capture buffers.
+dev_read_video_dev(linhellod_t)
+dev_write_video_dev(linhellod_t)
+dev_map_video_dev(linhellod_t)
+dev_getattr_video_dev(linhellod_t)
+# Camera enumeration walks /sys.
+dev_search_sysfs(linhellod_t)
+
+# Runtime socket: create /run/linhello.sock as linhellod_runtime_t.
+manage_sock_files_pattern(linhellod_t, linhellod_runtime_t, linhellod_runtime_t)
+files_pid_filetrans(linhellod_t, linhellod_runtime_t, sock_file, "linhello.sock")
+
+# Config dir: read sealed envelopes + models; rewrite envelopes on reseal.
+manage_files_pattern(linhellod_t, linhello_conf_t, linhello_conf_t)
+manage_dirs_pattern(linhellod_t, linhello_conf_t, linhello_conf_t)
+files_search_etc(linhellod_t)
+
+# Shared libraries — onnxruntime is dlopen'd (ort load-dynamic).
+libs_use_ld_so(linhellod_t)
+libs_use_shared_libs(linhellod_t)
+
+# Misc daemon needs.
+kernel_read_system_state(linhellod_t)
+auth_use_nsswitch(linhellod_t)
+logging_send_syslog_msg(linhellod_t)
+miscfiles_read_localization(linhellod_t)
+
+########################################
+#
+# Display-manager (greeter / lock screen) access to the socket
+#
+# GDM greeter and GNOME lock screen drive PAM via gdm-session-worker (xdm_t).
+# Allow it to reach ONLY the linhello socket and connect to the daemon, so face
+# auth works at the greeter/lock as well as via sudo.
+#
+
+optional_policy(`
+    gen_require(`
+        type xdm_t;
+    ')
+    allow xdm_t linhellod_runtime_t:sock_file { getattr write };
+    allow xdm_t linhellod_t:unix_stream_socket connectto;
+')

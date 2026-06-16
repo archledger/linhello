@@ -23,8 +23,10 @@
 #   Remove:  sudo semodule -r linhello
 #
 # NOTE: this assumes the daemon runs as unconfined_service_t (the case when
-# linhellod lives under /usr/local/bin). A packaged install that gives linhellod
-# its own SELinux domain should adjust the unconfined_service_t references.
+# linhellod lives under /usr/local/bin). A PACKAGED install that puts the daemon
+# on a system path should instead load etc/selinux/linhello-daemon.te, which
+# confines the daemon in its own domain (linhellod_t) and includes the same
+# greeter access — load that module INSTEAD of this one, not alongside it.
 
 module linhello 1.0.0;
 

@@ -88,6 +88,13 @@ install: all
 	# SELinux policy source. Harmless to ship everywhere; it is built+loaded only
 	# on SELinux systems (`linhello selinux install`, also run from `setup`).
 	install -Dm644 etc/selinux/linhello.te $(DESTDIR)$(CONFDIR)/selinux/linhello.te
+	# Daemon-confinement module (linhellod_t) for PACKAGED installs — built with
+	# selinux-policy-devel and loaded INSTEAD of linhello.te when the daemon runs
+	# from a system path. Shipped as packaging reference; see its header.
+	install -Dm644 etc/selinux/linhello-daemon.te \
+	    $(DESTDIR)$(PREFIX)/share/linhello/selinux/linhello-daemon.te
+	install -Dm644 etc/selinux/linhello-daemon.fc \
+	    $(DESTDIR)$(PREFIX)/share/linhello/selinux/linhello-daemon.fc
 	@echo
 	@echo "Installed (incl. anti-spoof models). Next — fetch buffalo_l (InsightFace):"
 	@echo "  systemctl daemon-reload && systemctl enable --now linhellod"

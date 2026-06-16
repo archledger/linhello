@@ -1,0 +1,10 @@
+# File contexts for the LinuxHello daemon confinement module.
+# Apply after `semodule -i linhello-daemon.pp` with:
+#   restorecon -v /usr/bin/linhellod /etc/linhello /run/linhello.sock
+
+/usr/bin/linhellod              --      gen_context(system_u:object_r:linhellod_exec_t,s0)
+/usr/local/bin/linhellod        --      gen_context(system_u:object_r:linhellod_exec_t,s0)
+
+/etc/linhello(/.*)?                     gen_context(system_u:object_r:linhello_conf_t,s0)
+
+/run/linhello\.sock             -s      gen_context(system_u:object_r:linhellod_runtime_t,s0)
