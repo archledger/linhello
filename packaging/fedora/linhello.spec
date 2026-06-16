@@ -85,7 +85,15 @@ cargo test --release -p linhello-common -p linhello-core
 install -Dm644 etc/selinux/linhello-daemon.pp \
     %{buildroot}%{_datadir}/selinux/packages/linhello-daemon.pp
 
-%files
+# Generated %%files list: always the SELinux module, plus the trusted release
+# key only when `make install` shipped it (packaging/trusted-signer.asc was
+# committed). Keeps the build green either way and avoids an empty -f list.
+echo "%{_datadir}/selinux/packages/linhello-daemon.pp" > extra-files.txt
+if [ -f %{buildroot}%{_sysconfdir}/%{name}/trusted-signer.asc ]; then
+    echo "%config(noreplace) %{_sysconfdir}/%{name}/trusted-signer.asc" >> extra-files.txt
+fi
+
+%files -f extra-files.txt
 %license LICENSE
 %doc README.md
 %{_bindir}/linhellod
@@ -97,7 +105,6 @@ install -Dm644 etc/selinux/linhello-daemon.pp \
 %{_unitdir}/linhellod.service
 %{_sysusersdir}/linhello.conf
 %{_datadir}/%{name}/
-%{_datadir}/selinux/packages/linhello-daemon.pp
 %dir %{_sysconfdir}/%{name}
 %config(noreplace) %{_sysconfdir}/%{name}/antispoof.onnx
 %config(noreplace) %{_sysconfdir}/%{name}/antispoof_4.onnx

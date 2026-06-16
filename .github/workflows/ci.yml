@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "port/**"]
+  pull_request:
+
+jobs:
+  fedora:
+    name: Fedora build, test & rpm
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            cargo rust clang clang-devel gcc make pkgconf-pkg-config git \
+            tpm2-tss-devel openssl-devel pam-devel \
+            selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy rpmlint
+
+      - name: Hardware-free unit tests
+        run: cargo test --release -p linhello-common -p linhello-core
+
+      - name: Lint the rpm spec
+        run: rpmlint packaging/fedora/linhello.spec
+
+      - name: Build the SELinux daemon module
+        run: make -C etc/selinux -f /usr/share/selinux/devel/Makefile linhello-daemon.pp
+
+      - name: Build the rpm
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ver=$(rpmspec -q --qf '%{version}\n' packaging/fedora/linhello.spec | head -1)
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
+          git archive --format=tar.gz --prefix="linhello-${ver}/" \
+            -o ~/rpmbuild/SOURCES/linhello-${ver}.tar.gz HEAD
+          rpmbuild -bb packaging/fedora/linhello.spec
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linhello-rpm
+          path: ~/rpmbuild/RPMS/*/*.rpm
+          if-no-files-found: error
+
+  # Debian/Ubuntu and Arch jobs are intentionally deferred: Fedora is the focus
+  # for now. Add a debian/ build job (debhelper) and an arch makepkg job here
+  # once those packages are build-tested on their native distros.

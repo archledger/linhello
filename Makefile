@@ -103,6 +103,15 @@ install: all
 	    $(DESTDIR)$(PREFIX)/share/linhello/selinux/linhello-daemon.te
 	install -Dm644 etc/selinux/linhello-daemon.fc \
 	    $(DESTDIR)$(PREFIX)/share/linhello/selinux/linhello-daemon.fc
+	# Trusted release-signing public key, used by `linhello update` to verify
+	# signed tags. Shipped only when present (export it on the signing box:
+	# `gpg --export --armor <fpr> > packaging/trusted-signer.asc` and commit).
+	@if [ -f packaging/trusted-signer.asc ]; then \
+	    install -Dm644 packaging/trusted-signer.asc $(DESTDIR)$(CONFDIR)/trusted-signer.asc; \
+	    echo "  installed trusted-signer.asc"; \
+	else \
+	    echo "  note: packaging/trusted-signer.asc absent — \`linhello update\` signature verification will be unavailable until it is committed"; \
+	fi
 	@echo
 	@echo "Installed (incl. anti-spoof models). Next — fetch buffalo_l (InsightFace):"
 	@echo "  systemctl daemon-reload && systemctl enable --now linhellod"

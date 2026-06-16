@@ -44,3 +44,35 @@ cp -rT packaging/debian debian && dpkg-buildpackage -b -us -uc
 
 ONNX Runtime is the one dependency not packaged everywhere (not in Debian/Fedora
 main); see `linhello deps` for the per-distro names and install command.
+
+## Releasing
+
+`linhello update` only installs from a tag signed by the pinned release key, and
+verifies it against `trusted-signer.asc` (installed to `/etc/linhello/`). So a
+release needs the **public key shipped in the repo** and a **signed tag**:
+
+1. One-time — export the public key on the signing box and commit it:
+
+   ```sh
+   gpg --export --armor <FINGERPRINT> > packaging/trusted-signer.asc
+   ```
+
+   (The fingerprint is pinned in `crates/linhello-cli/src/install.rs` as
+   `TRUSTED_SIGNER_FINGERPRINT`.) The packages install it to
+   `/etc/linhello/trusted-signer.asc`; without it `update` cannot verify.
+
+2. Per release — bump `version` in `Cargo.toml` and `packaging/fedora/linhello.spec`
+   (and the changelogs), commit, then create and **GPG-sign** the tag on the box
+   that holds the key:
+
+   ```sh
+   git tag -s v0.2.0 -m 'linhello 0.2.0'
+   git push origin v0.2.0
+   ```
+
+3. CI (`.github/workflows/release.yml`) verifies the tag against the committed
+   key, builds the package, and attaches it to the GitHub Release. CI never
+   signs — signing stays on the maintainer's machine.
+
+Keep the tag version, `Cargo.toml`/spec version, and changelog in lockstep.
+

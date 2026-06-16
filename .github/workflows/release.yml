@@ -1,0 +1,54 @@
+name: Release
+
+# Publishes packages from a signed release tag. Tags are created and GPG-signed
+# out of band (on the maintainer's Arch box); CI never signs — it verifies the
+# tag against the committed trusted-signer key, builds the package, and attaches
+# it to the GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  fedora-rpm:
+    name: Build & publish rpm
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            cargo rust clang clang-devel gcc make pkgconf-pkg-config git gnupg2 \
+            tpm2-tss-devel openssl-devel pam-devel \
+            selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy
+
+      - name: Verify the tag signature against the pinned key
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ ! -f packaging/trusted-signer.asc ]; then
+            echo "::error::packaging/trusted-signer.asc is missing — commit the exported public key."
+            exit 1
+          fi
+          gpg --import packaging/trusted-signer.asc
+          git verify-tag "${GITHUB_REF_NAME}"
+
+      - name: Build the rpm
+        run: |
+          ver=$(rpmspec -q --qf '%{version}\n' packaging/fedora/linhello.spec | head -1)
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
+          git archive --format=tar.gz --prefix="linhello-${ver}/" \
+            -o ~/rpmbuild/SOURCES/linhello-${ver}.tar.gz HEAD
+          rpmbuild -bb packaging/fedora/linhello.spec
+          mkdir -p dist && cp ~/rpmbuild/RPMS/*/*.rpm dist/
+
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.rpm
+          fail_on_unmatched_files: true
