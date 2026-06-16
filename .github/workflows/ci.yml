@@ -25,7 +25,7 @@ jobs:
         run: |
           dnf install -y \
             cargo rust clang clang-devel gcc make pkgconf-pkg-config \
-            tpm2-tss-devel openssl-devel pam-devel \
+            tpm2-tss-devel openssl-devel pam-devel systemd-devel \
             selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy rpmlint
 
       - name: Hardware-free unit tests

@@ -31,7 +31,7 @@ jobs:
         run: |
           dnf install -y \
             cargo rust clang clang-devel gcc make pkgconf-pkg-config gnupg2 \
-            tpm2-tss-devel openssl-devel pam-devel \
+            tpm2-tss-devel openssl-devel pam-devel systemd-devel \
             selinux-policy-devel rpm-build systemd-rpm-macros checkpolicy
 
       - name: Verify the tag signature against the pinned key
