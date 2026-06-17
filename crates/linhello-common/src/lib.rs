@@ -1,5 +1,6 @@
 //! Shared types, errors, and constants for the LinuxHello workspace.
 
+pub mod biopolicy;
 pub mod client;
 pub mod config;
 pub mod ipc;

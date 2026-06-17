@@ -110,6 +110,34 @@ the emitter off is *not* the secure tier (we fought for emitter activation;
 A machine with an IR sensor whose emitter can't be driven falls back to
 Convenience (honest).
 
+## 5a. Device integrity & anti-downgrade (ALREADY IMPLEMENTED — do not rebuild)
+
+The camera is bound to the enrollment ("soft-SDCP"). At enroll, the daemon
+snapshots each camera's USB identity — **vid, pid, serial** — into
+`/etc/linhello/<user>/camera_binding.json` (`linhello-liveness::device_binding`).
+The check is **enforced in the auth path**: `do_unseal_password` and `do_verify`
+both call `load_user_samples()`, which calls `check_camera_binding()` →
+`CameraBinding::verify()` before any match. Consequences, which satisfy the
+stated requirements directly:
+
+- **No device swap.** A different camera (vid/pid/serial mismatch) makes
+  `load_user_samples` fail → face auth declines → password → **re-enroll
+  required.** Exact-unit when a serial is present.
+- **No silent downgrade / disconnect = dark.** `verify()` returns
+  *"IR camera was present at enrollment but is now missing"* when an
+  enrolled IR camera is gone → face auth declines → password. A secure-tier
+  machine that loses its (USB) IR camera therefore goes to password, never to
+  RGB-convenience on some other sensor. Reconnect → works again.
+
+**Caveat (honest, surface in `doctor`):** serial-less webcams (e.g. NexiGo N930W,
+`serial=""`) bind at **model level** (vid/pid/name) only — two identical units
+are indistinguishable. No per-unit USB identifier exists for them; this is the
+ceiling, not a bug. Devices exposing a serial get true exact-unit binding.
+
+The tier in §5 therefore composes with binding: **tier is fixed at enrollment by
+the bound camera's capability.** Losing that camera fails safe (password); it is
+never re-derived from whatever sensor happens to be present.
+
 ## 6. IPC protocol changes (`crates/linhello-common/src/ipc.rs`)
 
 Centralise policy in the daemon; the PAM module just passes context and reacts.
@@ -151,6 +179,16 @@ for login/sudo the engine returns `Deny` (→ password). The TPM unseal code pat
 is only reachable from `Tier::Secure`.
 
 ## 8. PAM module (`pam/pam_linhello.c` + `crates/linhello-pam`)
+
+**Current state (the partial version P0 generalizes):** `pam_sm_authenticate`
+already splits the two modes — but by **euid**, not service/tier: a non-root
+caller (e.g. KDE kscreenlocker as the session user) calls `linhello_verify_face`
+(Verify, no AUTHTOK); a root caller (gdm-session-worker, sudo) calls
+`linhello_unseal_keyring` (UnsealPassword → AUTHTOK). This is a decent heuristic
+but (a) does no hardware-tier gating, and (b) on **GNOME the lock screen runs as
+root**, so today a screen-unlock *unseals the password* — exactly the
+Class-1-violating credential release §2 wants to stop. P0 moves the decision into
+the daemon, keyed on service + tier + warm:
 
 1. `pam_get_item(pamh, PAM_SERVICE, &svc)`; if missing → return `PAM_IGNORE`
    (fail-safe to password). Include `svc` in `Authenticate`.
