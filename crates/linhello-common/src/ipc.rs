@@ -84,6 +84,12 @@ pub enum Request {
     /// password so pam_gnome_keyring can unlock the existing keyring with
     /// `use_authtok`. Root-only.
     UnsealPassword { user: String },
+    /// Tiered-policy authentication (the PAM entry point). The daemon classifies
+    /// `service` (with logind warm-session state), looks up the hardware tier,
+    /// and either unseals (→ `PasswordUnsealed`), verifies without releasing the
+    /// secret (→ `Verified{matched:true}`), or denies (→ `Error`). Replaces the
+    /// euid heuristic in pam_linhello. Root-only for the unseal path.
+    Authenticate { user: String, service: String },
     /// Report envelope presence, PCR drift, and TPM reachability without
     /// attempting a full unseal.
     Diagnose,

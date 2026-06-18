@@ -70,6 +70,18 @@ pub enum ModalityReq {
     Ir,
 }
 
+impl ModalityReq {
+    /// Parse a config value (`off` / `rgb` / `ir`); `None` if unrecognized.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(ModalityReq::Off),
+            "rgb" => Some(ModalityReq::Rgb),
+            "ir" => Some(ModalityReq::Ir),
+            _ => None,
+        }
+    }
+}
+
 /// Per-operation policy. Defaults encode the agreed model: RGB may unlock a live
 /// session; everything that releases the credential or elevates needs IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

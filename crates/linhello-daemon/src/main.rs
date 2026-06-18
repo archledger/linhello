@@ -221,6 +221,22 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        Request::Authenticate { user, service } => {
+            // Peer must be allowed to act as `user` (root for anyone; otherwise
+            // only their own account — the KDE session-user unlock case). The
+            // unseal-vs-verify decision and the root gate on releasing the secret
+            // are made inside do_authenticate.
+            if !users::peer_may_act_as(peer_uid, &user) {
+                return forbidden("authenticate");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            let root = is_root(peer_uid);
+            task::spawn_blocking(move || do_authenticate(&user, &service, root))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
         Request::Probe => task::spawn_blocking(|| Response::Capabilities {
             report: capabilities::probe(),
@@ -386,6 +402,92 @@ fn save_camera_binding(user: &str, binding: &CameraBinding) {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
+    }
+}
+
+/// The enrolled camera binding for `user`, if any.
+fn enrolled_binding(user: &str) -> Option<CameraBinding> {
+    let json = std::fs::read_to_string(camera_binding_path(user)).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Hardware assurance tier for `user`, fixed by the camera they enrolled with: an
+/// enrolled IR camera ⇒ Secure, else Convenience. (That the IR camera is *still*
+/// present is enforced separately by `check_camera_binding`, so a Secure-tier
+/// user who loses their IR camera fails closed to the password, never downgrades.)
+fn user_tier(user: &str) -> linhello_common::biopolicy::Tier {
+    use linhello_common::biopolicy::Tier;
+    match enrolled_binding(user) {
+        Some(b) if b.ir.is_some() => Tier::Secure,
+        _ => Tier::Convenience,
+    }
+}
+
+/// Whether `user` has a live (warm) logind session — i.e. a credential created a
+/// session this boot, so a screen-unlock need not release the credential again.
+/// Read from systemd's per-user state file on the *system* side (no session bus).
+fn session_warm(user: &str) -> bool {
+    let Some(uid) = users::uid_for_name(user) else {
+        return false;
+    };
+    match std::fs::read_to_string(format!("/run/systemd/users/{uid}")) {
+        Ok(text) => text.lines().any(|l| {
+            l.strip_prefix("STATE=")
+                .map(|s| matches!(s.trim(), "active" | "online"))
+                .unwrap_or(false)
+        }),
+        Err(_) => false,
+    }
+}
+
+/// Load the per-operation policy from `/etc/linhello/policy.conf` (kv: `key=off|
+/// rgb|ir`), falling back to the secure defaults for any missing/invalid key.
+fn current_policy() -> linhello_common::biopolicy::Policy {
+    use linhello_common::biopolicy::{ModalityReq, Policy};
+    let mut p = Policy::default();
+    let get = |k: &str| {
+        linhello_common::config::read_kv("policy.conf", k).and_then(|v| ModalityReq::parse(&v))
+    };
+    if let Some(v) = get("screen_unlock") {
+        p.screen_unlock = v;
+    }
+    if let Some(v) = get("login") {
+        p.login = v;
+    }
+    if let Some(v) = get("sudo") {
+        p.sudo = v;
+    }
+    if let Some(v) = get("polkit") {
+        p.polkit = v;
+    }
+    p
+}
+
+/// Tiered-policy authentication: classify the service, look up the tier + warm
+/// state, decide, and route to the existing verify / unseal paths. Centralises
+/// the decision the PAM module used to make by euid.
+fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
+    use linhello_common::biopolicy::{classify, decide, Action};
+    let warm = session_warm(user);
+    let class = classify(service, warm);
+    let tier = user_tier(user);
+    let mut action = decide(class, tier, &current_policy());
+    // Defence in depth: the sealed password is only ever released to a root peer
+    // (the existing UnsealPassword rule). A non-root peer that somehow lands on
+    // the unseal path is downgraded to a deny → password.
+    if action == Action::Unseal && !peer_is_root {
+        action = Action::Deny;
+    }
+    tracing::info!(
+        "Authenticate: user='{user}' service='{service}' tier={} class={class:?} warm={warm} root={peer_is_root} -> {action:?}",
+        tier.as_str()
+    );
+    match action {
+        Action::Deny => Response::Error {
+            message: format!("face auth not permitted for '{service}' on the {} tier", tier.as_str()),
+        },
+        Action::Verify => do_verify(user),
+        Action::Unseal => do_unseal_password(user),
     }
 }
 
