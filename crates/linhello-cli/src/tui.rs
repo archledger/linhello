@@ -18,8 +18,8 @@
 use linhello_biometrics::camera::{self, CameraInfo, CameraKind};
 use linhello_common::config;
 use linhello_common::ipc::{
-    CapabilityReport, CapabilityStatus, IdentifyCandidate, PositionReport, ProfileInfo, Request,
-    Response, SecretBytes,
+    CapabilityReport, CapabilityStatus, IdentifyCandidate, OperationPolicy, PositionReport,
+    ProfileInfo, Request, Response, SecretBytes,
 };
 use zeroize::Zeroize;
 use linhello_common::platform;
@@ -43,6 +43,10 @@ const MAX_WIDTH: u16 = 90;
 /// Max content height, so the app floats centered with margin on tall screens
 /// instead of pinning to the top-left corner.
 const MAX_HEIGHT: u16 = 40;
+/// Approx. visible rows in the Host-check body (MAX_HEIGHT minus header/activity/
+/// footer and the surface border+padding). Used only to clamp scrolling so it
+/// can't run far past the content; an off-by-a-little here is harmless.
+const DOCTOR_VISIBLE_ROWS: u16 = 22;
 
 /// A rounded, hairline-bordered block — the base for every framed surface.
 fn surface() -> Block<'static> {
@@ -180,6 +184,18 @@ enum InstallStep {
     Failed(String),
 }
 
+/// Decoded [`Response::PolicyStatus`] for the Host-check panel: the effective
+/// tier and what face auth does per operation (sourced from the daemon, so it
+/// matches real auth behaviour).
+struct PolicyView {
+    tier: String,
+    secure: bool,
+    overridden: bool,
+    hardware_tier: String,
+    enrolled: bool,
+    ops: Vec<OperationPolicy>,
+}
+
 struct App {
     screen: Screen,
     user: String,
@@ -188,6 +204,13 @@ struct App {
     /// Host probe result from the daemon. `None` until fetched; `Err` carries a
     /// human-readable failure.
     report: Option<Result<CapabilityReport, String>>,
+    /// Effective biometric tier + per-operation policy from the daemon, fetched
+    /// alongside the probe. `None` when unavailable (old/unreachable daemon) —
+    /// the panel is simply omitted then.
+    policy: Option<PolicyView>,
+    /// Vertical scroll offset for the Host-check body (it can exceed the fixed
+    /// MAX_HEIGHT budget once the tier/policy panel is included).
+    doctor_scroll: u16,
     cameras: Vec<CameraInfo>,
     cam_cursor: usize,
     sel_rgb: Option<String>,
@@ -246,6 +269,8 @@ impl App {
         let active_profile = user.clone();
         App {
             screen: Screen::Welcome,
+            policy: None,
+            doctor_scroll: 0,
             user,
             install: crate::install::InstallState::detect(),
             report: None,
@@ -442,11 +467,34 @@ impl App {
     }
 
     fn refresh_probe(&mut self) {
+        self.doctor_scroll = 0;
         self.report = Some(match crate::send(Request::Probe) {
             Ok(Response::Capabilities { report }) => Ok(report),
             Ok(other) => Err(format!("unexpected response: {other:?}")),
             Err(e) => Err(e.to_string()),
         });
+        // Effective tier + per-op policy, sourced from the daemon. Best-effort:
+        // leave `None` (panel omitted) if the daemon is old or unreachable.
+        self.policy = match crate::send(Request::PolicyStatus {
+            user: self.user.clone(),
+        }) {
+            Ok(Response::PolicyStatus {
+                tier,
+                secure,
+                hardware_tier,
+                overridden,
+                enrolled,
+                ops,
+            }) => Some(PolicyView {
+                tier,
+                secure,
+                overridden,
+                hardware_tier,
+                enrolled,
+                ops,
+            }),
+            _ => None,
+        };
     }
 
     /// Restart the daemon without printing (the TUI owns the screen). Returns a
@@ -525,6 +573,18 @@ impl App {
             Screen::Identify => self.identify_key(code),
             Screen::Password => self.password_key(code),
             Screen::Pam => self.pam_key(code),
+            Screen::Doctor if matches!(code, KeyCode::Up) => {
+                self.doctor_scroll = self.doctor_scroll.saturating_sub(1);
+            }
+            Screen::Doctor if matches!(code, KeyCode::Down) => {
+                self.doctor_scroll = (self.doctor_scroll + 1).min(self.doctor_max_scroll());
+            }
+            Screen::Doctor if matches!(code, KeyCode::PageUp) => {
+                self.doctor_scroll = self.doctor_scroll.saturating_sub(10);
+            }
+            Screen::Doctor if matches!(code, KeyCode::PageDown) => {
+                self.doctor_scroll = (self.doctor_scroll + 10).min(self.doctor_max_scroll());
+            }
             Screen::Doctor if matches!(code, KeyCode::Char('r')) => self.refresh_probe(),
             // Self-heal: when the daemon is down, the user can have the wizard
             // start it rather than being told to go run systemctl themselves.
@@ -1916,6 +1976,65 @@ impl App {
         frame.render_widget(p, card);
     }
 
+    /// "What face auth does on this machine" panel for the Host-check screen,
+    /// built from the daemon's effective tier + per-operation policy. Empty when
+    /// the daemon didn't answer (old/unreachable) — the section is then omitted.
+    fn policy_panel(&self) -> Vec<Line<'static>> {
+        let Some(p) = &self.policy else {
+            return Vec::new();
+        };
+        let (tier_color, summary) = if p.secure {
+            (Color::Green, "login & sudo release your password by face; screen unlock just verifies")
+        } else {
+            (Color::Yellow, "screen unlock verifies by face; login & sudo fall back to your password")
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "What face auth does on this machine:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::raw("  tier   "),
+                Span::styled(
+                    p.tier.clone(),
+                    Style::default().fg(tier_color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!("         {summary}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        if p.overridden {
+            lines.push(Line::from(Span::styled(
+                format!("         forced by policy.conf — hardware is {}", p.hardware_tier),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if !p.enrolled {
+            lines.push(Line::from(Span::styled(
+                "         no face enrolled yet — finish setup to activate".to_string(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        for op in &p.ops {
+            let color = match op.action.as_str() {
+                "unseal" => Color::Green,
+                "verify" => Color::Cyan,
+                _ => Color::DarkGray,
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<21}", op.operation)),
+                Span::styled(
+                    format!("{:<8}", op.action),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(op.effect.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        lines
+    }
+
     fn body_doctor(&self, frame: &mut Frame, area: Rect) {
         match &self.report {
             None => self.body_paragraph(frame, area, vec![Line::from("Probing host…")]),
@@ -1940,37 +2059,62 @@ impl App {
                 ],
             ),
             Some(Ok(report)) => {
-                // Lead with the detected-OS / setup-path panel, then the probe.
-                let mut items: Vec<ListItem> =
-                    self.os_setup_panel().into_iter().map(ListItem::new).collect();
-                items.push(ListItem::new(Line::from("")));
-                items.extend(report.checks.iter().map(|c| {
-                    let (sym, color) = match c.status {
-                        CapabilityStatus::Ok => ("[ OK ]", Color::Green),
-                        CapabilityStatus::Warn => ("[WARN]", Color::Yellow),
-                        CapabilityStatus::Missing => ("[FAIL]", Color::Red),
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(sym, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("  {:<20} {}", c.name, c.detail)),
-                    ]))
-                }));
-                let verdict = if !report.can_run() {
-                    Line::from("verdict: CANNOT RUN — a required capability is missing.".red().bold())
-                } else if report.degraded() {
-                    Line::from("verdict: READY (degraded) — see [WARN].".yellow())
-                } else {
-                    Line::from("verdict: READY.".green().bold())
-                };
-                items.push(ListItem::new(Line::from("")));
-                items.push(ListItem::new(verdict));
-                let list = List::new(items).block(
-                    surface()
-                        .title(" host capabilities (r: re-probe) ")
-                        .padding(Padding::symmetric(4, 1)),
-                );
-                frame.render_widget(list, area);
+                // The OS panel + checks + tier/policy + verdict exceed the fixed
+                // MAX_HEIGHT body budget, so render as a scrollable paragraph.
+                let para = Paragraph::new(self.doctor_lines(report))
+                    .scroll((self.doctor_scroll, 0))
+                    .block(
+                        surface()
+                            .title(" host capabilities (r: re-probe · ↑/↓ scroll) ")
+                            .padding(Padding::symmetric(4, 1)),
+                    );
+                frame.render_widget(para, area);
             }
+        }
+    }
+
+    /// All lines of the Host-check body: detected-OS/setup panel, the probe
+    /// checks, the tier/policy panel, and the verdict. Shared by the renderer and
+    /// the scroll clamp so they agree on the content height.
+    fn doctor_lines(&self, report: &CapabilityReport) -> Vec<Line<'static>> {
+        let mut lines = self.os_setup_panel();
+        lines.push(Line::from(""));
+        lines.extend(report.checks.iter().map(|c| {
+            let (sym, color) = match c.status {
+                CapabilityStatus::Ok => ("[ OK ]", Color::Green),
+                CapabilityStatus::Warn => ("[WARN]", Color::Yellow),
+                CapabilityStatus::Missing => ("[FAIL]", Color::Red),
+            };
+            Line::from(vec![
+                Span::styled(sym, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::raw(format!("  {:<20} {}", c.name, c.detail)),
+            ])
+        }));
+        // What face auth actually does here (tier + per-op policy).
+        let policy = self.policy_panel();
+        if !policy.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(policy);
+        }
+        let verdict = if !report.can_run() {
+            Line::from("verdict: CANNOT RUN — a required capability is missing.".red().bold())
+        } else if report.degraded() {
+            Line::from("verdict: READY (degraded) — see [WARN].".yellow())
+        } else {
+            Line::from("verdict: READY.".green().bold())
+        };
+        lines.push(Line::from(""));
+        lines.push(verdict);
+        lines
+    }
+
+    /// Largest valid `doctor_scroll` so the view can't run far past the content.
+    fn doctor_max_scroll(&self) -> u16 {
+        match &self.report {
+            Some(Ok(report)) => {
+                (self.doctor_lines(report).len() as u16).saturating_sub(DOCTOR_VISIBLE_ROWS)
+            }
+            _ => 0,
         }
     }
 
