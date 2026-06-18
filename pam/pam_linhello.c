@@ -19,6 +19,8 @@
 
 extern int  linhello_unseal_keyring(const char *user, uint8_t *buf, size_t len);
 extern int  linhello_verify_face(const char *user);
+extern int  linhello_authenticate(const char *user, const char *service,
+                                  uint8_t *buf, size_t len);
 extern int  linhello_reseal_password(const char *user, uint8_t *buf, size_t len);
 extern void linhello_zero_buf(uint8_t *buf, size_t len);
 
@@ -52,81 +54,81 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_AUTH_ERR;
     }
 
-    /* Unprivileged PAM stacks — KDE's kscreenlocker runs PAM as the session
-     * user (no root helper since Plasma 5.25). The daemon refuses to release
-     * the sealed password to a non-root peer (by design: a user-level process
-     * must never be able to extract the login password), and an in-session
-     * unlock doesn't need PAM_AUTHTOK anyway — the wallet/keyring is already
-     * open. Verify the face (same liveness-gated pipeline) and answer
-     * success/failure only. */
-    if (geteuid() != 0) {
-        time_t deadline = time(NULL) + wait_seconds(argc, argv);
-        for (;;) {
-            if (linhello_verify_face(user) == 0) {
-                pam_syslog(pamh, LOG_NOTICE,
-                           "face auth (verify-only, unprivileged) succeeded for user '%s'",
-                           user);
-                return PAM_SUCCESS;
+    /* The PAM service name selects the policy class in the daemon (live-session
+     * unlock vs greeter login vs sudo/elevation). Missing service → fail safe to
+     * the password. */
+    const char *service = NULL;
+    if (pam_get_item(pamh, PAM_SERVICE, (const void **)&service) != PAM_SUCCESS
+        || service == NULL) {
+        return PAM_IGNORE;
+    }
+
+    /* The daemon makes the verify-vs-unseal-vs-deny decision (tier + service +
+     * warm-session). We pass the service and react to the outcome. */
+    int waits = wait_seconds(argc, argv);
+    /* Interactive stacks relay PAM_TEXT_INFO to their UI (GDM via UserVerifier
+     * InfoQuery; sudo prints a line). The non-interactive parallel lockscreen
+     * stacks (kde-fingerprint, `wait`) don't, so skip the prompt there. */
+    if (waits == 0) {
+        pam_info(pamh, "Looking for your face…");
+    }
+    time_t deadline = time(NULL) + waits;
+
+    for (;;) {
+        uint8_t buf[512];
+        int n = linhello_authenticate(user, service, buf, sizeof(buf));
+
+        if (n > 0) {
+            /* Unseal: the buffer holds the unsealed login password. PAM_AUTHTOK
+             * must be a NUL-terminated string so pam_gnome_keyring `use_authtok`
+             * can unlock the login keyring. */
+            if ((size_t)n >= sizeof(buf)) {
+                pam_syslog(pamh, LOG_ERR,
+                           "unsealed secret too large for buffer for user '%s'", user);
+                linhello_zero_buf(buf, sizeof(buf));
+                return PAM_AUTH_ERR;
             }
-            if (time(NULL) >= deadline) {
-                break;
+            buf[n] = '\0';
+            int rc = pam_set_item(pamh, PAM_AUTHTOK, (const void *)buf);
+            linhello_zero_buf(buf, sizeof(buf));
+            if (rc != PAM_SUCCESS) {
+                pam_syslog(pamh, LOG_WARNING,
+                           "face matched but pam_set_item(PAM_AUTHTOK) failed for '%s'", user);
+                return PAM_AUTH_ERR;
             }
-            /* A capture+match round trip is ~1-2s; a short breather between
-             * rounds keeps the camera from being hammered for the window. */
-            struct timespec pause = { 0, 400 * 1000 * 1000 };
-            nanosleep(&pause, NULL);
+            pam_syslog(pamh, LOG_NOTICE,
+                       "face auth (unseal) succeeded for '%s' [%s]; PAM_AUTHTOK set",
+                       user, service);
+            return PAM_SUCCESS;
         }
-        pam_syslog(pamh, LOG_NOTICE,
-                   "face auth (verify-only, unprivileged) declined for user '%s'; "
-                   "deferring to next auth module",
-                   user);
-        return PAM_AUTH_ERR;
-    }
 
-    /* Interactive stacks relay PAM_TEXT_INFO to their UI (GDM surfaces it on
-     * the lock/login screen via UserVerifier InfoQuery; sudo prints a line) —
-     * same feedback channel pam_fprintd uses for "Place your finger…". */
-    pam_info(pamh, "Looking for your face…");
+        if (n == 0) {
+            /* Verify-only: a liveness-gated match with no secret released — the
+             * convenience-tier / in-session unlock path. The keyring is already
+             * open, so PAM_SUCCESS with no AUTHTOK unlocks the session. */
+            linhello_zero_buf(buf, sizeof(buf));
+            pam_syslog(pamh, LOG_NOTICE,
+                       "face auth (verify, no secret) succeeded for '%s' [%s]",
+                       user, service);
+            return PAM_SUCCESS;
+        }
 
-    uint8_t buf[512];
-    int n = linhello_unseal_keyring(user, buf, sizeof(buf));
-    if (n <= 0) {
-        /* Face verify / TPM unseal declined. The daemon journal (linhellod,
-         * "UnsealPassword: ...") carries the precise reason; here we just record
-         * that this login fell through to the next module. */
-        pam_syslog(pamh, LOG_NOTICE,
-                   "face auth declined for user '%s'; deferring to next auth module",
-                   user);
+        /* n < 0: declined this round (no match yet, policy deny, or daemon
+         * unreachable). The daemon journal ("Authenticate: ...") carries the
+         * precise reason. Retry until the deadline for the non-interactive
+         * `wait` stacks; otherwise fall through immediately. */
         linhello_zero_buf(buf, sizeof(buf));
-        return PAM_AUTH_ERR;
+        if (time(NULL) >= deadline) {
+            break;
+        }
+        struct timespec pause = { 0, 400 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
     }
 
-    /* PAM_AUTHTOK must be a NUL-terminated string */
-    if ((size_t)n >= sizeof(buf)) {
-        pam_syslog(pamh, LOG_ERR,
-                   "unsealed secret too large for buffer for user '%s'", user);
-        linhello_zero_buf(buf, sizeof(buf));
-        return PAM_AUTH_ERR;
-    }
-    buf[n] = '\0';
-
-    int rc = pam_set_item(pamh, PAM_AUTHTOK, (const void *)buf);
-    linhello_zero_buf(buf, sizeof(buf));
-
-    if (rc != PAM_SUCCESS) {
-        pam_syslog(pamh, LOG_WARNING,
-                   "face matched but pam_set_item(PAM_AUTHTOK) failed for user '%s'",
-                   user);
-        return PAM_AUTH_ERR;
-    }
-
-    /* Success: AUTHTOK now holds the unsealed login password so a downstream
-     * pam_gnome_keyring `use_authtok` can unlock the login keyring. This is the
-     * decisive "a face login happened in this transaction" line. */
     pam_syslog(pamh, LOG_NOTICE,
-               "face auth succeeded for user '%s'; PAM_AUTHTOK set for keyring unlock",
-               user);
-    return PAM_SUCCESS;
+               "face auth declined for '%s' [%s]; deferring to next auth module",
+               user, service);
+    return PAM_AUTH_ERR;
 }
 
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,

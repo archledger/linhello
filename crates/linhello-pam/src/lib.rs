@@ -72,6 +72,51 @@ pub unsafe extern "C" fn linhello_verify_face(user: *const libc::c_char) -> i32 
     }
 }
 
+/// Tiered-policy authentication (the entry point pam_linhello uses). Sends the
+/// PAM service name so the daemon can classify the operation, look up the
+/// hardware tier + warm-session state, and decide. Returns:
+///   * `n > 0` — unseal: `n` secret bytes written to `buf`; caller sets
+///               PAM_AUTHTOK (login / keyring unlock).
+///   * `0`     — verify: a liveness-gated match with **no** secret released;
+///               caller returns PAM_SUCCESS without AUTHTOK (live-session unlock).
+///   * `-1`    — denied or error; caller cascades to the password.
+///
+/// # Safety
+/// `user` and `service` must be NUL-terminated C strings. `buf` must point to at
+/// least `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn linhello_authenticate(
+    user: *const libc::c_char,
+    service: *const libc::c_char,
+    buf: *mut u8,
+    len: usize,
+) -> i32 {
+    if user.is_null() || service.is_null() || buf.is_null() || len == 0 {
+        return -1;
+    }
+    let user = match CStr::from_ptr(user).to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return -1,
+    };
+    let service = match CStr::from_ptr(service).to_str() {
+        Ok(s) => s.to_owned(),
+        _ => return -1,
+    };
+    let dst = slice::from_raw_parts_mut(buf, len);
+    match client::request(&Request::Authenticate { user, service }) {
+        Ok(Response::PasswordUnsealed { secret }) => {
+            let bytes = secret.expose();
+            if bytes.len() > dst.len() {
+                return -1;
+            }
+            dst[..bytes.len()].copy_from_slice(bytes);
+            bytes.len() as i32
+        }
+        Ok(Response::Verified { matched: true, .. }) => 0,
+        _ => -1,
+    }
+}
+
 /// Reseal `password` as the user's login password envelope. Called from the
 /// PAM `password` stack after the new token has been accepted by the upstream
 /// module, so the face-auth path stays in lockstep with the real password.

@@ -423,6 +423,19 @@ fn user_tier(user: &str) -> linhello_common::biopolicy::Tier {
     }
 }
 
+/// Effective tier after the `tier=auto|secure|convenience` config override in
+/// `policy.conf` (the design's `tier.mode`). `auto` (default) uses the enrolled
+/// hardware; `convenience` caps it down (useful for testing / a user who wants
+/// no face-driven credential release even with IR present).
+fn effective_tier(user: &str) -> linhello_common::biopolicy::Tier {
+    use linhello_common::biopolicy::Tier;
+    match linhello_common::config::read_kv("policy.conf", "tier").as_deref() {
+        Some("convenience") => Tier::Convenience,
+        Some("secure") => Tier::Secure,
+        _ => user_tier(user),
+    }
+}
+
 /// Whether `user` has a live (warm) logind session — i.e. a credential created a
 /// session this boot, so a screen-unlock need not release the credential again.
 /// Read from systemd's per-user state file on the *system* side (no session bus).
@@ -470,7 +483,7 @@ fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
     use linhello_common::biopolicy::{classify, decide, Action};
     let warm = session_warm(user);
     let class = classify(service, warm);
-    let tier = user_tier(user);
+    let tier = effective_tier(user);
     let mut action = decide(class, tier, &current_policy());
     // Defence in depth: the sealed password is only ever released to a root peer
     // (the existing UnsealPassword rule). A non-root peer that somehow lands on
