@@ -25,6 +25,23 @@ impl DeviceIdentity {
     /// Read identity for a v4l device (e.g. `/dev/video0`) by walking
     /// its sysfs ancestry up to the USB device node.
     pub fn from_device(device_path: &str) -> Option<Self> {
+        // Windows-Hello shared-USB cameras (e.g. NexiGo N930W) briefly USB-reset
+        // when their IR stream opens, transiently removing the sysfs node. A
+        // single failed read must NOT be read as "camera gone" (it would fail
+        // the binding check and decline auth), so retry a few times to ride out
+        // a re-enumeration before concluding the device is genuinely absent.
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if let Some(id) = Self::probe(device_path) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn probe(device_path: &str) -> Option<Self> {
         let node = Path::new(device_path).file_name()?.to_str()?;
         let sys = Path::new("/sys/class/video4linux").join(node);
         let name = read_trim(&sys.join("name"))?;
