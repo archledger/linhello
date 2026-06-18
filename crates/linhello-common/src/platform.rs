@@ -820,9 +820,10 @@ mod tests {
     #[test]
     fn dep_packages_and_install_command_are_per_family() {
         let onnx = DEPENDENCIES.iter().find(|d| d.need == "ONNX Runtime").unwrap();
-        assert_eq!(onnx.package(DistroFamily::Fedora), "onnxruntime");
-        assert_eq!(onnx.package(DistroFamily::Arch), "onnxruntime");
-        assert_eq!(onnx.package(DistroFamily::Debian), ""); // not packaged
+        assert_eq!(onnx.package(DistroFamily::Arch), "onnxruntime"); // in Arch repos
+        // Not in Fedora's or Debian's main repos — installed via `linhello fetch-onnx`.
+        assert_eq!(onnx.package(DistroFamily::Fedora), "");
+        assert_eq!(onnx.package(DistroFamily::Debian), "");
         // install_command joins names after the family prefix and drops empties.
         let cmd = install_command(&["onnxruntime", "", "tpm2-tss"]);
         // (depends on the running distro's prefix; just assert structure if Some)
