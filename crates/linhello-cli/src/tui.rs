@@ -24,7 +24,7 @@ use linhello_common::ipc::{
 use zeroize::Zeroize;
 use linhello_common::platform;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -43,10 +43,15 @@ const MAX_WIDTH: u16 = 90;
 /// Max content height, so the app floats centered with margin on tall screens
 /// instead of pinning to the top-left corner.
 const MAX_HEIGHT: u16 = 40;
-/// Approx. visible rows in the Host-check body (MAX_HEIGHT minus header/activity/
-/// footer and the surface border+padding). Used only to clamp scrolling so it
-/// can't run far past the content; an off-by-a-little here is harmless.
-const DOCTOR_VISIBLE_ROWS: u16 = 22;
+/// How many terminal rows a line of display-width `w` occupies once wrapped into
+/// `inner` columns (>=1). Used to size scrolling against wrapped content.
+fn wrapped_rows(w: u16, inner: u16) -> u16 {
+    if inner == 0 {
+        1
+    } else {
+        (w.max(1) + inner - 1) / inner
+    }
+}
 
 /// A rounded, hairline-bordered block — the base for every framed surface.
 fn surface() -> Block<'static> {
@@ -210,9 +215,20 @@ struct App {
     /// alongside the probe. `None` when unavailable (old/unreachable daemon) —
     /// the panel is simply omitted then.
     policy: Option<PolicyView>,
-    /// Vertical scroll offset for the Host-check body (it can exceed the fixed
-    /// MAX_HEIGHT budget once the tier/policy panel is included).
+    /// Vertical scroll offset (in wrapped rows) for the Host-check body — it can
+    /// exceed the fixed MAX_HEIGHT budget once the tier/policy panel is included.
     doctor_scroll: u16,
+    /// Last-rendered wrapped-row count / visible-row count of the Host-check
+    /// body, so ↑/↓ can clamp scrolling to the real (post-wrap) content height.
+    doctor_content_rows: std::cell::Cell<u16>,
+    doctor_view_rows: std::cell::Cell<u16>,
+    /// How many wrapped rows the Activity log is scrolled UP from the newest
+    /// (0 = following the latest). Lets the user review prior actions.
+    activity_scroll_up: u16,
+    /// Last-rendered wrapped-row / visible-row counts for the Activity panel, to
+    /// clamp `activity_scroll_up` to the real content height.
+    activity_content_rows: std::cell::Cell<u16>,
+    activity_view_rows: std::cell::Cell<u16>,
     cameras: Vec<CameraInfo>,
     cam_cursor: usize,
     sel_rgb: Option<String>,
@@ -273,6 +289,11 @@ impl App {
             screen: Screen::Welcome,
             policy: None,
             doctor_scroll: 0,
+            doctor_content_rows: std::cell::Cell::new(0),
+            doctor_view_rows: std::cell::Cell::new(0),
+            activity_scroll_up: 0,
+            activity_content_rows: std::cell::Cell::new(0),
+            activity_view_rows: std::cell::Cell::new(0),
             user,
             install: crate::install::InstallState::detect(),
             report: None,
@@ -313,6 +334,9 @@ impl App {
     fn log_activity(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.status = msg.clone();
+        // A new action snaps the log back to the newest line, so whatever just
+        // happened is always visible (the user can Shift+↑ to review history).
+        self.activity_scroll_up = 0;
         self.activity.push(msg);
         if self.activity.len() > ACTIVITY_MAX {
             let drop = self.activity.len() - ACTIVITY_MAX;
@@ -524,7 +548,34 @@ impl App {
         Ok(())
     }
 
-    fn on_key(&mut self, code: KeyCode) {
+    fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Activity-log scrollback is global (the panel shows on every screen):
+        // Shift+↑/↓ (and Shift+PgUp/PgDn) review prior actions without colliding
+        // with the per-screen ↑/↓ navigation.
+        if mods.contains(KeyModifiers::SHIFT) {
+            match code {
+                KeyCode::Up => {
+                    self.activity_scroll_up =
+                        (self.activity_scroll_up + 1).min(self.activity_max_scroll());
+                    return;
+                }
+                KeyCode::Down => {
+                    self.activity_scroll_up = self.activity_scroll_up.saturating_sub(1);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.activity_scroll_up =
+                        (self.activity_scroll_up + 5).min(self.activity_max_scroll());
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.activity_scroll_up = self.activity_scroll_up.saturating_sub(5);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Uninstall is a modal side-screen with its own keys (Esc leaves it);
         // wizard navigation does not apply there.
         if self.screen == Screen::Uninstall {
@@ -1156,7 +1207,21 @@ impl App {
         // On screens backed by a daemon round-trip or external state, keep those
         // live too while the user is looking at them (not just on first entry).
         match self.screen {
-            Screen::Doctor => self.refresh_probe(),
+            Screen::Doctor => {
+                // Note a hardware-readiness transition (e.g. IR camera unplugged
+                // or reconnected) in the activity log — transparency for why face
+                // auth may start/stop falling back to the password.
+                let was_ready = self.policy.as_ref().map(|p| p.hardware_ready);
+                self.refresh_probe();
+                if let (Some(was), Some(p)) = (was_ready, self.policy.as_ref()) {
+                    if was && !p.hardware_ready && !p.hardware_note.is_empty() {
+                        let note = p.hardware_note.clone();
+                        self.log_activity(note);
+                    } else if !was && p.hardware_ready {
+                        self.log_activity("IR camera reconnected — secure tier fully active again");
+                    }
+                }
+            }
             Screen::Profiles => self.refresh_profiles(),
             Screen::Pam => self.pam = crate::pamwire::status(),
             _ => {}
@@ -1372,7 +1437,7 @@ impl App {
         }
 
         // Row 1 — universal navigation, identical on every step.
-        let nav = Line::from(vec![
+        let mut nav_spans = vec![
             key("←"),
             dim(" back    "),
             key("→"),
@@ -1385,7 +1450,14 @@ impl App {
             dim(" confirm    "),
             key("q"),
             dim(" quit"),
-        ]);
+        ];
+        // Surface the activity scrollback only once there's history off-screen.
+        if self.activity_max_scroll() > 0 {
+            nav_spans.push(dim("    "));
+            nav_spans.push(key("⇧↑/↓"));
+            nav_spans.push(dim(" activity log"));
+        }
+        let nav = Line::from(nav_spans);
 
         // Row 2 — what THIS step lets you do.
         let hints = self.key_hints();
@@ -1467,13 +1539,8 @@ impl App {
     /// software makes to the system, so the user can always see what is being
     /// done to their machine. Shows the most recent entries (newest last).
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
-        let title =
-            " ● Activity — what LinuxHello is doing to your system (newest last) ".to_string();
-        let block = surface()
-            .title(title)
-            .border_style(Style::default().fg(Color::Blue))
-            .padding(Padding::horizontal(2));
-        let inner_rows = area.height.saturating_sub(2) as usize;
+        // Build the full log as wrapped lines, then scroll within it so the user
+        // can Shift+↑/↓ back through prior actions (default follows the newest).
         let lines: Vec<Line> = if self.activity.is_empty() {
             vec![Line::from(
                 "Nothing changed yet. Any file the software touches will be listed here."
@@ -1481,8 +1548,7 @@ impl App {
                     .italic(),
             )]
         } else {
-            let shown = self.activity.len().min(inner_rows.max(1));
-            self.activity[self.activity.len() - shown..]
+            self.activity
                 .iter()
                 .map(|m| {
                     Line::from(vec![
@@ -1492,7 +1558,35 @@ impl App {
                 })
                 .collect()
         };
-        let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+
+        let inner_w = area.width.saturating_sub(2 + 4); // borders + horizontal(2)
+        let view_rows = area.height.saturating_sub(2); // borders only
+        let content_rows: u16 = lines
+            .iter()
+            .map(|l| wrapped_rows(l.width() as u16, inner_w))
+            .sum();
+        self.activity_content_rows.set(content_rows);
+        self.activity_view_rows.set(view_rows);
+
+        let max_scroll = content_rows.saturating_sub(view_rows);
+        let up = self.activity_scroll_up.min(max_scroll);
+        let offset = max_scroll - up; // wrapped-row offset from the top
+
+        // Title hint: show scroll affordance only when there's history off-screen.
+        let title = if max_scroll > 0 {
+            let pos = if up == 0 { "newest" } else { "↑ history" };
+            format!(" ● Activity — what LinuxHello is doing (Shift+↑/↓ scroll · {pos}) ")
+        } else {
+            " ● Activity — what LinuxHello is doing to your system (newest last) ".to_string()
+        };
+        let block = surface()
+            .title(title)
+            .border_style(Style::default().fg(Color::Blue))
+            .padding(Padding::horizontal(2));
+        let p = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0));
         frame.render_widget(p, area);
     }
 
@@ -2086,8 +2180,21 @@ impl App {
             ),
             Some(Ok(report)) => {
                 // The OS panel + checks + tier/policy + verdict exceed the fixed
-                // MAX_HEIGHT body budget, so render as a scrollable paragraph.
-                let para = Paragraph::new(self.doctor_lines(report))
+                // MAX_HEIGHT body budget, so render as a scrollable paragraph that
+                // wraps (no truncated lines). Record the wrapped-row geometry so
+                // ↑/↓ can clamp to the real content height (scroll is in wrapped
+                // rows, matching ratatui's post-wrap offset).
+                let lines = self.doctor_lines(report);
+                let inner_w = area.width.saturating_sub(2 + 8); // borders + symmetric(4,_)
+                let view_rows = area.height.saturating_sub(2 + 2); // borders + symmetric(_,1)
+                let content_rows: u16 = lines
+                    .iter()
+                    .map(|l| wrapped_rows(l.width() as u16, inner_w))
+                    .sum();
+                self.doctor_content_rows.set(content_rows);
+                self.doctor_view_rows.set(view_rows);
+                let para = Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
                     .scroll((self.doctor_scroll, 0))
                     .block(
                         surface()
@@ -2135,14 +2242,20 @@ impl App {
         lines
     }
 
-    /// Largest valid `doctor_scroll` so the view can't run far past the content.
+    /// Largest valid `doctor_scroll`, from the wrapped-row geometry recorded at
+    /// the last render (so it accounts for line wrapping, not just line count).
     fn doctor_max_scroll(&self) -> u16 {
-        match &self.report {
-            Some(Ok(report)) => {
-                (self.doctor_lines(report).len() as u16).saturating_sub(DOCTOR_VISIBLE_ROWS)
-            }
-            _ => 0,
-        }
+        self.doctor_content_rows
+            .get()
+            .saturating_sub(self.doctor_view_rows.get())
+    }
+
+    /// Largest valid `activity_scroll_up`, from the wrapped-row geometry recorded
+    /// at the last Activity render.
+    fn activity_max_scroll(&self) -> u16 {
+        self.activity_content_rows
+            .get()
+            .saturating_sub(self.activity_view_rows.get())
     }
 
     fn body_cameras(&self, frame: &mut Frame, area: Rect) {
@@ -2490,7 +2603,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    app.on_key(key.code);
+                    app.on_key(key.code, key.modifiers);
                 }
             }
         }
