@@ -89,8 +89,9 @@ Tune or disable:
 # Loosen the threshold (easier to pass; more spoofs slip through):
 export LINHELLO_SPOOF_THRESHOLD=0.7
 
-# Fail-closed if the model is missing (production):
-export LINHELLO_REQUIRE_ANTISPOOF=1
+# Anti-spoof is REQUIRED by default (fail-closed). To allow running WITHOUT the
+# model — not recommended — explicitly opt out:
+export LINHELLO_REQUIRE_ANTISPOOF=0
 
 # Inspect raw scores on the current camera:
 linhello liveness-test

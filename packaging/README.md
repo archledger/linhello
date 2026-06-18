@@ -75,9 +75,10 @@ release needs the **public key shipped in the repo** and a **signed tag**:
    `TRUSTED_SIGNER_FINGERPRINT`.) The packages install it to
    `/etc/linhello/trusted-signer.asc`; without it `update` cannot verify.
 
-2. Per release — bump `version` in `Cargo.toml` and `packaging/fedora/linhello.spec`
-   (and the changelogs), commit, then create and **GPG-sign** the tag on the box
-   that holds the key:
+2. Per release — bump the version everywhere it's pinned: `Cargo.toml`
+   (workspace), `Makefile` `DIST_VERSION`, `packaging/arch/PKGBUILD` `pkgver`, and
+   `packaging/fedora/linhello.spec` (plus the spec changelog). Commit, then create
+   and **GPG-sign** the tag on the box that holds the key:
 
    ```sh
    git tag -s v0.2.0 -m 'linhello 0.2.0'
@@ -88,5 +89,6 @@ release needs the **public key shipped in the repo** and a **signed tag**:
    key, builds the package, and attaches it to the GitHub Release. CI never
    signs — signing stays on the maintainer's machine.
 
-Keep the tag version, `Cargo.toml`/spec version, and changelog in lockstep.
+Keep the tag and every pinned version (`Cargo.toml`, `Makefile` `DIST_VERSION`,
+PKGBUILD `pkgver`, spec) plus the changelog in lockstep.
 
