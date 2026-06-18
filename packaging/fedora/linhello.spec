@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -141,6 +141,19 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Wed Jun 17 2026 archledger <archledger236@gmail.com> - 0.3.0-1
+- Hardware-adaptive tiered biometric policy: Secure tier (RGB + working IR)
+  unseals the TPM password for login/sudo/polkit; Convenience tier (RGB-only)
+  verifies for live-session screen unlock but never unseals credentials.
+- Daemon-centralised verify/unseal/deny decision (classify service + tier +
+  warm logind session), replacing the PAM euid heuristic.
+- Pre-flight auth-intent so the "Looking for your face..." prompt only shows
+  when the camera will actually engage.
+- Honor cameras.conf across reboots (canonicalize symlink device paths,
+  readable-config warning).
+- SELinux: linhellod_t reads logind warm-session state and Secure Boot state
+  (efivarfs); device-probe retry to ride out Windows-Hello USB resets.
+
 * Tue Jun 16 2026 archledger <archledger236@gmail.com> - 0.2.0-1
 - Fedora port milestone: confined daemon SELinux domain (linhellod_t,
   runtime-validated), per-distro reseal trigger, sysusers group, dependency
