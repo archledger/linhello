@@ -586,10 +586,33 @@ fn do_auth_intent(user: &str, service: &str, peer_is_root: bool) -> Response {
 /// warm-independent and we report it directly by class.
 fn do_policy_status(user: &str) -> Response {
     use linhello_common::biopolicy::{decide, Action, OperationClass, Tier};
+    let binding = enrolled_binding(user);
     let hardware = user_tier(user);
     let tier = effective_tier(user);
     let policy = current_policy();
-    let enrolled = enrolled_binding(user).is_some();
+    let enrolled = binding.is_some();
+
+    // Live hardware readiness: for a Secure-enrolled user, is an IR sensor
+    // present right now? Uses a FRESH enumeration (not the OnceLock-cached
+    // ir_device()), so doctor/TUI track both unplug AND replug live without a
+    // daemon restart. The tier itself never downgrades — losing the IR camera
+    // fails secure ops closed to the password, it does not drop to Convenience.
+    let (hardware_ready, hardware_note) = match &binding {
+        Some(b) if b.ir.is_some() => {
+            let ir_present = linhello_biometrics::camera::enumerate()
+                .into_iter()
+                .any(|c| c.kind == linhello_biometrics::camera::CameraKind::Ir);
+            if ir_present {
+                (true, String::new())
+            } else {
+                (
+                    false,
+                    "IR camera not detected — login & sudo fall back to your password until it's reconnected".to_string(),
+                )
+            }
+        }
+        _ => (true, String::new()),
+    };
 
     let row = |operation: &str, class: OperationClass| {
         let (action, effect) = match decide(class, tier, &policy) {
@@ -624,6 +647,8 @@ fn do_policy_status(user: &str) -> Response {
         hardware_tier: hardware.as_str().to_string(),
         overridden: tier != hardware,
         enrolled,
+        hardware_ready,
+        hardware_note,
         ops,
     }
 }

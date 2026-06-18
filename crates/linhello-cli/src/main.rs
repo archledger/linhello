@@ -527,13 +527,19 @@ fn print_policy_status() {
         hardware_tier,
         overridden,
         enrolled,
+        hardware_ready,
+        hardware_note,
         ops,
     }) = send(Request::PolicyStatus { user })
     else {
         return;
     };
-    let tag = if secure { "[ OK ]" } else { "[WARN]" };
+    // A Secure tier whose IR camera is currently missing is degraded right now.
+    let tag = if secure && hardware_ready { "[ OK ]" } else { "[WARN]" };
     println!("{tag} {:<20} {}", "Biometric tier", tier);
+    if !hardware_ready && !hardware_note.is_empty() {
+        println!("       {:<20} ⚠ {hardware_note}", "");
+    }
     if overridden {
         println!("       {:<20} forced by policy.conf — hardware is {hardware_tier}", "");
     }

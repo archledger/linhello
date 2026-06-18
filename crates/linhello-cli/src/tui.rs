@@ -193,6 +193,8 @@ struct PolicyView {
     overridden: bool,
     hardware_tier: String,
     enrolled: bool,
+    hardware_ready: bool,
+    hardware_note: String,
     ops: Vec<OperationPolicy>,
 }
 
@@ -486,6 +488,8 @@ impl App {
                 hardware_tier,
                 overridden,
                 enrolled,
+                hardware_ready,
+                hardware_note,
                 ops,
             }) => Some(PolicyView {
                 tier,
@@ -493,6 +497,8 @@ impl App {
                 overridden,
                 hardware_tier,
                 enrolled,
+                hardware_ready,
+                hardware_note,
                 ops,
             }),
             _ => None,
@@ -1990,10 +1996,17 @@ impl App {
         let Some(p) = &self.policy else {
             return Vec::new();
         };
-        let (tier_color, summary) = if p.secure {
-            (Color::Green, "login & sudo release your password by face; screen unlock just verifies")
+        let summary = if p.secure {
+            "login & sudo release your password by face; screen unlock just verifies"
         } else {
-            (Color::Yellow, "screen unlock verifies by face; login & sudo fall back to your password")
+            "screen unlock verifies by face; login & sudo fall back to your password"
+        };
+        // A Secure tier whose IR camera is missing right now is degraded: keep the
+        // tier label but colour it as a warning and explain the live fallback.
+        let tier_color = if p.secure && p.hardware_ready {
+            Color::Green
+        } else {
+            Color::Yellow
         };
         let mut lines = vec![
             Line::from(Span::styled(
@@ -2012,6 +2025,12 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             )),
         ];
+        if !p.hardware_ready && !p.hardware_note.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("         ⚠ {}", p.hardware_note),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+        }
         if p.overridden {
             lines.push(Line::from(Span::styled(
                 format!("         forced by policy.conf — hardware is {}", p.hardware_tier),

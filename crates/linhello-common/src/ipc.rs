@@ -14,6 +14,12 @@ fn default_threshold() -> f32 {
     0.60
 }
 
+/// Default for `PolicyStatus.hardware_ready` when decoding from an older daemon
+/// that didn't send it — assume ready (no spurious warning).
+fn ready_default() -> bool {
+    true
+}
+
 /// A byte buffer carrying a secret (login password / unsealed keyring secret)
 /// across the wire. Serializes identically to `Vec<u8>` (a JSON array of
 /// integers), but the in-memory buffer is wiped on drop and its `Debug` is
@@ -367,6 +373,17 @@ pub enum Response {
         overridden: bool,
         /// Whether `user` has an enrolled camera binding at all.
         enrolled: bool,
+        /// Live check: the currently-present cameras still satisfy the enrolled
+        /// binding (for a Secure-tier user, the IR camera is present and matches).
+        /// `false` means secure operations will fail closed to the password right
+        /// now — the tier itself does NOT downgrade. Defaults true for older
+        /// daemons that don't report it.
+        #[serde(default = "ready_default")]
+        hardware_ready: bool,
+        /// Human explanation when `hardware_ready` is false (e.g. "IR camera not
+        /// detected …"); empty when ready.
+        #[serde(default)]
+        hardware_note: String,
         /// Per-operation rows (screen unlock, login, elevation, remote, unknown).
         ops: Vec<OperationPolicy>,
     },
