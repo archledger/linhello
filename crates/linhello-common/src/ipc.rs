@@ -98,6 +98,12 @@ pub enum Request {
     /// prompt is shown and PAM falls straight through to the password — no camera
     /// is ever lit. Cheap and side-effect-free.
     AuthIntent { user: String, service: String },
+    /// Report the effective biometric tier and the per-operation policy for
+    /// `user` (what face auth will do for screen-unlock / login / sudo / etc.),
+    /// without capturing or touching the camera/TPM. Pure status, so `doctor`
+    /// and the TUI can surface exactly what the daemon will do — no drift from
+    /// the real decision path. Gated like [`Request::AuthIntent`] (own uid/root).
+    PolicyStatus { user: String },
     /// Report envelope presence, PCR drift, and TPM reachability without
     /// attempting a full unseal.
     Diagnose,
@@ -144,6 +150,18 @@ pub struct ProfileInfo {
     /// A sealed login-password envelope exists (so this profile can unlock a
     /// keyring on login).
     pub has_password: bool,
+}
+
+/// One operation class and the action the daemon would take for it under the
+/// current tier + policy, as reported by [`Request::PolicyStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationPolicy {
+    /// Human label for the operation ("Screen unlock", "Login (greeter)", …).
+    pub operation: String,
+    /// The action: `"verify"` | `"unseal"` | `"deny"`.
+    pub action: String,
+    /// One-line plain-English meaning of that action for this operation.
+    pub effect: String,
 }
 
 /// One scored candidate in an [`Request::Identify`] result, best first.
@@ -333,6 +351,24 @@ pub enum Response {
     AuthPlan {
         engage: bool,
         action: String,
+    },
+    /// Result of [`Request::PolicyStatus`]: the effective tier and per-operation
+    /// policy the daemon would apply right now.
+    PolicyStatus {
+        /// Effective tier label, e.g. `"secure (RGB + active IR)"` /
+        /// `"convenience (RGB only)"`.
+        tier: String,
+        /// True when the effective tier is Secure (may unseal credentials).
+        secure: bool,
+        /// Hardware tier from the enrolled camera binding, before any
+        /// `policy.conf` `tier=` override.
+        hardware_tier: String,
+        /// The effective tier was forced by `policy.conf` (differs from hardware).
+        overridden: bool,
+        /// Whether `user` has an enrolled camera binding at all.
+        enrolled: bool,
+        /// Per-operation rows (screen unlock, login, elevation, remote, unknown).
+        ops: Vec<OperationPolicy>,
     },
     Error {
         message: String,

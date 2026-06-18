@@ -146,6 +146,38 @@ fn privileged_op_from_non_root_is_forbidden() {
 }
 
 #[test]
+fn policy_status_returns_wire_shape() {
+    // PolicyStatus for our own account (own uid) is permitted and reads no
+    // hardware. Verify the wire shape and that every per-op row carries a
+    // recognized action. (Unenrolled in the test env → Convenience tier, but we
+    // assert structure, not the specific tier, to stay hardware-independent.)
+    let user = match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
+        Ok(u) if !u.is_empty() && u != "root" => u,
+        _ => return, // can't determine a non-root username here; skip
+    };
+    let d = Daemon::spawn();
+    match d.request(&Request::PolicyStatus { user }) {
+        Response::PolicyStatus { ops, .. } => {
+            assert_eq!(ops.len(), 5, "expected five operation rows, got {}", ops.len());
+            assert!(
+                ops.iter().any(|o| o.operation.contains("Screen unlock")),
+                "missing the screen-unlock row"
+            );
+            for o in &ops {
+                assert!(
+                    matches!(o.action.as_str(), "verify" | "unseal" | "deny"),
+                    "unexpected action {:?} for {:?}",
+                    o.action,
+                    o.operation
+                );
+                assert!(!o.effect.is_empty(), "empty effect for {:?}", o.operation);
+            }
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
 fn diagnose_returns_wire_shape() {
     // We don't control /etc/linhello state from a unit test, so just verify
     // the wire shape: Diagnose must return a `Diagnosed {..}` (never an

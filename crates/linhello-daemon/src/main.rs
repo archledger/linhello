@@ -251,6 +251,19 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        Request::PolicyStatus { user } => {
+            // Pure policy read (no capture, no secret) — same own-uid/root gate
+            // as AuthIntent so it can't leak another user's tier/enrollment.
+            if !users::peer_may_act_as(peer_uid, &user) {
+                return forbidden("policy_status");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            task::spawn_blocking(move || do_policy_status(&user))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
         Request::Probe => task::spawn_blocking(|| Response::Capabilities {
             report: capabilities::probe(),
@@ -563,6 +576,55 @@ fn do_auth_intent(user: &str, service: &str, peer_is_root: bool) -> Response {
     Response::AuthPlan {
         engage: action != Action::Deny,
         action: label.to_string(),
+    }
+}
+
+/// Report the effective tier + per-operation policy for `user` (read-only). Runs
+/// the same `decide()` the auth path uses, per operation class, so `doctor`/TUI
+/// surface exactly what real auth would do. `warm` only affects how a *service*
+/// maps to a class (`classify`), not the class→action decision, so the matrix is
+/// warm-independent and we report it directly by class.
+fn do_policy_status(user: &str) -> Response {
+    use linhello_common::biopolicy::{decide, Action, OperationClass, Tier};
+    let hardware = user_tier(user);
+    let tier = effective_tier(user);
+    let policy = current_policy();
+    let enrolled = enrolled_binding(user).is_some();
+
+    let row = |operation: &str, class: OperationClass| {
+        let (action, effect) = match decide(class, tier, &policy) {
+            Action::Verify => (
+                "verify",
+                "match only — unlocks the live session, no credential released",
+            ),
+            Action::Unseal => (
+                "unseal",
+                "match + IR liveness — releases your password to log in / elevate",
+            ),
+            Action::Deny => ("deny", "face not used — falls back to your password"),
+        };
+        linhello_common::ipc::OperationPolicy {
+            operation: operation.to_string(),
+            action: action.to_string(),
+            effect: effect.to_string(),
+        }
+    };
+
+    let ops = vec![
+        row("Screen unlock", OperationClass::ScreenUnlock),
+        row("Login (greeter)", OperationClass::Login),
+        row("sudo / su / polkit", OperationClass::Elevation),
+        row("ssh / remote", OperationClass::Remote),
+        row("unknown service", OperationClass::Unknown),
+    ];
+
+    Response::PolicyStatus {
+        tier: tier.as_str().to_string(),
+        secure: tier == Tier::Secure,
+        hardware_tier: hardware.as_str().to_string(),
+        overridden: tier != hardware,
+        enrolled,
+        ops,
     }
 }
 

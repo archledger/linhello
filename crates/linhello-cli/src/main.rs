@@ -514,6 +514,37 @@ fn print_capability_report(report: &CapabilityReport) {
     }
 }
 
+/// Ask the daemon for the effective tier + per-operation policy and print it, so
+/// `doctor` shows what face auth actually does on this machine (sourced from the
+/// daemon, so it can't drift from the real decision path). Best-effort: if the
+/// daemon is unreachable or too old to answer, print nothing — the capability
+/// report already covers hardware, and this must never fail `doctor`.
+fn print_policy_status() {
+    let Ok(user) = current_user() else { return };
+    let Ok(Response::PolicyStatus {
+        tier,
+        secure,
+        hardware_tier,
+        overridden,
+        enrolled,
+        ops,
+    }) = send(Request::PolicyStatus { user })
+    else {
+        return;
+    };
+    let tag = if secure { "[ OK ]" } else { "[WARN]" };
+    println!("{tag} {:<20} {}", "Biometric tier", tier);
+    if overridden {
+        println!("       {:<20} forced by policy.conf — hardware is {hardware_tier}", "");
+    }
+    if !enrolled {
+        println!("       {:<20} no face enrolled yet — run `linhello setup`", "");
+    }
+    for op in ops {
+        println!("       · {:<19}{:<8}{}", op.operation, op.action, op.effect);
+    }
+}
+
 /// Guided face capture: prints instructions and captures `samples` frames,
 /// each a `Request::Enroll`. `reset` wipes prior samples on the first
 /// *successful* capture so a no-face miss doesn't leave the model half-cleared.
@@ -1177,6 +1208,7 @@ fn main() -> Result<()> {
         Cmd::Doctor => match send(Request::Probe)? {
             Response::Capabilities { report } => {
                 print_capability_report(&report);
+                print_policy_status();
                 println!();
                 if !report.can_run() {
                     println!("verdict: CANNOT RUN — a required capability is missing (see [FAIL]).");
