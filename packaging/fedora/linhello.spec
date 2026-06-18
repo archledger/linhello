@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -148,6 +148,13 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.1-1
+- Fedora install polish: %post now enables + starts the daemon (so `linhello
+  doctor` works immediately); new `linhello fetch-onnx` installs the matching
+  ONNX Runtime where it isn't packaged; `linhello deps` routes ONNX to fetch-onnx
+  instead of a non-existent Fedora package; fetch-models reliably restarts the
+  daemon. Groundwork for the Fedora COPR (native dnf install/update with deps).
+
 * Wed Jun 17 2026 archledger <archledger236@gmail.com> - 0.3.0-1
 - Hardware-adaptive tiered biometric policy: Secure tier (RGB + working IR)
   unseals the TPM password for login/sudo/polkit; Convenience tier (RGB-only)
