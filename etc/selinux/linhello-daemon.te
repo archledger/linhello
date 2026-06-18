@@ -96,6 +96,14 @@ miscfiles_read_localization(linhellod_t)
 # "none").
 selinux_get_enforce_mode(linhellod_t)
 
+# Read the Secure Boot state from efivarfs (/sys/firmware/efi/efivars/SecureBoot-*)
+# so the daemon can pick the right TPM binding tier (PCR-7 trust vs. weakest-tier
+# fallback) and `doctor` reports Secure Boot honestly. read_files_pattern grants
+# the dir search (the AVC seen at startup) plus the file read for when the
+# SecureBoot variable is actually read. Without this the daemon is denied under
+# enforcing and silently treats Secure Boot as absent.
+fs_read_efivarfs_files(linhellod_t)
+
 # Read the per-user logind state (/run/systemd/users/<uid>) to distinguish a
 # warm live-session unlock from a cold greeter login (the tiered-auth policy's
 # warm-session signal). The traversal is /run (var_run_t) -> /run/systemd
