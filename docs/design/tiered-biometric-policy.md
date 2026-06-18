@@ -221,34 +221,30 @@ actually trust least. Apply **only** to RGB `Verify` (IR path already stronger):
 No rPPG (defeated by video), no depth-from-motion per-unlock (friction; weak), no
 recognition-stack swap (buffalo_l/ArcFace already ≥ FaceNet).
 
-## 10. Configuration (`/etc/linhello/policy.toml`, hot-reloaded)
+## 10. Configuration (`/etc/linhello/policy.conf`, `key=value`)
 
-```toml
-[tier]
-# Cap the tier regardless of hardware: "auto" | "convenience" | "off".
-mode = "auto"
+Matches the project's existing kv config style (`cameras.conf`, …), read via
+`config::read_kv`. Implemented in P0:
 
-[policy]                 # minimum modality per operation class
-screen_unlock = "rgb"    # rgb | ir | off   (rgb ⇒ verify-only, no unseal)
-login         = "ir"     # ir | off         (rgb can't unseal ⇒ password)
-sudo          = "ir"
-polkit        = "ir"
-ssh           = "off"    # never
-unknown       = "off"    # fail-safe deny
+```ini
+# Tier override (the design's tier.mode): auto | secure | convenience.
+# auto (default) = the enrolled hardware; convenience caps it down.
+tier=auto
 
-[warm]
-strong_reauth_after_hours   = 12   # 0 = only at boot
-strong_reauth_after_unlocks = 0    # 0 = unlimited
-require_strong_on_autologin = true
-
-[pad.rgb]                # convenience-tier hardening
-multi_frame_consensus = 3
-require_eyes_open      = true
-spoof_threshold       = 0.30       # stricter than IR
+# Minimum modality per operation class: off | rgb | ir.
+screen_unlock=rgb     # rgb ⇒ verify-only, never unseals
+login=ir              # rgb can't unseal anyway ⇒ password
+sudo=ir
+polkit=ir
+# ssh and unknown services are always denied (fail-safe; not tunable).
 ```
 
-Defaults are conservative: IR for everything that releases the credential or
-elevates; RGB only for live-session unlock; deny the unknown.
+Defaults (no file) are the conservative model: IR for everything that releases
+the credential or elevates; RGB only for live-session unlock; deny the unknown.
+
+P1 additions (not yet implemented): warm-reauth timeout / autologin guard, and
+the RGB PAD-hardening knobs (multi-frame consensus, eyes-open, RGB-specific spoof
+threshold).
 
 ## 11. `doctor` / honesty surfacing
 
