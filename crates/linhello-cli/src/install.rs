@@ -528,7 +528,11 @@ fn newest_built(dir: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
             if p.is_dir() && depth > 0 {
                 collect(&p, prefix, suffix, depth - 1, out);
             } else if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
-                if n.starts_with(prefix) && n.ends_with(suffix) {
+                // Never the installable: makepkg's `-debug` split, rpm's
+                // `-debuginfo`/`-debugsource`, deb's `-dbgsym`. These share the
+                // `linhello-` prefix but carry no binaries.
+                let is_debug = n.contains("-debug") || n.contains("-dbgsym");
+                if n.starts_with(prefix) && n.ends_with(suffix) && !is_debug {
                     out.push(p.clone());
                 }
             }

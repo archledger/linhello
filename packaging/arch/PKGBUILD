@@ -1,6 +1,6 @@
 # Maintainer: Ben <archledger236@gmail.com>
 pkgname=linhello
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="TPM-backed facial authentication and PAM keyring unlock for Linux"
 arch=('x86_64')
@@ -10,6 +10,9 @@ depends=('tpm2-tss' 'pam' 'v4l-utils' 'onnxruntime' 'gcc-libs' 'glibc')
 makedepends=('rust' 'cargo' 'clang')
 optdepends=('sbctl: secure-boot key enrollment via `linhello secureboot setup`')
 install=linhello.install
+# Release artifact: ship a single stripped package, no separate -debug split
+# (keeps `linhello package`/`update` from having to disambiguate two .pkg.tar.zst).
+options=('!debug')
 
 # Clean-chroot-compatible source: we consume a tarball that lives next to
 # this PKGBUILD. Produce it from the repo root with:
