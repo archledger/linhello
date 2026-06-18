@@ -78,6 +78,25 @@ Anti-spoofing rejects photos and virtual cameras. Kernel updates don't break it.
 The TTY console login is never touched, so there's always a way in. Details:
 [`docs/design/signed-pcr-policy.md`](docs/design/signed-pcr-policy.md).
 
+### Security tiers (what face auth is allowed to do)
+
+LinuxHello adapts to your camera, and `linhello doctor` shows exactly which tier
+you're on and what each operation does:
+
+- **Secure tier** — RGB **plus a working active-IR** camera. Face can log you in,
+  unlock your keyring, and authorize `sudo`/`polkit`, because IR liveness makes
+  spoofing hard. This is the Windows Hello-equivalent posture.
+- **Convenience tier** — RGB only (most laptops). Face **unlocks an already
+  open session** (screen unlock) but **never releases your password** — login and
+  `sudo` fall back to typing it. RGB-alone can't be trusted to release
+  credentials, so it structurally won't.
+
+Anything remote (ssh) or unrecognized is always declined → password. Tune the
+per-operation policy in `/etc/linhello/policy.conf` (keys `screen_unlock`,
+`login`, `sudo`, `polkit` = `off`|`rgb`|`ir`; `tier` = `auto`|`secure`|
+`convenience`); defaults are the safe ones above. Rationale and evidence:
+[`docs/design/tiered-biometric-policy.md`](docs/design/tiered-biometric-policy.md).
+
 ## 🆚 Compared to Howdy
 
 [Howdy](https://github.com/boltgolt/howdy) is the established, widely-packaged

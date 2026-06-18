@@ -543,6 +543,7 @@ fn print_policy_status() {
     for op in ops {
         println!("       · {:<19}{:<8}{}", op.operation, op.action, op.effect);
     }
+    println!("       · {:<19}{}", "configure", "/etc/linhello/policy.conf (keys: tier, screen_unlock, login, sudo, polkit)");
 }
 
 /// Guided face capture: prints instructions and captures `samples` frames,
