@@ -18,9 +18,17 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
 
 ## 🧰 What you need
 
-- A TPM 2.0 chip (most PCs since ~2016 — check: `ls /dev/tpm*`)
-- A webcam (a Windows Hello IR camera is a bonus, not required)
-- Arch Linux or Fedora (Debian/Ubuntu support is experimental)
+- **A TPM 2.0 chip — required** (it's what seals your secrets). Most PCs since
+  ~2016 have one; check with `ls /dev/tpm*`.
+- **A webcam.** A Windows Hello **IR** camera unlocks the headline features —
+  face **login, sudo, and keyring** — via the "secure" tier with active-IR
+  anti-spoofing. A plain **RGB-only** webcam still works, but only to unlock an
+  *already-logged-in* session (the "convenience" tier); face login/sudo then fall
+  back to your password.
+- **Secure Boot — recommended.** With it, your secrets are bound to your boot
+  state (the `Medium`/`Full` tiers); without it linhello still runs, but at its
+  weakest TPM tier (no boot-state binding).
+- **Arch Linux or Fedora.** Debian/Ubuntu support is experimental.
 
 ## ⚡ Install
 
@@ -134,8 +142,10 @@ enabled).
 ## 🔒 Security in one paragraph
 
 Face templates are encrypted (AES-256-GCM) with a key that only your TPM can
-release, and only when your machine's boot state (Secure Boot) is untampered.
-Anti-spoofing rejects photos and virtual cameras. Kernel updates don't break it.
+release — and, when Secure Boot is enabled, only while your boot state is
+untampered (the `Medium`/`Full` tiers; without Secure Boot the key is still
+TPM-sealed but not bound to boot state). Anti-spoofing rejects photos and virtual
+cameras. Kernel updates don't break it.
 The TTY console login is never touched, so there's always a way in. Details:
 [`docs/design/signed-pcr-policy.md`](docs/design/signed-pcr-policy.md).
 
