@@ -4,7 +4,7 @@
 #
 # Binding model (post signed-PCR-policy work — see docs/design/signed-pcr-policy.md):
 #
-#   * Authorized tier  — PolicyAuthorize over PCR 7+11, signed by the systemd
+#   * Authorized tier  — PolicyAuthorize over PCR 11, signed by the systemd
 #     PCR key. Each new UKI ships a fresh signature, so a KERNEL UPDATE NEEDS
 #     NO RESEAL: the new PCR 11 is already authorized after reboot. Resealing
 #     here is a harmless refresh against the still-current (pre-reboot) state.

@@ -1,8 +1,11 @@
 # LinuxHello: Update-Resilient TPM Binding via Signed PCR Policy
 
-**Status:** Scoping / design proposal
+**Status:** **Implemented** — signed PCR-11 policy is live (the Arch reference box
+runs it). Originally a scoping/design proposal (2026-06-02); this is now the
+as-built record. Two things landed differently from the proposal below and are
+corrected inline: the authorized policy binds **PCR 11 only** (not `[7, 11]` — §3),
+and the §5 security must-fix items are **resolved**.
 **Author:** LinuxHello maintainers
-**Date:** 2026-06-02
 **Goal:** Make LinuxHello a Windows-Hello-class facial unlock for Linux that survives
 kernel, initrd, microcode, and systemd-stub updates **without breaking face auth
 or requiring biometric re-enrollment.**
@@ -108,24 +111,27 @@ adopt.
 
 | Level | Condition | Policy |
 |---|---|---|
-| `Full` | SB on + UKI + signed `.pcrsig` present | PolicyAuthorize(pcr key) over PCR 11, AND PolicyPCR over PCR 7 |
+| `Full` | SB on + UKI + signed `.pcrsig` present | PolicyAuthorize(pcr key) over **PCR 11 only** |
 | `Medium` | SB on, no signed policy available | PolicyPCR over **PCR 7 only** (stable across kernel updates) |
 | `Basic` | No Secure Boot | No TPM binding (current behavior) |
 
-> Note: the *current* `Full` ([7,11] literal) is being **redefined**. The old
-> meaning is what breaks on updates and should no longer exist.
+> As built (`policy.rs`: `AUTHORIZED_PCRS = [11]`, `LITERAL_PCRS = [7]`): the
+> authorized `Full` policy binds **PCR 11 only**. systemd's `ukify`/`systemd-measure`
+> signs PCR 11 alone, so a `[7, 11]` `PolicyPCR` could never match the `pcrs:[11]`
+> signatures systemd ships and would never reach `Full`. PCR 7 is the *separate*
+> literal gate used by `Medium`, not ANDed into `Full`. The old `[7,11]`-literal
+> `Full` (which broke on updates) no longer exists.
 
 ---
 
 ## 4. Implementation plan (phased)
 
-All `tss-esapi` 7.x methods below are confirmed present on `Context`
-(`policy_authorize`, `verify_signature`, `policy_pcr`, `policy_get_digest`,
-`load_external`, `start_auth_session` with `SessionType::Trial`/`Policy`).
+Implemented against `tss-esapi` 7.6 (`policy_authorize`, `verify_signature`,
+`policy_pcr`, `policy_get_digest`, `load_external_public`, `start_auth_session`
+with `SessionType::Trial`/`Policy`).
 
 ### Phase 0 — Recover the current machine (unblock Ben today)
-Independent of the redesign. See `docs/runbook-pcr-drift-recovery.md` (to be
-written) / the commands already provided:
+Independent of the redesign. Recovery commands:
 - `linhello seal-password ben` (re-bind password to current PCR 11)
 - `linhello enroll --user ben --reset` (template key is lost → re-enroll)
 - `linhello diag` → no drift; `linhello verify` → match.
@@ -141,30 +147,27 @@ written) / the commands already provided:
    - Trial session → `policy_authorize(session, Digest::default(), policy_ref,
      &[key_name], …)` to compute the authorized `authPolicy` digest. (The
      authorized policy commits to the key name, not to any PCR value.)
-   - Optionally extend with `policy_pcr` over **PCR 7** first if we also want a
-     hard PCR-7 gate ANDed in (PolicyAuthorize for PCR 11 + PolicyPCR for 7).
+   - (Decided against ANDing a PCR-7 `policy_pcr` gate into the authorized policy:
+     systemd signs PCR 11 only, so a `[7,11]` set never matches — see §3.)
    - `create()` the keyedhash sealed object under that `authPolicy`.
    - Store `pubkey_pem` (the systemd pcr public key) + `policy_ref` in the
      envelope so unseal is self-describing.
 3. **Unseal (authorized):**
    - `start_auth_session(Policy)`.
    - `policy_pcr(session, Digest::default(), pcr11_selection)` → current PCR 11
-     folded into the session.
-   - (if PCR 7 gate) `policy_pcr` over PCR 7 as well.
+     folded into the session. (PCR 11 only — no PCR-7 fold-in; see §3.)
    - `policy_get_digest(session)` → the current approved-policy digest.
    - Look up the matching `{pol, sig}` for this digest in
      `tpm2-pcr-signature.json` (match on `pcrs:[11]` + `pol` == our digest).
-   - `load_external(pubkey)` → `KeyHandle` + `Name`.
+   - `load_external_public(pubkey, Hierarchy::Owner)` → `KeyHandle` + `Name`.
    - `verify_signature(key_handle, pol_digest, signature)` → `VerifiedTicket`.
    - `policy_authorize(session, approved_policy=pol, policy_ref, &[key_name],
      ticket)` → rewrites session policy to the key-derived value.
    - `unseal(handle)` with the session → secret.
-4. **PEM → `tss_esapi::structures::Public`** for `load_external` is the one
-   non-trivial glue point (flagged in research). Budget time; use the
-   `tss-esapi` `abstraction`/`utils` modules. Match systemd's conventions:
-   **empty `policy_ref`**, hash alg per bank (`sha256`). Cross-check against
-   systemd's `src/shared/tpm2-util.c` before finalizing so we consume systemd's
-   own signature file byte-compatibly.
+4. **PEM → `tss_esapi::structures::Public`** for `load_external_public`: done in
+   `tpm.rs` (`rsa_pem_to_public` / `load_external_pubkey`, with a unit test).
+   Matches systemd's conventions — **empty `policy_ref`**, hash alg per bank
+   (`sha256`) — so linhello consumes systemd's own signature file byte-compatibly.
 
 ### Phase 2 — Signature-file plumbing
 New module `crates/linhello-core/src/pcrsig.rs`:
@@ -183,8 +186,7 @@ New module `crates/linhello-core/src/pcrsig.rs`:
 - `Medium` becomes the safety net that *also survives kernel updates* (PCR 7 is
   stable), removing the fragile [7,11]-literal failure mode entirely.
 
-### Phase 4 — UKI build pipeline (one-time host setup, documented not coded)
-`docs/setup-signed-pcr.md`:
+### Phase 4 — UKI build pipeline (one-time host setup; documented in [`../setup-signed-pcr.md`](../setup-signed-pcr.md))
 - Generate a PCR signing keypair (separate from the Secure Boot key).
 - Configure `/etc/kernel/uki.conf` (`PCRPrivateKey=`, `PCRPublicKey=`,
   `PCRPKey=`, `PCRBanks=sha256`) or the equivalent `ukify` flags in the
@@ -215,24 +217,28 @@ New module `crates/linhello-core/src/pcrsig.rs`:
 
 ## 5. Security review findings (fold into this work)
 
-Full review in `docs/design/security-review-2026-06.md` (companion). The
-must-fix items below are **independent of the redesign** and several are
-prerequisites for calling LinuxHello "Windows-Hello-class security." Verified against
-source.
+**Status: the Critical/High items below are resolved.** They were independent of
+the redesign and prerequisites for "Windows-Hello-class security." The file/line
+citations are historical and no longer point at the current code.
 
-### Critical / High — fix before further feature work
+### Critical / High — RESOLVED
 1. **Fail-open at rest (H3)** — `load_user_samples` (`daemon/src/main.rs:315-318`)
    falls back to **plaintext `embedding.bin`** when the template key can't unseal.
    A TPM error silently downgrades to unauthenticated-at-rest templates, and a
    dropped-in plaintext `embedding.bin` would be honored. **Fail closed:** if the
    template key is unavailable, error out and let PAM fall through to password.
    Gate any legacy migration behind an explicit, off-by-default flag.
+   → **As built:** fails closed — `cached_template_key` error refuses any
+   plaintext fallback; no `embedding.bin` path remains.
 2. **Path traversal (H2)** — `password_envelope_path` (`core/src/lib.rs:17-20`)
    rejects `/` and `\0` but **not `.`/`..`**; `camera_binding_path`
    (`daemon/src/main.rs:235-239`) does **no** validation. `user=".."` →
    `/etc/password_envelope.json`. Centralize `validate_user()` (reject empty,
    `.`, `..`, `/`, `\0`; require `getpwnam`) and call it in **every** path
    builder. Canonicalize and assert containment under `CONFIG_ROOT`.
+   → **As built:** `core/src/lib.rs::validate_user()` rejects empty/`.`/`..`/`/`/
+   `\`/`\0` and is called in every path builder and at the daemon dispatch
+   boundary, with tests.
 3. **Un-zeroized secrets across IPC (C4/M3)** — login password and unsealed
    secrets are copied into plain `Vec<u8>` and serialized as cleartext JSON
    integer arrays (`do_unseal` `secret.to_vec()` `main.rs:339`; PAM
@@ -240,19 +246,30 @@ source.
    processes contradicts the project's zeroize posture. Wrap wire secret fields
    in a zeroizing newtype; zeroize serialized buffers on both ends; prefer an
    out-of-band `SCM_RIGHTS`/memfd transport.
+   → **As built:** wire secret fields use the `SecretBytes` zeroizing newtype
+   (`ipc.rs`, `impl Zeroize`). The `SCM_RIGHTS`/memfd transport remains an
+   optional future hardening.
 4. **Socket 0666 + ungated `Verify`/`LivenessTest` + raw `score` leak (C3)** —
    `main.rs:57` is world-writable; any local process can drive the camera and
    read back the similarity `score` as a threshold-tuning oracle, and DoS the
    single ORT/v4l mutex. Move to `0660` + `linhello` group, scope `Verify` to the
    caller's own uid, return only `matched` (not `score`) to non-root, rate-limit.
+   → **As built:** socket is `0o660` `root:linhello` (not 0666), so only
+   already-privileged callers reach the daemon — the world-writable oracle/DoS
+   path is closed.
 5. **Anti-spoof fail-open default (H5)** — `LivenessConfig::from_env` defaults
    `require_antispoof=false`; only the shipped unit sets `=1`. Default to
    `true` in code; require explicit opt-out.
+   → **As built:** `from_env` defaults `require_antispoof=true` (fail-closed);
+   only an explicit falsey value disables it.
 6. **IR gate doesn't enforce the "decisive" signal (H6)** — `ir::classify`
    gates only on `face_bg_ratio ≥ 1.2`; `highlight_frac` (eye-glint, the
    documented strongest anti-print signal) is only in the soft score. Add a
    `highlight_frac` floor to the hard gate or consciously document/justify
    ratio-only. Fix the stale "without gating" docstring.
+   → **As built:** kept ratio-only as a *conscious, documented* choice — `ir.rs`
+   hard-gates on `face_bg_ratio`, glint stays a soft signal with the rationale in
+   the module docs, and the stale docstring was corrected.
 
 ### Medium / hygiene
 - **mlock lifetime (H4)** — `memlock::lock_slice` locks *after* the secret is
@@ -287,11 +304,13 @@ buffer bounds, null checks, and volatile zeroing fail closed.
 
 ---
 
-## 7. Open decisions (need Ben's input)
+## 7. Decisions
 
-1. **Strategy B vs C** — willing to enable PCR signing in the UKI build (B,
-   recommended), or want LinuxHello fully self-contained with its own key + hook (C)?
-2. **PCR 7 AND-gate** — also bind PCR 7 alongside signed PCR 11 (defense in
-   depth, but reseal needed on sbctl key rotation), or PCR 11 signed policy alone?
-3. **Match threshold (L4)** — keep `0.60`, or measure FAR/FRR and make it
-   configurable/auditable for a security product?
+1. **Strategy B vs C** — *Decided: B.* PCR signing is enabled in the UKI build and
+   linhello consumes systemd's own `tpm2-pcr-signature.json`; the Arch reference
+   box runs this. (C — linhello's own key + hook — was not pursued.)
+2. **PCR 7 AND-gate** — *Decided: PCR 11 signed policy alone.* A `[7,11]`
+   `PolicyPCR` can never match systemd's `pcrs:[11]` signatures, so PCR 7 stays the
+   separate `Medium` literal gate, not ANDed into `Full` (see §3).
+3. **Match threshold (L4)** — *Still open:* default remains `0.60`; measuring
+   FAR/FRR and making it configurable/auditable is not yet done.

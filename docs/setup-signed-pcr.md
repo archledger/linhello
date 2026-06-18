@@ -39,11 +39,12 @@ sudo openssl rsa -pubout \
 
 > Security note: while the private key is on the local disk and root-readable,
 > an attacker with root (or who can mount the disk offline) could sign an
-> arbitrary PCR state. LinuxHello mitigates this by *also* binding **PCR 7** in the
-> authorized policy (`AUTHORIZED_PCRS = [7, 11]`): an offline/rogue-OS boot
-> changes PCR 7, so no signature for that state will match. For higher
-> assurance, keep the private key offline (sign UKIs on a separate machine) or
-> on a hardware token.
+> arbitrary PCR state. Note the authorized policy binds **PCR 11 only**
+> (`AUTHORIZED_PCRS = [11]`) — systemd's `ukify`/`systemd-measure` signs PCR 11
+> alone, so PCR 7 is **not** folded into the signed `Full` tier and does not
+> constrain a rogue signer here. (PCR 7 only gates the unsigned `Medium`/literal
+> fallback.) For real assurance, keep the private key offline (sign UKIs on a
+> separate machine) or on a hardware token.
 
 ## 3. Point kernel-install/ukify at the keys
 
@@ -110,10 +111,10 @@ value is already authorized.
 - `linhello-core::pcrsig` discovers `tpm2-pcr-signature.json` /
   `tpm2-pcr-public-key.pem` (search order `/etc/systemd`, `/run/systemd`,
   `/usr/lib/systemd`; override with `LINHELLO_PCR_SIGNATURE` / `LINHELLO_PCR_PUBKEY`).
-- `linhello-core::policy::plan()` selects `Authorized([7,11])` when Secure Boot is
+- `linhello-core::policy::plan()` selects `Authorized([11])` when Secure Boot is
   on, the boot mode is UKI, and both artifacts are present; otherwise it falls
   back to the stable `Literal([7])` tier.
-- At unseal, `tpm::unseal_authorized` replays `PolicyPCR(7,11)`, finds the
+- At unseal, `tpm::unseal_authorized` replays `PolicyPCR(11)`, finds the
   signature whose authorized policy matches the resulting digest, verifies it
   with `TPM2_VerifySignature`, and satisfies the object policy with
   `TPM2_PolicyAuthorize`.

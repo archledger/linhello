@@ -1,7 +1,9 @@
 # Tiered Biometric Policy (hardware-adaptive RGB / RGB+IR)
 
-Status: **design** (2026-06-17). Supersedes the binary `LINHELLO_REQUIRE_IR`
-behaviour. Rationale and evidence: [`rgb-liveness-research.md`](rgb-liveness-research.md).
+Status: **implemented** — shipped in v0.3.0 (originally scoped 2026-06-17 as a
+design proposal). This doc now describes the as-built system; the design rationale
+is preserved below. Supersedes the binary `LINHELLO_REQUIRE_IR` behaviour.
+Rationale and evidence: [`rgb-liveness-research.md`](rgb-liveness-research.md).
 
 ## 1. Problem & goals
 
@@ -140,19 +142,33 @@ never re-derived from whatever sensor happens to be present.
 
 ## 6. IPC protocol changes (`crates/linhello-common/src/ipc.rs`)
 
-Centralise policy in the daemon; the PAM module just passes context and reacts.
+Policy lives in the daemon; the PAM module just passes context and reacts. As
+shipped, `Authenticate` was **added alongside** the existing `Verify` / `Unseal` /
+`UnsealPassword` requests (those are retained; `Authenticate` routes to the same
+verify / unseal paths after the policy decision):
 
 ```rust
-// Replace Request::UnsealPassword { user } with:
-Request::Authenticate { user: String, service: String }   // service from pam_get_item(PAM_SERVICE)
+// Tiered PAM entry point (service from pam_get_item(PAM_SERVICE)):
+Request::Authenticate { user: String, service: String }
 
-// Response:
-Response::Unsealed { secret: SecretBytes }   // secure tier: set PAM_AUTHTOK, PAM_SUCCESS
-Response::Verified                            // convenience: PAM_SUCCESS, NO AUTHTOK
-Response::Denied { reason: String }           // PAM_IGNORE → cascade to password
+// Pre-flight: same classify → tier → decide, but no capture — so the PAM module
+// only prints "Looking for your face…" when the daemon would actually engage:
+Request::AuthIntent { user: String, service: String }
+    -> Response::AuthPlan { engage: bool, action }
+
+// Read-only tier/policy report that backs `doctor` and the TUI (§11):
+Request::PolicyStatus { user: String }
+    -> Response::PolicyStatus { tier, secure, hardware_tier, overridden,
+                                enrolled, hardware_ready, hardware_note, ops }
+
+// Authenticate resolves to one of:
+Response::PasswordUnsealed { secret: SecretBytes }  // secure tier: set PAM_AUTHTOK, PAM_SUCCESS
+Response::Verified { matched, score, threshold }    // convenience: PAM_SUCCESS, NO AUTHTOK
+Response::Error { message: String }                 // denial / any error → PAM_IGNORE → password
 ```
 
-(Keep `ResealUserEnvelopes`, `Probe`, etc. unchanged.)
+(`ResealUserEnvelopes`, `Probe`, etc. are unchanged. Note there is no
+`Response::Denied`; denials are `Response::Error`.)
 
 ## 7. Daemon policy engine (`crates/linhello-daemon`)
 
@@ -160,12 +176,13 @@ Response::Denied { reason: String }           // PAM_IGNORE → cascade to passw
 on Authenticate { user, service }:
     class  = classify(service)              // ScreenUnlock | Login | Elevation | Remote | Unknown
     tier   = hardware_tier()                // Secure | Convenience
-    warm   = logind_session_active(user) && within_reauth_window(user)
+    warm   = logind_session_active(user)    // STATE=active|online for the uid
+                                            // (the reauth-window AND is a future P1 add — §10)
     action = policy.decide(class, tier, warm)   // Verify | Unseal | Deny
     match action:
-      Deny           -> Denied{reason}            // never starts the camera/ML
-      Verify         -> capture+match+PAD (RGB-hardened); ok -> Verified else Denied
-      Unseal         -> require IR liveness; capture+match+IR; ok -> unseal -> Unsealed else Denied
+      Deny           -> Error{message}            // never starts the camera/ML
+      Verify         -> capture+match+PAD (RGB-hardened); ok -> Verified else Error
+      Unseal         -> require IR liveness; capture+match+IR; ok -> unseal -> PasswordUnsealed else Error
 ```
 
 `classify(service)` maps the per-distro service names linhello already enumerates
@@ -180,21 +197,20 @@ is only reachable from `Tier::Secure`.
 
 ## 8. PAM module (`pam/pam_linhello.c` + `crates/linhello-pam`)
 
-**Current state (the partial version P0 generalizes):** `pam_sm_authenticate`
-already splits the two modes — but by **euid**, not service/tier: a non-root
-caller (e.g. KDE kscreenlocker as the session user) calls `linhello_verify_face`
-(Verify, no AUTHTOK); a root caller (gdm-session-worker, sudo) calls
-`linhello_unseal_keyring` (UnsealPassword → AUTHTOK). This is a decent heuristic
-but (a) does no hardware-tier gating, and (b) on **GNOME the lock screen runs as
-root**, so today a screen-unlock *unseals the password* — exactly the
-Class-1-violating credential release §2 wants to stop. P0 moves the decision into
-the daemon, keyed on service + tier + warm:
+**As shipped, the decision moved into the daemon, keyed on service + tier + warm.**
+The prior behaviour this replaced split the two modes by **euid** in
+`pam_sm_authenticate`: a non-root caller (e.g. KDE kscreenlocker as the session
+user) ran Verify (no AUTHTOK); a root caller (gdm-session-worker, sudo) unsealed
+the password → AUTHTOK. That heuristic did no hardware-tier gating, and on
+**GNOME the lock screen runs as root**, so a screen-unlock would *unseal the
+password* — exactly the Class-1-violating credential release §2 stops. Now the
+PAM module passes `PAM_SERVICE` and the daemon decides:
 
 1. `pam_get_item(pamh, PAM_SERVICE, &svc)`; if missing → return `PAM_IGNORE`
-   (fail-safe to password). Include `svc` in `Authenticate`.
-2. On `Unsealed{secret}` → `pam_set_item(PAM_AUTHTOK)` + return `PAM_SUCCESS`.
+   (fail-safe to password). `svc` is sent in `Authenticate`.
+2. On `PasswordUnsealed{secret}` → `pam_set_item(PAM_AUTHTOK)` + return `PAM_SUCCESS`.
 3. On `Verified` → return `PAM_SUCCESS` (do **not** set AUTHTOK).
-4. On `Denied` / any error → return `PAM_IGNORE` so the stack cascades to
+4. On `Error` / any decline → return `PAM_IGNORE` so the stack cascades to
    `pam_unix` (password). Never `PAM_AUTH_ERR` (that would just be a logged
    failure; IGNORE is cleaner and the password is always the floor).
 

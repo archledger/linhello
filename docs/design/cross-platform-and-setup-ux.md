@@ -1,17 +1,23 @@
 # Cross-platform support & setup UX — design / roadmap
 
-Status: **design only, nothing implemented.** Scoped 2026-06-02. LinuxHello is
-currently built and tested only on Arch. This document plans four related
-efforts:
+Status: **largely implemented as of v0.3.2.** Originally scoped 2026-06-02 as
+design-only (Arch-only at the time); most of this roadmap has since shipped. The
+doc is retained for the design rationale, with inline corrections where the
+implementation diverged or moved ahead. Per-effort status:
 
-1. Run on **Debian/Ubuntu** and **Fedora/RHEL**, not just Arch.
-2. Work under both **systemd-boot** and **GRUB** (Secure Boot is required).
-3. A **setup TUI** to replace the linear `linhello setup` prompts.
-4. A **live camera-positioning guide** during enrollment.
+1. Run on **Debian/Ubuntu** and **Fedora/RHEL**, not just Arch — **Fedora done**
+   (COPR live), **Arch** packaged natively (`.pkg.tar.zst`); Debian/Ubuntu
+   packaging is authored but not yet build-tested.
+2. Work under both **systemd-boot** and **GRUB** (Secure Boot is required) — tier
+   detection is implemented; the main remaining item is the Secure-Boot
+   **key-enrollment** abstraction (§2.3 is still sbctl-only).
+3. A **setup TUI** to replace the linear `linhello setup` prompts — **done**
+   (`linhello tui`, ratatui).
+4. A **live camera-positioning guide** during enrollment — **done**
+   (`Request::PositionSample` / `linhello position`).
 
-The first two are "portability"; the last two are "setup UX." They are
-independent and can land in any order, but the recommended sequencing is at the
-end.
+The first two are "portability"; the last two are "setup UX." The original
+recommended sequencing is at the end.
 
 ---
 
@@ -26,17 +32,22 @@ Grounded inventory (file:line) of every distro assumption:
   `Makefile:17` `SYSTEMDDIR ?= /etc/systemd/system`.
   - PAM module dir differs: Arch/Fedora `/usr/lib64/security` or `/usr/lib/security`;
     **Debian/Ubuntu `/lib/x86_64-linux-gnu/security`** (multiarch triplet).
-- `etc/systemd/linhellod.service:9` hardcodes `ExecStart=/usr/local/bin/linhellod`
-  — breaks a packaged `/usr/bin` install.
+- `etc/systemd/linhellod.service` carries the dev default
+  `ExecStart=/usr/local/bin/linhellod`. *(Resolved: `make install` rewrites it via
+  `sed 's|/usr/local/bin|$(BINDIR)|g'`, so packaged `/usr/bin` installs are
+  correct — the §1.2(b) proposal below shipped.)*
 - `scripts/migrate-to-linhello.sh:112` hardcodes `/usr/lib/security/pam_*.so`.
+  (PAM wiring now lives in `linhello pam` / `pamwire.rs`; the migrate script is a
+  legacy path.)
 
 **Distro-stable paths (already portable, leave alone)**
 - `CONFIG_ROOT=/etc/linhello` (`linhello-common/src/lib.rs:41`),
   `SOCKET_PATH=/run/linhello.sock` (`:40`), `/dev/tpmrm0` (`tpm.rs:46`).
 - ONNX dylib search already multi-distro: `capabilities.rs:168-173` checks
-  `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu`, `/usr/local/lib`. But the
-  two *default* constants are Arch-only: `ort_init.rs:11` and
-  `antispoof.rs:29` = `/usr/lib/libonnxruntime.so`.
+  `/usr/lib`, `/usr/lib64`, `/usr/lib/x86_64-linux-gnu`, `/usr/local/lib`.
+  *(Resolved: the onnx default was promoted to
+  `linhello_common::platform::onnxruntime_dylib()`; `ort_init.rs` and
+  `antispoof.rs` now call it instead of an Arch-only constant — §1.2(a) shipped.)*
 - systemd PCR-signature search is already correct cross-distro:
   `pcrsig.rs:29` = `/etc/systemd`, `/run/systemd`, `/usr/lib/systemd`.
 
@@ -120,29 +131,31 @@ gdm/sddm/lightdm/system-login — extend with Debian/Fedora variants).
 
 ### 1.4 Packaging per distro
 
-| Distro | Format | Channel | Notes |
+| Distro | Format | Channel | Status |
 |---|---|---|---|
-| Arch | PKGBUILD (exists) | AUR | already done; just needs sha256 pin + signing |
-| Debian/Ubuntu | `.deb` (`debian/` dir, dpkg-buildpackage) | PPA or release `.deb` | `debhelper`; maintainer scripts (`postinst`/`prerm`) replace the `.install` scriptlet; `pam-auth-update` in `postinst` |
-| Fedora/RHEL | `.rpm` (`.spec`) | **COPR** | `%post`/`%postun` scriptlets; authselect integration |
+| Arch | `packaging/arch/PKGBUILD` | native `.pkg.tar.zst` (`make dist` → `makepkg` → `pacman`); `sudo linhello update` rebuilds from the signed tag | **done** (AUR was dropped in favour of the native package + `linhello update`) |
+| Fedora/RHEL | `packaging/fedora/linhello.spec` (+ `onnxruntime.spec`) | **COPR** (`%post`/`%postun`; authselect) | **done, COPR live** |
+| Debian/Ubuntu | `packaging/debian/` (`.deb`, dpkg-buildpackage, `pam-auth-update` in `postinst`) | PPA or release `.deb` | authored, **not yet build-tested** |
 
 Dependency name map (for the spec/control files):
 
 | Need | Arch | Debian/Ubuntu | Fedora/RHEL |
 |---|---|---|---|
 | TPM TSS runtime | `tpm2-tss` | `libtss2-tcti-device0` | `tpm2-tss` |
-| ONNX Runtime | `onnxruntime` | (often self-built / `libonnxruntime`) | `onnxruntime` (RPMFusion/COPR) |
+| ONNX Runtime | `onnxruntime` (Arch packages it; `onnxruntime-cuda` also provides it) | (none — `linhello fetch-onnx`) | (none in main repos — `linhello fetch-onnx`, or the COPR's `onnxruntime`) |
 | PAM | `pam` | `libpam0g` | `pam` |
 | V4L | `v4l-utils` | `libv4l-0` | `libv4l` |
 | SB enroll (optional) | `sbctl` | `sbsigntool`,`mokutil` | `mokutil`,`pesign` |
 | UKI gen (optional) | `systemd-ukify` | `systemd-ukify` | `systemd-ukify`/`dracut` |
 
-The per-distro reseal trigger replaces the pacman hook:
-- Debian: `dpkg` trigger or an apt `DPkg::Post-Invoke` hook, **or** simpler — a
-  `kernel-install` plugin / a systemd path-unit watching the ESP. (A systemd
-  path-unit on `boot/EFI/Linux/*` is the most distro-portable replacement for the
-  pacman hook and could supersede it on Arch too.)
-- Fedora: `kernel-install` plugin (`/etc/kernel/install.d/`) or dnf plugin.
+The per-distro reseal trigger replaces the pacman hook. *As built*, linhello ships
+per-family triggers (`platform::ResealTrigger`: `PacmanHook` on Arch,
+`KernelInstall` on Fedora, `KernelPostinst` on Debian) installed via
+`linhello reseal-hook install`. The universal systemd path-unit idea below was
+considered but **not pursued** — the pacman hook remains the Arch mechanism.
+- Debian: `kernel-install` / `postinst.d` (shipped). (Originally also weighed: a
+  `dpkg` trigger or a systemd path-unit on `boot/EFI/Linux/*`.)
+- Fedora: `kernel-install` plugin (`/etc/kernel/install.d/`) — shipped.
 
 **ONNX Runtime is the biggest packaging friction** — it's not in Debian main and
 Fedora needs RPMFusion/COPR. Options: vendor a known-good `libonnxruntime.so` via
@@ -173,7 +186,7 @@ of whether systemd-boot, GRUB, or rEFInd launched it. So `BootMode::Grub` really
 means *"traditional vmlinuz+initrd, no systemd-stub"*, not "the GRUB bootloader."
 
 The policy tiering (`policy.rs:81-98`) already follows from this:
-- **Full** (`PolicyAuthorize([7,11])`) — SB on **+ UKI present + signed PCR sig**.
+- **Full** (`PolicyAuthorize([11])`) — SB on **+ UKI present + signed PCR sig**.
   PCR 11 is extended *by systemd-stub* from the UKI's PE sections, and the signed
   policy survives kernel updates (the whole point of `signed-pcr-policy.md`).
 - **Medium** (`PolicyPCR([7])`) — SB on, no UKI/signed policy. PCR 7 = Secure Boot
@@ -251,6 +264,10 @@ initramfs/UKI builder differs. `pcrsig.rs` consumes systemd's output unchanged.
 
 ### 3.1 What exists
 
+*(Shipped: `linhello tui` is the full-screen wizard described in §3.2 —
+`ratatui` 0.29 is now a CLI dependency, and `setup` remains the headless
+fallback. The text below is the original "before" snapshot.)*
+
 `linhello setup` (`main.rs:405-461`) is a 4-step linear flow (probe → pick cameras
 → calibrate threshold → optional enroll) using bare `println!`/`prompt_line`/
 `prompt_yes` (`:181-194`) and `rpassword` for secrets. **No TUI crate is a
@@ -319,6 +336,10 @@ fast (~20-30 ms cached) → a ~10-15 Hz guidance loop is feasible.
 
 ### 4.3 Two ways to wire it — recommendation
 
+*(Shipped: Option A. `Request::PositionSample` → `Response::Position` exist in
+`ipc.rs`, the daemon serves them, and `linhello position [--once]` renders the
+guide. Option B's `--pixel-preview` was not built.)*
+
 **Option A (recommended): daemon-polled geometry, abstract guide.**
 Add a lightweight `Request::PositionSample` → `Response::Position { face_count,
 bbox, frame_w, frame_h, yaw, pitch, face_frac, guidance: String }`. The TUI polls
@@ -386,6 +407,7 @@ will accept." Wire this into both `linhello setup`'s enroll step and standalone
    Debian/Fedora; generalize the signed-PCR doc (§2.5). Mostly docs + the enroller
    seam; no new PCR machinery.
 
-Out of scope here (tracked separately): the update/release channel (AUR + signed
-GitHub releases) — revisit after portability, since `.deb`/`.rpm`/COPR are the
-same release artifacts.
+Out of scope here (tracked separately): the update/release channel — now shipped
+as **signed GitHub release tags** consumed by `sudo linhello update` (per-distro
+native package built from the verified tag), plus the Fedora COPR. AUR was not
+pursued; Arch installs/updates via the native `.pkg.tar.zst` + `linhello update`.
