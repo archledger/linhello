@@ -96,6 +96,20 @@ miscfiles_read_localization(linhellod_t)
 # "none").
 selinux_get_enforce_mode(linhellod_t)
 
+# Read the per-user logind state (/run/systemd/users/<uid>) to distinguish a
+# warm live-session unlock from a cold greeter login (the tiered-auth policy's
+# warm-session signal). The traversal is /run (var_run_t) -> /run/systemd
+# (init_var_run_t) -> /run/systemd/users (systemd_logind_var_run_t). Without
+# this the read is dontaudit-denied and every session reads as cold.
+files_search_pids(linhellod_t)
+gen_require(`
+    type init_var_run_t;
+    type systemd_logind_var_run_t;
+')
+allow linhellod_t init_var_run_t:dir search_dir_perms;
+allow linhellod_t systemd_logind_var_run_t:dir search_dir_perms;
+allow linhellod_t systemd_logind_var_run_t:file read_file_perms;
+
 ########################################
 #
 # Display-manager (greeter / lock screen) access to the socket
