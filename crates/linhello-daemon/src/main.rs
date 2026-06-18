@@ -237,6 +237,20 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        Request::AuthIntent { user, service } => {
+            // Same peer gate as Authenticate, but this only reveals the policy
+            // decision (no capture, no secret), so it's safe and cheap.
+            if !users::peer_may_act_as(peer_uid, &user) {
+                return forbidden("auth_intent");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            let root = is_root(peer_uid);
+            task::spawn_blocking(move || do_auth_intent(&user, &service, root))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::Diagnose => task::spawn_blocking(do_diagnose).await.unwrap_or_else(err),
         Request::Probe => task::spawn_blocking(|| Response::Capabilities {
             report: capabilities::probe(),
@@ -479,7 +493,16 @@ fn current_policy() -> linhello_common::biopolicy::Policy {
 /// Tiered-policy authentication: classify the service, look up the tier + warm
 /// state, decide, and route to the existing verify / unseal paths. Centralises
 /// the decision the PAM module used to make by euid.
-fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
+/// Pure decision: classify the service, look up the tier + warm state, decide,
+/// and apply the non-root → no-unseal downgrade. Captures nothing and touches no
+/// camera/TPM. Shared by `do_authenticate` (which then routes to capture) and the
+/// `AuthIntent` pre-flight (which only reports whether the camera will engage), so
+/// the "Looking for your face…" prompt can never disagree with the real decision.
+fn plan_action(
+    user: &str,
+    service: &str,
+    peer_is_root: bool,
+) -> (linhello_common::biopolicy::Action, linhello_common::biopolicy::Tier, linhello_common::biopolicy::OperationClass, bool) {
     use linhello_common::biopolicy::{classify, decide, Action};
     let warm = session_warm(user);
     let class = classify(service, warm);
@@ -491,6 +514,12 @@ fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
     if action == Action::Unseal && !peer_is_root {
         action = Action::Deny;
     }
+    (action, tier, class, warm)
+}
+
+fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
+    use linhello_common::biopolicy::Action;
+    let (action, tier, class, warm) = plan_action(user, service, peer_is_root);
     tracing::info!(
         "Authenticate: user='{user}' service='{service}' tier={} class={class:?} warm={warm} root={peer_is_root} -> {action:?}",
         tier.as_str()
@@ -501,6 +530,39 @@ fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {
         },
         Action::Verify => do_verify(user),
         Action::Unseal => do_unseal_password(user),
+    }
+}
+
+/// Pre-flight for the PAM prompt: report whether the upcoming `Authenticate` will
+/// engage the camera, without capturing. `engage` is true for Verify/Unseal,
+/// false for Deny — so PAM only says "Looking for your face…" when a camera will
+/// actually light up (convenience-tier greeter login → Deny → silent password).
+fn do_auth_intent(user: &str, service: &str, peer_is_root: bool) -> Response {
+    use linhello_common::biopolicy::Action;
+    let (action, tier, class, warm) = plan_action(user, service, peer_is_root);
+    let label = match action {
+        Action::Deny => "deny",
+        Action::Verify => "verify",
+        Action::Unseal => "unseal",
+    };
+    // Deny is logged at INFO: PAM short-circuits to the password without ever
+    // calling Authenticate, so this is the *only* daemon-side record of a denied
+    // attempt — keep the decision trail intact. The engage path (Verify/Unseal)
+    // stays at DEBUG because the follow-up Authenticate will log the real result.
+    if action == Action::Deny {
+        tracing::info!(
+            "AuthIntent: user='{user}' service='{service}' tier={} class={class:?} warm={warm} root={peer_is_root} -> deny (no camera; PAM defers to password)",
+            tier.as_str()
+        );
+    } else {
+        tracing::debug!(
+            "AuthIntent: user='{user}' service='{service}' tier={} class={class:?} warm={warm} root={peer_is_root} -> {label} (engage=true)",
+            tier.as_str()
+        );
+    }
+    Response::AuthPlan {
+        engage: action != Action::Deny,
+        action: label.to_string(),
     }
 }
 

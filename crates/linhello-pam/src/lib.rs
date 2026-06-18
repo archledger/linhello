@@ -117,6 +117,44 @@ pub unsafe extern "C" fn linhello_authenticate(
     }
 }
 
+/// Pre-flight for [`linhello_authenticate`]: ask the daemon whether this
+/// (user, service) will actually engage the camera, WITHOUT capturing. Lets the
+/// PAM module decide whether to announce "Looking for your face…". Returns:
+///   * `1`  — the camera will engage (Verify or Unseal); show the prompt.
+///   * `0`  — policy deny (e.g. convenience-tier greeter login / sudo): no camera
+///            will light up; stay silent and cascade to the password.
+///   * `-1` — daemon unreachable or error; treat as "no capture" (stay silent).
+///
+/// # Safety
+/// `user` and `service` must be NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn linhello_auth_will_capture(
+    user: *const libc::c_char,
+    service: *const libc::c_char,
+) -> i32 {
+    if user.is_null() || service.is_null() {
+        return -1;
+    }
+    let user = match CStr::from_ptr(user).to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return -1,
+    };
+    let service = match CStr::from_ptr(service).to_str() {
+        Ok(s) => s.to_owned(),
+        _ => return -1,
+    };
+    match client::request(&Request::AuthIntent { user, service }) {
+        Ok(Response::AuthPlan { engage, .. }) => {
+            if engage {
+                1
+            } else {
+                0
+            }
+        }
+        _ => -1,
+    }
+}
+
 /// Reseal `password` as the user's login password envelope. Called from the
 /// PAM `password` stack after the new token has been accepted by the upstream
 /// module, so the face-auth path stays in lockstep with the real password.

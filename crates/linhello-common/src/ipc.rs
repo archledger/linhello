@@ -90,6 +90,14 @@ pub enum Request {
     /// secret (→ `Verified{matched:true}`), or denies (→ `Error`). Replaces the
     /// euid heuristic in pam_linhello. Root-only for the unseal path.
     Authenticate { user: String, service: String },
+    /// Pre-flight for [`Request::Authenticate`]: run the *same* classify → tier →
+    /// warm → decide pipeline but DO NOT capture or touch the camera/TPM. Lets the
+    /// PAM module learn whether this operation will actually engage the camera
+    /// (→ `AuthPlan{engage:true}`) before it announces "Looking for your face…".
+    /// On the convenience tier at the greeter (a `Deny`), `engage` is false so no
+    /// prompt is shown and PAM falls straight through to the password — no camera
+    /// is ever lit. Cheap and side-effect-free.
+    AuthIntent { user: String, service: String },
     /// Report envelope presence, PCR drift, and TPM reachability without
     /// attempting a full unseal.
     Diagnose,
@@ -318,6 +326,14 @@ pub enum Response {
         candidates: Vec<IdentifyCandidate>,
     },
     ProfileNameSet,
+    /// Result of [`Request::AuthIntent`]: the decision the daemon *would* make for
+    /// this (user, service, tier, warm) without capturing. `engage` is true when
+    /// the action is Verify or Unseal (the camera will be lit), false for Deny.
+    /// `action` carries the human label ("verify" | "unseal" | "deny") for logs.
+    AuthPlan {
+        engage: bool,
+        action: String,
+    },
     Error {
         message: String,
     },

@@ -21,6 +21,7 @@ extern int  linhello_unseal_keyring(const char *user, uint8_t *buf, size_t len);
 extern int  linhello_verify_face(const char *user);
 extern int  linhello_authenticate(const char *user, const char *service,
                                   uint8_t *buf, size_t len);
+extern int  linhello_auth_will_capture(const char *user, const char *service);
 extern int  linhello_reseal_password(const char *user, uint8_t *buf, size_t len);
 extern void linhello_zero_buf(uint8_t *buf, size_t len);
 
@@ -66,6 +67,27 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     /* The daemon makes the verify-vs-unseal-vs-deny decision (tier + service +
      * warm-session). We pass the service and react to the outcome. */
     int waits = wait_seconds(argc, argv);
+
+    /* Pre-flight: ask the daemon (same classify→tier→warm→decide, no capture)
+     * whether this op will actually engage the camera. This drives the prompt so
+     * we never announce "Looking for your face…" for an operation that won't lift
+     * a finger — e.g. the convenience tier at the greeter (Deny, RGB-only, no IR):
+     * there the camera stays dark and we must fall straight through to the
+     * password silently. The secure tier (login unseals, unlock verifies) and any
+     * lock-screen Verify still light the camera, so the prompt shows there. */
+    int will_capture = linhello_auth_will_capture(user, service);
+    if (will_capture <= 0) {
+        /* 0 = policy deny (no camera engaged); <0 = daemon unreachable/error.
+         * Either way there is no capture to narrate: stay silent, don't run the
+         * retry loop, and cascade to the next module (the password). */
+        pam_syslog(pamh, LOG_NOTICE,
+                   "face auth not engaged for '%s' [%s] (%s); deferring to password",
+                   user, service,
+                   will_capture == 0 ? "policy: camera not used for this operation"
+                                     : "daemon unavailable");
+        return PAM_AUTH_ERR;
+    }
+
     /* Interactive stacks relay PAM_TEXT_INFO to their UI (GDM via UserVerifier
      * InfoQuery; sudo prints a line). The non-interactive parallel lockscreen
      * stacks (kde-fingerprint, `wait`) don't, so skip the prompt there. */
