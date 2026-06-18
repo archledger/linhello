@@ -148,6 +148,15 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Download + install the ONNX Runtime shared library (the official Microsoft
+    /// prebuild matching this linhello's ABI) into /usr/local/lib. For distros
+    /// that don't package it (Fedora, Debian); on Arch use `pacman -S onnxruntime`.
+    /// Requires root.
+    FetchOnnx {
+        /// Reinstall even if an ONNX Runtime is already present.
+        #[arg(long)]
+        force: bool,
+    },
     /// Build the native package for this distro (rpm/deb/pkg, auto-detected) from
     /// the source checkout. With --install, install it via the package manager
     /// (needs root). This is what `update` uses to pick the right package.
@@ -1257,6 +1266,12 @@ fn main() -> Result<()> {
                 println!("  {l}");
             }
         }
+        Cmd::FetchOnnx { force } => {
+            require_root("fetch-onnx")?;
+            for l in install::fetch_onnx(force).map_err(|e| anyhow::anyhow!(e))? {
+                println!("  {l}");
+            }
+        }
         Cmd::Package { format, install } => package_cmd(format.as_deref(), install)?,
     }
     Ok(())
@@ -1619,10 +1634,14 @@ fn deps_cmd(only: Option<&str>) {
             None => println!("  → install the above with your package manager"),
         }
     }
-    if family == platform::DistroFamily::Debian {
+    if platform::DEPENDENCIES
+        .iter()
+        .any(|d| d.need == "ONNX Runtime" && d.package(family).is_empty())
+    {
         println!(
-            "\nnote: ONNX Runtime isn't packaged in Debian — build/download \
-             libonnxruntime.so and set ORT_DYLIB_PATH."
+            "\nnote: ONNX Runtime isn't in {}'s main repos — run `sudo linhello fetch-onnx` to \
+             install the matching prebuilt (or build it and set ORT_DYLIB_PATH).",
+            family.as_str()
         );
     }
 }

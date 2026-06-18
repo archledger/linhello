@@ -127,6 +127,13 @@ if %{_sbindir}/selinuxenabled 2>/dev/null; then
     %{_sbindir}/restorecon -R %{_bindir}/linhellod %{_sysconfdir}/%{name} || :
     %{_sbindir}/restorecon %{_rundir}/linhello.sock 2>/dev/null || :
 fi
+# Enable + start the daemon now (after the SELinux module is loaded and the
+# binary relabeled, so it transitions into linhellod_t). The daemon binds its
+# socket lazily — no face models or ONNX Runtime are needed at startup — so this
+# is safe immediately after install: `linhello doctor` works right away and face
+# auth is ready on the next boot. Non-fatal so a sandbox/container install that
+# can't talk to systemd still succeeds.
+%{_bindir}/systemctl enable --now linhellod.service >/dev/null 2>&1 || :
 
 %preun
 %systemd_preun linhellod.service

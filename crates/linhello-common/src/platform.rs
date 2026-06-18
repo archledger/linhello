@@ -532,7 +532,9 @@ impl Dep {
 pub const DEPENDENCIES: &[Dep] = &[
     // Runtime.
     Dep { need: "TPM 2.0 TSS runtime", runtime: true, arch: "tpm2-tss", debian: "libtss2-tcti-device0", fedora: "tpm2-tss" },
-    Dep { need: "ONNX Runtime", runtime: true, arch: "onnxruntime", debian: "", fedora: "onnxruntime" },
+    // Not in Fedora's or Debian's main repos — install via `linhello fetch-onnx`
+    // (the official Microsoft prebuilt matching our ABI). Arch packages it.
+    Dep { need: "ONNX Runtime", runtime: true, arch: "onnxruntime", debian: "", fedora: "" },
     Dep { need: "PAM runtime", runtime: true, arch: "pam", debian: "libpam0g", fedora: "pam" },
     Dep { need: "V4L cameras", runtime: true, arch: "v4l-utils", debian: "libv4l-0", fedora: "libv4l" },
     // Build-time (matches the validated Fedora deps: tpm2-tss-devel, openssl-devel, clang-devel, pam-devel).
@@ -636,10 +638,8 @@ pub fn onnxruntime_install_hint() -> String {
         .unwrap_or("");
     match install_command(&[pkg]) {
         Some(cmd) => cmd,
-        None if family == DistroFamily::Debian => {
-            "not packaged in Debian — build/download libonnxruntime.so and set ORT_DYLIB_PATH".into()
-        }
-        None => "install the onnxruntime package, or set ORT_DYLIB_PATH".into(),
+        // Not packaged (Fedora/Debian): the one-command installer is the path.
+        None => "run `sudo linhello fetch-onnx` (installs the matching ONNX Runtime), or set ORT_DYLIB_PATH".into(),
     }
 }
 

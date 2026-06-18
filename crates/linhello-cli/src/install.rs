@@ -729,9 +729,98 @@ pub fn fetch_models(force: bool) -> Result<Vec<String>, String> {
             let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
         }
         log.push(format!("installed {} + {}", det.display(), face.display()));
-        // Pick up the new models without a manual restart.
-        let _ = run_streamed(None, Path::new("/"), "systemctl", &["try-restart", "linhellod"]);
-        log.push("restarted linhellod".to_string());
+        // Pick up the new models. `restart` (not `try-restart`) so it also starts
+        // the daemon if it isn't running yet (e.g. right after a package install).
+        if run_streamed(None, Path::new("/"), "systemctl", &["restart", "linhellod"]).is_ok() {
+            log.push("restarted linhellod".to_string());
+        }
+        Ok(log.clone())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Official Microsoft ONNX Runtime prebuilt matching the `ort` crate ABI
+/// (onnxruntime 1.22.x ↔ ort 2.0.0-rc.10). HTTPS from the upstream release is the
+/// trust anchor; the per-arch SHA-256s pin the exact tarballs.
+const ORT_VERSION: &str = "1.22.0";
+const ORT_X64_SHA256: &str = "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3";
+const ORT_AARCH64_SHA256: &str = "bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702";
+
+/// `linhello fetch-onnx` — download the official Microsoft ONNX Runtime prebuilt
+/// for this architecture and install `libonnxruntime.so*` into `/usr/local/lib`
+/// (on linhello's loader search path), so distros that don't package it (Fedora,
+/// Debian) get a working runtime in one command. Root-only.
+pub fn fetch_onnx(force: bool) -> Result<Vec<String>, String> {
+    if !force {
+        if let Some(p) = platform::onnxruntime_dylib() {
+            return Ok(vec![format!(
+                "ONNX Runtime already present at {p} (use --force to reinstall)"
+            )]);
+        }
+    }
+    let (asset_arch, sha) = match std::env::consts::ARCH {
+        "x86_64" => ("x64", ORT_X64_SHA256),
+        "aarch64" => ("aarch64", ORT_AARCH64_SHA256),
+        other => {
+            return Err(format!(
+                "no Microsoft ONNX Runtime prebuilt for arch '{other}' — build it or install \
+                 libonnxruntime.so manually and set ORT_DYLIB_PATH"
+            ))
+        }
+    };
+    for t in ["curl", "tar", "sha256sum"] {
+        if !on_path(t) {
+            return Err(format!("`{t}` not found — install it and retry"));
+        }
+    }
+    let stem = format!("onnxruntime-linux-{asset_arch}-{ORT_VERSION}");
+    let url =
+        format!("https://github.com/microsoft/onnxruntime/releases/download/v{ORT_VERSION}/{stem}.tgz");
+    let mut log = Vec::new();
+    let tmp = std::env::temp_dir().join(format!("linhello-onnx-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {e}"))?;
+    let result = (|| -> Result<Vec<String>, String> {
+        let tgz = tmp.join("onnxruntime.tgz");
+        log.push(format!(
+            "downloading ONNX Runtime {ORT_VERSION} ({asset_arch}) from Microsoft…"
+        ));
+        run_streamed(
+            None,
+            &tmp,
+            "curl",
+            &["-fL", "--proto", "=https", "--tlsv1.2", "-o", &tgz.to_string_lossy(), &url],
+        )?;
+        verify_model(&tgz, &format!("onnxruntime {ORT_VERSION} ({asset_arch})"), sha, &mut log)?;
+        run_streamed(
+            None,
+            &tmp,
+            "tar",
+            &["xzf", &tgz.to_string_lossy(), "-C", &tmp.to_string_lossy()],
+        )?;
+        // The versioned object is the real .so; .so.1 and .so are symlinks to it.
+        let soname = format!("libonnxruntime.so.{ORT_VERSION}");
+        let src = find_under(&tmp, &soname).ok_or_else(|| format!("{soname} not found in archive"))?;
+        let libdir = Path::new("/usr/local/lib");
+        std::fs::create_dir_all(libdir).map_err(|e| format!("mkdir {}: {e}", libdir.display()))?;
+        let dst = libdir.join(&soname);
+        std::fs::copy(&src, &dst).map_err(|e| format!("install {}: {e}", dst.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+        // Recreate the ABI symlinks: libonnxruntime.so → .so.1 → .so.<version>.
+        for link in ["libonnxruntime.so.1", "libonnxruntime.so"] {
+            let lp = libdir.join(link);
+            let _ = std::fs::remove_file(&lp);
+            std::os::unix::fs::symlink(&soname, &lp).map_err(|e| format!("symlink {}: {e}", lp.display()))?;
+        }
+        log.push(format!("installed {} (+ .so.1, .so symlinks)", dst.display()));
+        // Label it as a shared lib for SELinux, refresh the loader cache, and
+        // restart the daemon so it loads the now-present runtime.
+        let _ = run_streamed(None, Path::new("/"), "restorecon", &["-F", &dst.to_string_lossy()]);
+        let _ = run_streamed(None, Path::new("/"), "ldconfig", &[]);
+        if run_streamed(None, Path::new("/"), "systemctl", &["restart", "linhellod"]).is_ok() {
+            log.push("ran ldconfig + restarted linhellod".to_string());
+        }
         Ok(log.clone())
     })();
     let _ = std::fs::remove_dir_all(&tmp);
