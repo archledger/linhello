@@ -592,23 +592,26 @@ fn do_policy_status(user: &str) -> Response {
     let policy = current_policy();
     let enrolled = binding.is_some();
 
-    // Live hardware readiness: for a Secure-enrolled user, is an IR sensor
-    // present right now? Uses a FRESH enumeration (not the OnceLock-cached
-    // ir_device()), so doctor/TUI track both unplug AND replug live without a
-    // daemon restart. The tier itself never downgrades — losing the IR camera
-    // fails secure ops closed to the password, it does not drop to Convenience.
+    // Live hardware readiness: for a Secure-enrolled user, do the currently
+    // resolved cameras still satisfy the enrolled binding? Uses the daemon's own
+    // resolver (snapshot_camera_binding → rgb_device/ir_device), which is now
+    // TTL-cached and re-resolves within a couple seconds — so this matches what
+    // the auth path will actually do AND tracks hot-plug/unplug live without a
+    // restart. The tier never downgrades — losing the IR camera fails secure ops
+    // closed to the password, it does not drop to Convenience.
     let (hardware_ready, hardware_note) = match &binding {
         Some(b) if b.ir.is_some() => {
-            let ir_present = linhello_biometrics::camera::enumerate()
-                .into_iter()
-                .any(|c| c.kind == linhello_biometrics::camera::CameraKind::Ir);
-            if ir_present {
-                (true, String::new())
-            } else {
-                (
+            let current = snapshot_camera_binding();
+            match b.verify(&current) {
+                Ok(()) => (true, String::new()),
+                Err(_) if current.ir.is_none() => (
                     false,
                     "IR camera not detected — login & sudo fall back to your password until it's reconnected".to_string(),
-                )
+                ),
+                Err(_) => (
+                    false,
+                    "enrolled camera changed — login & sudo fall back to your password".to_string(),
+                ),
             }
         }
         _ => (true, String::new()),

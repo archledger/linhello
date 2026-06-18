@@ -3,7 +3,8 @@
 use crate::bio_err;
 use linhello_common::Result;
 use image::{ImageBuffer, Rgb};
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream;
 use v4l::io::traits::CaptureStream;
@@ -174,16 +175,43 @@ pub fn classify_fourccs(fourccs: &[String]) -> CameraKind {
     }
 }
 
-/// Resolved RGB device path (cached per process).
+/// How long a resolved camera path is reused before re-resolving. Short enough
+/// that hot-plugging a camera is picked up within a couple seconds (by the auth
+/// path, `doctor`, and the TUI) WITHOUT a daemon restart, but long enough that a
+/// capture burst doesn't re-enumerate V4L on every frame. (Replaces a permanent
+/// per-process cache, which pinned whatever was present at daemon startup — so a
+/// camera plugged in later was ignored until restart, and one mis-resolved during
+/// USB settle stayed wrong.)
+const RESOLVE_TTL: Duration = Duration::from_secs(2);
+
+/// Resolved RGB device path. Re-resolved at most once per [`RESOLVE_TTL`].
 pub fn rgb_device() -> String {
-    static RGB: OnceLock<String> = OnceLock::new();
-    RGB.get_or_init(resolve_rgb).clone()
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = g.as_ref() {
+        if at.elapsed() < RESOLVE_TTL {
+            return v.clone();
+        }
+    }
+    let v = resolve_rgb();
+    *g = Some((Instant::now(), v.clone()));
+    v
 }
 
-/// Resolved IR device path, or `None` if this machine has no IR sensor.
+/// Resolved IR device path, or `None` if this machine has no IR sensor. Also
+/// re-resolved at most once per [`RESOLVE_TTL`] so a reconnected IR camera is
+/// picked up live.
 pub fn ir_device() -> Option<String> {
-    static IR: OnceLock<Option<String>> = OnceLock::new();
-    IR.get_or_init(resolve_ir).clone()
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = g.as_ref() {
+        if at.elapsed() < RESOLVE_TTL {
+            return v.clone();
+        }
+    }
+    let v = resolve_ir();
+    *g = Some((Instant::now(), v.clone()));
+    v
 }
 
 fn resolve_rgb() -> String {
