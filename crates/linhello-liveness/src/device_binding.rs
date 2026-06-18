@@ -11,7 +11,7 @@
 //! device with the exact same descriptor tuple.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
@@ -42,7 +42,13 @@ impl DeviceIdentity {
     }
 
     fn probe(device_path: &str) -> Option<Self> {
-        let node = Path::new(device_path).file_name()?.to_str()?;
+        // Resolve symlinks (e.g. /dev/v4l/by-path/… or by-id/…) to the real
+        // /dev/videoN node so the sysfs lookup below uses the kernel node name.
+        // Stable by-path nodes are how cameras.conf survives boot renumbering;
+        // without this the basename would be the symlink name (no sysfs entry)
+        // and binding would wrongly fail. Falls back to the path as given.
+        let real = std::fs::canonicalize(device_path).unwrap_or_else(|_| PathBuf::from(device_path));
+        let node = real.file_name()?.to_str()?;
         let sys = Path::new("/sys/class/video4linux").join(node);
         let name = read_trim(&sys.join("name"))?;
 

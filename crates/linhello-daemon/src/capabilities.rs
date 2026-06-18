@@ -103,51 +103,76 @@ fn signed_policy_check() -> CapabilityCheck {
 }
 
 fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
-    use linhello_biometrics::camera::{enumerate, CameraKind};
+    use linhello_biometrics::camera::{enumerate, ir_device, rgb_device, CameraKind};
     let cams = enumerate();
+    // Canonicalize so a cameras.conf by-path/by-id symlink matches the real
+    // /dev/videoN that `enumerate()` reports.
+    let canon = |p: &str| {
+        std::fs::canonicalize(p)
+            .ok()
+            .and_then(|q| q.to_str().map(str::to_string))
+            .unwrap_or_else(|| p.to_string())
+    };
 
-    let rgb = cams
-        .iter()
-        .find(|c| c.kind == CameraKind::Rgb && c.trusted);
-    let rgb_check = match rgb {
-        Some(c) => check(
+    // Report the device the daemon will ACTUALLY bind (env → cameras.conf →
+    // auto-detect), not a fresh independent auto-detect. Otherwise doctor can
+    // show a different camera than the one auth uses — e.g. an unreadable
+    // cameras.conf sends both to auto-detect, but a correct one diverges.
+    let rgb_path = rgb_device();
+    let rgb_node = canon(&rgb_path);
+    let rgb_check = match cams.iter().find(|c| canon(&c.path) == rgb_node) {
+        Some(c) if c.kind == CameraKind::Rgb && c.trusted => check(
             "RGB camera",
             CapabilityStatus::Ok,
             true,
-            format!("{} ({})", c.name.as_deref().unwrap_or("camera"), c.path),
+            format!("{} ({})", c.name.as_deref().unwrap_or("camera"), rgb_node),
         ),
-        None => {
-            // Distinguish "only an untrusted/virtual camera" from "none at all".
-            if cams.iter().any(|c| c.kind == CameraKind::Rgb) {
-                check(
-                    "RGB camera",
-                    CapabilityStatus::Warn,
-                    true,
-                    "only an untrusted (virtual?) camera found — set LINHELLO_RGB_DEVICE or cameras.conf",
-                )
-            } else {
-                check(
-                    "RGB camera",
-                    CapabilityStatus::Missing,
-                    true,
-                    "no colour-capable capture device found",
-                )
-            }
-        }
-    };
-
-    let ir = cams.iter().find(|c| c.kind == CameraKind::Ir);
-    let ir_check = match ir {
-        Some(c) => check(
-            "IR camera",
-            CapabilityStatus::Ok,
-            false,
+        Some(c) if c.kind == CameraKind::Rgb => check(
+            "RGB camera",
+            CapabilityStatus::Warn,
+            true,
+            format!("resolved {rgb_node} is untrusted (virtual?) — check cameras.conf"),
+        ),
+        Some(_) => check(
+            "RGB camera",
+            CapabilityStatus::Warn,
+            true,
+            format!("resolved {rgb_node} is not colour-capable — wrong cameras.conf `rgb=`"),
+        ),
+        None => check(
+            "RGB camera",
+            CapabilityStatus::Warn,
+            true,
             format!(
-                "{} ({}) — active-IR liveness available",
-                c.name.as_deref().unwrap_or("IR sensor"),
-                c.path
+                "resolved {rgb_path} not found among capture nodes — check cameras.conf / its SELinux label"
             ),
         ),
+    };
+
+    let ir_check = match ir_device() {
+        Some(ir_path) => {
+            let ir_node = canon(&ir_path);
+            match cams.iter().find(|c| canon(&c.path) == ir_node) {
+                Some(c) => check(
+                    "IR camera",
+                    CapabilityStatus::Ok,
+                    false,
+                    format!(
+                        "{} ({}) — active-IR liveness available",
+                        c.name.as_deref().unwrap_or("IR sensor"),
+                        ir_node
+                    ),
+                ),
+                None => check(
+                    "IR camera",
+                    CapabilityStatus::Warn,
+                    false,
+                    format!(
+                        "resolved {ir_path} not found among capture nodes — check cameras.conf / its SELinux label"
+                    ),
+                ),
+            }
+        }
         None => check(
             "IR camera",
             CapabilityStatus::Warn,

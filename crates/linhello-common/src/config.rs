@@ -16,7 +16,24 @@ pub fn config_path(file: &str) -> PathBuf {
 /// trimmed value, or `None` if the file is missing, the key is absent, or the
 /// value is empty.
 pub fn read_kv(file: &str, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(config_path(file)).ok()?;
+    let path = config_path(file);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // A present-but-unreadable config (classically a wrong SELinux label —
+        // a cameras.conf created as `admin_home_t` blocks `linhellod_t`) must
+        // NOT be ignored silently: that sends the daemon to auto-detect and it
+        // can bind the wrong camera. Make it loud (daemon stderr ⇒ journald).
+        Err(e) => {
+            eprintln!(
+                "linhello: WARNING: config {p} exists but is unreadable ({e}); \
+                 key '{key}' ignored — check permissions / SELinux label \
+                 (try: restorecon -v {p})",
+                p = path.display(),
+            );
+            return None;
+        }
+    };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
