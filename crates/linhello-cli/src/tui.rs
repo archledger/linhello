@@ -407,7 +407,10 @@ impl App {
         self.name_input = None;
         self.install = crate::install::InstallState::detect();
         match self.screen {
-            Screen::Doctor if self.report.is_none() => self.refresh_probe(),
+            Screen::Doctor => {
+                self.doctor_scroll = 0;
+                self.refresh_probe();
+            }
             Screen::Cameras => {
                 self.cameras = camera::enumerate();
                 self.cam_cursor = self.cam_cursor.min(self.cameras.len().saturating_sub(1));
@@ -467,7 +470,6 @@ impl App {
     }
 
     fn refresh_probe(&mut self) {
-        self.doctor_scroll = 0;
         self.report = Some(match crate::send(Request::Probe) {
             Ok(Response::Capabilities { report }) => Ok(report),
             Ok(other) => Err(format!("unexpected response: {other:?}")),
@@ -495,6 +497,10 @@ impl App {
             }),
             _ => None,
         };
+        // A live refresh must not move the user's view: keep the scroll where it
+        // is, only clamping it if the content got shorter. (Resetting to top is
+        // done explicitly on entering the screen / re-probing with `r`.)
+        self.doctor_scroll = self.doctor_scroll.min(self.doctor_max_scroll());
     }
 
     /// Restart the daemon without printing (the TUI owns the screen). Returns a
@@ -1141,11 +1147,12 @@ impl App {
         if self.cam_cursor >= self.cameras.len() {
             self.cam_cursor = self.cameras.len().saturating_sub(1);
         }
-        // On screens backed by a daemon round-trip, keep those live too while
-        // the user is looking at them.
+        // On screens backed by a daemon round-trip or external state, keep those
+        // live too while the user is looking at them (not just on first entry).
         match self.screen {
             Screen::Doctor => self.refresh_probe(),
             Screen::Profiles => self.refresh_profiles(),
+            Screen::Pam => self.pam = crate::pamwire::status(),
             _ => {}
         }
     }
@@ -2078,6 +2085,13 @@ impl App {
     /// the scroll clamp so they agree on the content height.
     fn doctor_lines(&self, report: &CapabilityReport) -> Vec<Line<'static>> {
         let mut lines = self.os_setup_panel();
+        // Lead with the security tier/policy — the headline — so it's visible
+        // without scrolling; the longer capability list follows below it.
+        let policy = self.policy_panel();
+        if !policy.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(policy);
+        }
         lines.push(Line::from(""));
         lines.extend(report.checks.iter().map(|c| {
             let (sym, color) = match c.status {
@@ -2090,12 +2104,6 @@ impl App {
                 Span::raw(format!("  {:<20} {}", c.name, c.detail)),
             ])
         }));
-        // What face auth actually does here (tier + per-op policy).
-        let policy = self.policy_panel();
-        if !policy.is_empty() {
-            lines.push(Line::from(""));
-            lines.extend(policy);
-        }
         let verdict = if !report.can_run() {
             Line::from("verdict: CANNOT RUN — a required capability is missing.".red().bold())
         } else if report.degraded() {
