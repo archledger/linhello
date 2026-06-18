@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -148,6 +148,12 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.2-1
+- Arch packaging/update fix: `linhello package`/`update` no longer mis-select the
+  makepkg `-debug` split (which carries no binaries) as the installable. PKGBUILD
+  now builds a single stripped package (options=!debug) and the package picker
+  skips -debug/-dbgsym artifacts. No functional change on Fedora.
+
 * Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.1-1
 - Fedora install polish: %post now enables + starts the daemon (so `linhello
   doctor` works immediately); new `linhello fetch-onnx` installs the matching
