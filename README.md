@@ -26,8 +26,9 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
 
 ### Fedora
 
-Install from the COPR — `dnf` pulls every dependency (including ONNX Runtime,
-which isn't in Fedora's main repos) and updates ride along with `dnf upgrade`:
+**Recommended — install from the COPR.** `dnf` pulls every dependency (including
+ONNX Runtime, which isn't in Fedora's main repos) and updates ride along with
+`dnf upgrade`:
 
 ```sh
 sudo dnf copr enable archledger/linhello
@@ -55,30 +56,59 @@ sudo linhello tui
 
 ### Arch Linux
 
-```sh
-# 1. Dependencies
-sudo pacman -S --needed tpm2-tss onnxruntime v4l-utils base-devel rust
+Build the native package and install it with `pacman`, so the system tracks it
+like any other package and updates ride along with `sudo linhello update`:
 
-# 2. Get the code and build
+```sh
+# 1. Dependencies (makepkg also pulls build deps automatically, but these are
+#    the runtime + build set the package declares)
+sudo pacman -S --needed base-devel git rust clang tpm2-tss onnxruntime v4l-utils
+
+# 2. Build + install the package
 git clone https://github.com/archledger/linhello
 cd linhello
-cargo build --release
+make dist                         # rolls packaging/arch/linhello-<ver>.tar.gz from HEAD
+cd packaging/arch
+makepkg -si                       # builds linhello-*.pkg.tar.zst and installs it
 
-# 3. Get the face-recognition models (~250 MB, one time)
-curl -L -o /tmp/buffalo_l.zip \
-    https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
-unzip -d /tmp/buffalo_l /tmp/buffalo_l.zip
-mkdir -p models
-cp /tmp/buffalo_l/det_10g.onnx   models/
-cp /tmp/buffalo_l/w600k_r50.onnx models/face.onnx
+# 3. Start the daemon (Arch doesn't auto-start it on install)
+sudo systemctl enable --now linhellod
 
-# 4. Run the setup wizard — it does everything else
-sudo target/release/linhello tui
+# 4. Face-recognition models (~250 MB, one time)
+sudo linhello fetch-models
+
+# 5. Set up — pick your camera, enroll, and wire up login
+sudo linhello tui
 ```
 
-The wizard installs the daemon, checks your hardware, picks your camera, enrolls
-your face, and wires up login — one step at a time, showing you every change it
-makes to your system.
+`onnxruntime` is the one model dependency Arch packages for you — the
+`onnxruntime-cuda` build works too, since it provides `onnxruntime`. The wizard
+checks your hardware, picks your camera, enrolls your face, and wires up login —
+one step at a time, showing you every change it makes to your system.
+
+### Set up from the CLI (instead of the wizard)
+
+`linhello tui` runs all of this interactively. If you'd rather drive it step by
+step — for scripting, headless work, or just to see each piece — every stage has
+a plain command (all of these need `sudo`):
+
+```sh
+sudo linhello doctor                # check TPM, camera, models, ONNX — should say READY
+sudo linhello enroll --user "$USER" # look at the camera and hold still (captures 5 samples)
+sudo linhello test                  # confirm it recognizes you (safe; can't lock you out)
+
+# Wire face login into your PAM stacks — greeter + lock screen, plus sudo with --sudo.
+# Add --dry-run first to preview the exact edits without changing anything:
+sudo linhello pam enable --sudo
+sudo linhello seal-password         # seal your login password so face login unlocks the keyring
+
+linhello pam status                 # show what's currently wired
+sudo linhello pam disable           # remove face login again (password login always stays)
+```
+
+Re-run `sudo linhello enroll` anytime to add samples (glasses on/off, varied
+lighting); auth always takes the best match. Password login and the TTY console
+(Ctrl+Alt+F2) are never touched, so you always have a way in.
 
 ## 🎯 Everyday commands
 
