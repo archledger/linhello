@@ -26,26 +26,32 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
 
 ### Fedora
 
-Install the prebuilt package from the
-[latest release](https://github.com/archledger/linhello/releases/latest) (grab the
-`.fcNN.x86_64.rpm` matching your Fedora version):
+Install from the COPR — `dnf` pulls every dependency (including ONNX Runtime,
+which isn't in Fedora's main repos) and updates ride along with `dnf upgrade`:
 
 ```sh
-# 1. Download + install the package
-curl -LO https://github.com/archledger/linhello/releases/download/v0.3.0/linhello-0.3.0-1.fc44.x86_64.rpm
-sudo dnf install ./linhello-0.3.0-1.fc44.x86_64.rpm
+sudo dnf copr enable archledger/linhello
+sudo dnf install linhello        # daemon + ONNX Runtime, pulled automatically
 
-# 2. Fetch the face-recognition models (~250 MB, one time)
-sudo linhello fetch-models
-
-# 3. Run the setup wizard — it starts the daemon, enrolls your face, and wires up login
-sudo linhello tui
+sudo linhello fetch-models       # the ~250 MB face models (one time)
+sudo linhello tui                # enroll your face + wire up login
 ```
 
-> **ONNX Runtime** is the one dependency not in Fedora's main repos. Install it from
-> RPMFusion/COPR or build it before step 3 — `linhello deps` prints the exact names,
-> and the daemon reports an actionable error if it's missing. The rest (`tpm2-tss`,
-> `pam`, `libv4l`) is pulled in automatically by `dnf`.
+The daemon starts on install, so `linhello doctor` works right away. Updates:
+just `sudo dnf upgrade`.
+
+<details><summary>Alternative — install the release RPM directly (no COPR)</summary>
+
+Download the `.fcNN.x86_64.rpm` from the
+[latest release](https://github.com/archledger/linhello/releases/latest), then:
+
+```sh
+sudo dnf install ./linhello-*.fc*.x86_64.rpm
+sudo linhello fetch-onnx         # ONNX Runtime isn't in Fedora's main repos
+sudo linhello fetch-models
+sudo linhello tui
+```
+</details>
 
 ### Arch Linux
 

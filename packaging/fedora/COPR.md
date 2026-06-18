@@ -1,0 +1,73 @@
+# Publishing LinuxHello to a Fedora COPR
+
+[COPR](https://copr.fedorainfracloud.org/) is Fedora's community build/repo
+service. A LinuxHello COPR lets Fedora users install **and update** through `dnf`
+the way they expect, with dependencies resolved natively:
+
+```sh
+sudo dnf copr enable archledger/linhello
+sudo dnf install linhello          # pulls onnxruntime + the rest automatically
+# updates ride along with normal `sudo dnf upgrade`
+```
+
+The COPR ships **two** packages, because ONNX Runtime isn't in Fedora's main
+repositories:
+
+| Package      | Spec                  | What it is |
+|--------------|-----------------------|------------|
+| `onnxruntime`| `onnxruntime.spec`    | Official Microsoft prebuilt `libonnxruntime.so`, version-matched to the `ort` crate LinuxHello is built against (1.22.x ↔ ort 2.0.0-rc.10). |
+| `linhello`   | `linhello.spec`       | The daemon/CLI/PAM module. `Recommends: onnxruntime`, so `dnf` pulls it from the same COPR by default. |
+
+## One-time: create the project
+
+Requires a [Fedora account](https://accounts.fedoraproject.org/) and
+`sudo dnf install copr-cli`, then `copr-cli` authenticated via the API token from
+<https://copr.fedorainfracloud.org/api/>.
+
+```sh
+copr-cli create linhello \
+    --chroot fedora-44-x86_64 \
+    --chroot fedora-rawhide-x86_64 \
+    --enable-net on \
+    --description "Windows Hello-style face authentication for Linux"
+```
+
+**Network must be on** (`--enable-net on`, or the project's *Settings → Build
+options*): `linhello.spec`'s `cargo build` fetches crates from crates.io inside
+the chroot. (The stricter, network-free alternative is to `cargo vendor` the
+dependencies into the SRPM — not done yet.) `onnxruntime` itself builds offline
+— its tarball is bundled in the SRPM.
+
+(Add `fedora-NN-aarch64` chroots later — `onnxruntime.spec` already supports
+aarch64; `build-srpms.sh` must then be run on/for that arch.)
+
+## Each release: build + upload
+
+From a clean checkout (pass the signed release tag so the SRPM matches the
+release exactly):
+
+```sh
+packaging/fedora/build-srpms.sh v0.3.0          # -> target/rpmbuild/SRPMS/*.src.rpm
+
+# Build onnxruntime FIRST so linhello's weak dep resolves in the same repo:
+copr-cli build linhello target/rpmbuild/SRPMS/onnxruntime-*.src.rpm
+copr-cli build linhello target/rpmbuild/SRPMS/linhello-*.src.rpm
+```
+
+`onnxruntime` only needs rebuilding when its pinned version changes (i.e. when a
+LinuxHello release bumps the `ort` crate). `linhello` is rebuilt every release.
+
+> COPR builds each SRPM in a clean mock chroot. `onnxruntime.spec` just unpacks
+> the bundled prebuilt (no network). `linhello.spec` compiles the Rust workspace,
+> which fetches crates — hence `--enable-net on` above.
+
+## Verifying a build locally first
+
+`build-srpms.sh` produces the exact SRPMs COPR consumes. To dry-run a full build
+the way COPR does (clean chroot), use mock:
+
+```sh
+sudo dnf install mock
+mock -r fedora-44-x86_64 target/rpmbuild/SRPMS/onnxruntime-*.src.rpm
+mock -r fedora-44-x86_64 target/rpmbuild/SRPMS/linhello-*.src.rpm
+```
