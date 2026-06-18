@@ -20,9 +20,34 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
 
 - A TPM 2.0 chip (most PCs since ~2016 — check: `ls /dev/tpm*`)
 - A webcam (a Windows Hello IR camera is a bonus, not required)
-- Arch Linux (Debian/Ubuntu/Fedora support is experimental)
+- Arch Linux or Fedora (Debian/Ubuntu support is experimental)
 
 ## ⚡ Install
+
+### Fedora
+
+Install the prebuilt package from the
+[latest release](https://github.com/archledger/linhello/releases/latest) (grab the
+`.fcNN.x86_64.rpm` matching your Fedora version):
+
+```sh
+# 1. Download + install the package
+curl -LO https://github.com/archledger/linhello/releases/download/v0.3.0/linhello-0.3.0-1.fc44.x86_64.rpm
+sudo dnf install ./linhello-0.3.0-1.fc44.x86_64.rpm
+
+# 2. Fetch the face-recognition models (~250 MB, one time)
+sudo linhello fetch-models
+
+# 3. Run the setup wizard — it starts the daemon, enrolls your face, and wires up login
+sudo linhello tui
+```
+
+> **ONNX Runtime** is the one dependency not in Fedora's main repos. Install it from
+> RPMFusion/COPR or build it before step 3 — `linhello deps` prints the exact names,
+> and the daemon reports an actionable error if it's missing. The rest (`tpm2-tss`,
+> `pam`, `libv4l`) is pulled in automatically by `dnf`.
+
+### Arch Linux
 
 ```sh
 # 1. Dependencies
