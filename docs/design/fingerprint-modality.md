@@ -1,7 +1,9 @@
 # LinuxHello: Fingerprint as a First-Class Secure-Tier Method
 
-**Status:** **Phase 1 implemented** (tier/method model, detection, suggestion,
-CLI + `pam_fprintd` wiring). Phase 2 (greeter method-chooser) is deferred — see §5.
+**Status:** **Implemented & hardware-validated** — tier/method model, detection,
+suggestion, named fingerprints, duplicate detection, daemon method-gating, CLI +
+TUI + `setup`, and per-distro `pam_fprintd` wiring (Debian/Fedora auto, Arch
+guided). The Windows-style greeter chooser is intentionally not pursued (§7).
 **Goal:** Treat fingerprint as a standalone **secure-tier** unlock method
 (equal to IR face), never combined with face. linhello picks a sensible default
 for the detected hardware, lets the user switch to any method their hardware
@@ -86,24 +88,41 @@ show fingerprint natively. The face method stays handled by `pam_linhello`.
   `linhello fingerprint enable` (enroll via `fprintd-enroll`, then wire
   `pam_fprintd`: `pam-auth-update --enable fprintd` on Debian; authselect
   feature on Fedora; manual stanza guidance elsewhere).
-- **Wizards**: both the headless `setup` and the **TUI** (`linhello tui`) now
-  include a fingerprint step. The TUI gains a dedicated **Fingerprint** screen
-  (after Identify, before Password) that shows the reader, the detected
-  methods/tiers, the recommended default, and — on `e` — suspends the
-  full-screen view to run the interactive `fprintd-enroll` + PAM wiring, then
-  resumes. It is an optional step (does not gate progression).
+- **`method` gating in the daemon**: `method = fingerprint` in `policy.conf`
+  disables face (the daemon denies, so `pam_linhello` stays silent and the
+  greeter/lock screen no longer says "Looking for your face…"). `fingerprint
+  enable` records the method; `fingerprint disable` unwires `pam_fprintd` and
+  clears it so face resumes. `auto`/`face-*`/unset keep face active (fail-safe:
+  an unknown value never disables face).
+- **Named fingerprints** (Android-style): `fingerprint add [--name]` enrolls the
+  next free fprintd slot under a friendly name (stored in
+  `/etc/linhello/<user>/fingerprints.conf`); `status` lists them.
+- **Duplicate detection**: enrollment uses fprintd's native `enroll-duplicate`,
+  reporting the existing enrollment and saving nothing.
+- **Wizards**: both the headless `setup` and the **TUI** (`linhello tui`) include
+  a fingerprint step. The TUI's dedicated **Fingerprint** screen (after Identify;
+  the TPM password-seal step is skipped on RGB-only since face never unseals
+  there) shows the reader, enrolled fingers with names, the detected
+  methods/tiers, the configured method, and — on `e` — suspends to run the
+  interactive `fprintd-enroll` + PAM wiring, then resumes. Optional; never gates.
 
 RGB-only face is unchanged; fingerprint is additive and opt-in.
 
-## 6. Phase 2 roadmap
+## 6. Validated on hardware
 
-1. **`method` in policy.conf**: have the daemon read the chosen method and
-   reflect it in `doctor`/`policy-status` (the per-method PAM wiring already
-   makes it functional; this is reporting/consistency).
-2. **Greeter method-chooser** ("like Windows 11"): investigate per-desktop. On
-   GDM, fingerprint + password appear natively once `pam_fprintd` is wired; a
-   polished click-to-choose chooser is limited by the greeter, not linhello.
-   KDE/SDDM differ. Deferred until the core is validated in the field.
-4. **Validation**: end-to-end login/sudo with a physically enrolled finger
-   (Phase 1 validated detection + the tier-selection model; live auth runs
-   through `pam_fprintd`).
+End-to-end on a ThinkPad (Synaptics reader, RGB-only camera): named enrollment,
+duplicate refusal, `status`/`doctor`/TUI, `enable`↔`disable` (PAM
+wire/unwire + method flip), and the method gating proven via `AuthIntent`
+(`engage:false` under `method=fingerprint`, `engage:true` under `auto`) and on
+the real lock screen (fingerprint prompt, no "Looking for your face").
+
+## 7. Not pursued
+
+- **Greeter method-chooser** ("like Windows 11", per-desktop click-to-choose):
+  intentionally **not** implemented — a user picks one method anyway, and a
+  polished chooser is bounded by the greeter (GDM/KDE), not linhello. Fingerprint
+  + password already appear natively once `pam_fprintd` is wired.
+- **Keyring note** (not a bug): with `method=fingerprint`, neither face nor
+  fingerprint releases the login password, so the GNOME keyring isn't auto-
+  unlocked by the biometric (same as Windows Hello fingerprint) — the password
+  unlocks it. Use `face-ir` + `seal-password` if keyring auto-unlock is desired.
