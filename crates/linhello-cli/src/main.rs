@@ -558,44 +558,13 @@ fn set_fingerprint_name(user: &str, slot: &str, name: &str) {
 /// Returns Ok(true) if a finger was enrolled, Ok(false) if skipped (duplicate or
 /// user declined). Used by both `fingerprint add` and first-time `enable`.
 fn enroll_named_finger(user: &str, name: Option<String>) -> Result<bool> {
-    use linhello_fingerprint::{self as fp, VerifyOutcome};
+    use linhello_fingerprint::{self as fp, EnrollOutcome};
 
     let Some(slot) = fp::free_finger(user) else {
         bail!("all ten finger slots are already enrolled — remove one with `fprintd-delete` first.");
     };
 
-    // Duplicate check: if the user already has fingers, scan once and make sure
-    // the finger they're about to add isn't already enrolled.
-    if fp::has_enrollment(user) {
-        println!(
-            "First, briefly touch the finger you want to add — I'll check it isn't \
-             already enrolled."
-        );
-        match fp::verify_once(user) {
-            VerifyOutcome::Match => {
-                // Identify which name(s) it could be (fprintd-verify doesn't name
-                // the matched slot, so list the enrolled ones).
-                let existing: Vec<String> = fp::enrolled_fingers(user)
-                    .iter()
-                    .map(|s| match fingerprint_name(user, s) {
-                        Some(n) => format!("{n} [{s}]"),
-                        None => s.clone(),
-                    })
-                    .collect();
-                println!(
-                    "✗ That finger is already enrolled (you have: {}). Not adding a duplicate.",
-                    existing.join(", ")
-                );
-                return Ok(false);
-            }
-            VerifyOutcome::NoMatch => println!("  good — that's a new finger; let's enroll it."),
-            VerifyOutcome::Unavailable => {
-                println!("  (couldn't run the duplicate check; continuing with enrollment.)")
-            }
-        }
-    }
-
-    // Friendly name.
+    // Friendly name (prompt if not supplied and stdin is interactive).
     let name = match name {
         Some(n) if !n.trim().is_empty() => n.trim().to_string(),
         _ => {
@@ -614,12 +583,29 @@ fn enroll_named_finger(user: &str, name: Option<String>) -> Result<bool> {
     };
 
     println!("Enrolling \"{name}\" — touch the sensor repeatedly until complete…");
-    if fp::enroll_finger(user, slot).context("running fprintd-enroll")? {
-        set_fingerprint_name(user, slot, &name);
-        println!("✓ enrolled \"{name}\" ({slot}).");
-        Ok(true)
-    } else {
-        bail!("fprintd-enroll did not complete; nothing saved.");
+    // fprintd refuses (enroll-duplicate) if this finger is already enrolled, so
+    // the duplicate check is native and reliable — no extra pre-scan touch.
+    match fp::enroll_finger(user, slot) {
+        EnrollOutcome::Enrolled => {
+            set_fingerprint_name(user, slot, &name);
+            println!("✓ enrolled \"{name}\" ({slot}).");
+            Ok(true)
+        }
+        EnrollOutcome::Duplicate => {
+            let existing: Vec<String> = fp::enrolled_fingers(user)
+                .iter()
+                .map(|s| match fingerprint_name(user, s) {
+                    Some(n) => format!("{n} [{s}]"),
+                    None => s.clone(),
+                })
+                .collect();
+            println!(
+                "✗ That finger is already enrolled (you have: {}). Not saving a duplicate.",
+                existing.join(", ")
+            );
+            Ok(false)
+        }
+        EnrollOutcome::Failed(why) => bail!("enrollment did not complete ({why}); nothing saved."),
     }
 }
 

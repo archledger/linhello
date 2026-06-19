@@ -148,61 +148,58 @@ fn first_free(taken: &[String]) -> Option<&'static str> {
         .find(|f| !taken.iter().any(|t| t == f))
 }
 
-/// Run `fprintd-enroll -f <finger>` for `user`, inheriting stdio so the user
-/// sees the live "place / lift finger" prompts. Returns Ok(true) on success.
-pub fn enroll_finger(user: &str, finger: &str) -> std::io::Result<bool> {
+/// Outcome of an enrollment attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// A fresh finger was enrolled.
+    Enrolled,
+    /// fprintd refused: this finger is already enrolled (its native
+    /// `enroll-duplicate`). We surface this so the caller can name the existing
+    /// one and avoid storing a duplicate.
+    Duplicate,
+    /// Anything else (cancelled, timed out, reader error).
+    Failed(String),
+}
+
+/// Run `fprintd-enroll -f <finger>` for `user`, streaming its progress lines so
+/// the user sees each "place / lift finger" step live, while also capturing them
+/// to classify the result. fprintd itself detects a finger that's already
+/// enrolled (`enroll-duplicate`) — we map that to [`EnrollOutcome::Duplicate`].
+pub fn enroll_finger(user: &str, finger: &str) -> EnrollOutcome {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
     let Some(enroll) = tool("fprintd-enroll") else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "fprintd-enroll not installed",
-        ));
+        return EnrollOutcome::Failed("fprintd-enroll not installed".into());
     };
-    let status = Command::new(enroll)
+    let mut child = match Command::new(enroll)
         .args(["-f", finger, user])
-        .status()?;
-    Ok(status.success())
-}
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return EnrollOutcome::Failed(format!("spawn fprintd-enroll: {e}")),
+    };
 
-/// Outcome of a single dup-check verification (used at enroll time only — auth
-/// verification is performed by pam_fprintd, not here).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyOutcome {
-    /// The scanned finger matched an already-enrolled template.
-    Match,
-    /// Scanned but did not match any enrolled finger.
-    NoMatch,
-    /// No reader / no enrolled fingers / fprintd unavailable.
-    Unavailable,
-}
-
-/// Scan once and report whether the finger matches any already-enrolled template
-/// (`fprintd-verify`, automatic finger). Used to warn the user that a finger they
-/// are about to add is already enrolled — so we don't store a duplicate.
-pub fn verify_once(user: &str) -> VerifyOutcome {
-    if !has_enrollment(user) {
-        return VerifyOutcome::Unavailable;
+    let mut captured = String::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(std::io::Result::ok) {
+            println!("{line}"); // live feedback (also visible in the TUI-suspend flow)
+            captured.push_str(&line);
+            captured.push('\n');
+        }
     }
-    let Some(verify) = tool("fprintd-verify") else {
-        return VerifyOutcome::Unavailable;
-    };
-    let Ok(out) = Command::new(verify).arg(user).output() else {
-        return VerifyOutcome::Unavailable;
-    };
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    classify_verify_output(&combined)
-}
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
 
-fn classify_verify_output(output: &str) -> VerifyOutcome {
-    if output.contains("verify-match") {
-        VerifyOutcome::Match
-    } else if output.contains("verify-no-match") {
-        VerifyOutcome::NoMatch
+    if captured.contains("enroll-duplicate") {
+        EnrollOutcome::Duplicate
+    } else if ok && captured.contains("enroll-completed") {
+        EnrollOutcome::Enrolled
+    } else if ok {
+        // Exit 0 without an explicit token — treat as success.
+        EnrollOutcome::Enrolled
     } else {
-        VerifyOutcome::Unavailable
+        EnrollOutcome::Failed("enrollment did not complete".into())
     }
 }
 
@@ -230,18 +227,5 @@ mod tests {
         );
         let all: Vec<String> = FINGERS.iter().map(|s| s.to_string()).collect();
         assert_eq!(first_free(&all), None);
-    }
-
-    #[test]
-    fn verify_output_classification() {
-        assert_eq!(
-            classify_verify_output("Verify result: verify-match"),
-            VerifyOutcome::Match
-        );
-        assert_eq!(
-            classify_verify_output("Verify result: verify-no-match"),
-            VerifyOutcome::NoMatch
-        );
-        assert_eq!(classify_verify_output("some error"), VerifyOutcome::Unavailable);
     }
 }
