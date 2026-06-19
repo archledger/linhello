@@ -521,6 +521,12 @@ fn plan_action(
     let class = classify(service, warm);
     let tier = effective_tier(user);
     let mut action = decide(class, tier, &current_policy());
+    // If the user chose a non-face method (fingerprint), face auth is off: deny
+    // so the camera never engages and pam_linhello never says "Looking for your
+    // face…". pam_fprintd drives the prompt; the password is always the fallback.
+    if !face_is_active_method() {
+        action = Action::Deny;
+    }
     // Defence in depth: the sealed password is only ever released to a root peer
     // (the existing UnsealPassword rule). A non-root peer that somehow lands on
     // the unseal path is downgraded to a deny → password.
@@ -528,6 +534,19 @@ fn plan_action(
         action = Action::Deny;
     }
     (action, tier, class, warm)
+}
+
+/// Whether FACE is the configured unlock method. `method = fingerprint` in
+/// `policy.conf` disables face entirely (see [`plan_action`]); `auto` / unset /
+/// `face-*` keep face active, preserving existing behaviour.
+fn face_is_active_method() -> bool {
+    use linhello_common::biopolicy::UnlockMethod;
+    !matches!(
+        linhello_common::config::read_kv("policy.conf", "method")
+            .as_deref()
+            .and_then(UnlockMethod::parse),
+        Some(UnlockMethod::Fingerprint)
+    )
 }
 
 fn do_authenticate(user: &str, service: &str, peer_is_root: bool) -> Response {

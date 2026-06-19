@@ -223,6 +223,21 @@ enum FpAction {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Stop using fingerprint as the unlock method (unwire pam_fprintd, let face
+    /// resume). Keeps the enrolled finger so it can be re-enabled later.
+    Disable {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Enroll an ADDITIONAL fingerprint under a friendly name (Android-style).
+    /// Warns and refuses if the scanned finger is already enrolled.
+    Add {
+        /// Friendly name for this finger (prompted if omitted), e.g. "Right thumb".
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -356,14 +371,17 @@ fn fingerprint_status(user: &str) {
 
     println!("reader        : {reader}");
     if fp::available() {
-        println!(
-            "enrolled      : {}",
-            if fingers.is_empty() {
-                "no fingers — run `linhello fingerprint enable`".into()
-            } else {
-                format!("{} finger(s) [{}]", fingers.len(), fingers.join(", "))
+        if fingers.is_empty() {
+            println!("enrolled      : no fingers — run `linhello fingerprint enable`");
+        } else {
+            println!("enrolled      : {} finger(s)", fingers.len());
+            for slot in &fingers {
+                match fingerprint_name(user, slot) {
+                    Some(name) => println!("                • {name}  [{slot}]"),
+                    None => println!("                • {slot}"),
+                }
             }
-        );
+        }
     }
     println!("face camera   : {}", if av.face_ir { "RGB + IR" } else { "RGB only" });
     println!();
@@ -431,19 +449,12 @@ pub(crate) fn fingerprint_enable(user: &str) -> Result<()> {
         bail!("no fingerprint reader is registered with fprintd.");
     }
 
-    // 1. Enroll (interactive — user lifts and touches the sensor).
+    // 1. Enroll the first finger (named), unless one already exists.
     if fp::has_enrollment(user) {
         println!("{user} already has an enrolled fingerprint; skipping enrollment.");
-    } else {
-        let enroll = abs_tool("fprintd-enroll").context("fprintd-enroll not found")?;
-        println!("Enrolling a fingerprint for {user} (follow the prompts; lift and touch repeatedly)…");
-        let status = Command::new(enroll)
-            .arg(user)
-            .status()
-            .context("running fprintd-enroll")?;
-        if !status.success() {
-            bail!("fprintd-enroll did not complete; nothing was wired.");
-        }
+        println!("(add more with `linhello fingerprint add`.)");
+    } else if !enroll_named_finger(user, None)? {
+        bail!("no fingerprint was enrolled; nothing was wired.");
     }
 
     // 2. Wire pam_fprintd per distro so the greeter/sudo offer it. Password
@@ -477,20 +488,141 @@ pub(crate) fn fingerprint_enable(user: &str) -> Result<()> {
         }
     }
 
+    // Record fingerprint as the active method so the daemon disables face — the
+    // greeter/lock screen will say "Place your finger…" (pam_fprintd), not
+    // "Looking for your face…". The TTY/password fallback is untouched.
+    if let Err(e) = linhello_common::config::write_kv("policy.conf", "method", "fingerprint") {
+        println!("note: could not record method in policy.conf: {e}");
+    }
+
     println!(
-        "\nDone. Fingerprint is now a secure-tier method (screen unlock + login + sudo).\n\
-         Your password still works everywhere; any configured face unlock is unchanged."
+        "\nDone. Fingerprint is now your secure-tier method (screen unlock + login + sudo),\n\
+         and face prompts are suppressed. Your password still works everywhere.\n\
+         To switch back to face: `sudo linhello fingerprint disable`."
     );
     Ok(())
 }
 
-/// Resolve a tool to an absolute path (no $PATH trust).
-fn abs_tool(name: &str) -> Option<std::path::PathBuf> {
-    ["/usr/bin", "/bin", "/usr/local/bin"]
-        .iter()
-        .map(|d| std::path::PathBuf::from(d).join(name))
-        .find(|p| p.exists())
+/// Stop using fingerprint as the unlock method: unwire pam_fprintd and clear the
+/// `method` override so face (per the detected tier) resumes. The enrolled
+/// finger is kept (re-enable any time); to also erase it, `fprintd-delete`.
+pub(crate) fn fingerprint_disable(user: &str) -> Result<()> {
+    use linhello_common::platform::{self, DistroFamily};
+    let _ = user;
+    println!("Disabling fingerprint as the unlock method (enrollment is kept)…");
+    match platform::distro_family() {
+        DistroFamily::Debian => {
+            let st = Command::new("pam-auth-update")
+                .args(["--disable", "fprintd"])
+                .status()
+                .context("running pam-auth-update")?;
+            if !st.success() {
+                bail!("pam-auth-update --disable fprintd failed; run it manually to review.");
+            }
+            println!("removed the `fprintd` pam-auth-update profile.");
+        }
+        DistroFamily::Fedora => {
+            println!("Fedora: `sudo authselect disable-feature with-fingerprint && sudo authselect apply-changes`");
+        }
+        DistroFamily::Arch | DistroFamily::Other => {
+            println!("Remove the `auth … pam_fprintd.so` line(s) you added to /etc/pam.d.");
+        }
+    }
+    // Clear the method override → face resumes per the detected tier.
+    if let Err(e) = linhello_common::config::write_kv("policy.conf", "method", "auto") {
+        println!("note: could not update policy.conf: {e}");
+    }
+    println!(
+        "\nDone. Face auth resumes (per your camera tier); the finger prompt is removed.\n\
+         Your enrolled fingerprint is kept — re-enable with `linhello fingerprint enable`."
+    );
+    Ok(())
 }
+
+// ── Friendly fingerprint names (Android-style), layered over fprintd slots ──
+
+fn fp_names_file(user: &str) -> String {
+    format!("{user}/fingerprints.conf")
+}
+
+/// Friendly name for an enrolled finger slot, if the user gave one.
+fn fingerprint_name(user: &str, slot: &str) -> Option<String> {
+    linhello_common::config::read_kv(&fp_names_file(user), slot).filter(|s| !s.is_empty())
+}
+
+fn set_fingerprint_name(user: &str, slot: &str, name: &str) {
+    let _ = linhello_common::config::write_kv(&fp_names_file(user), slot, name);
+}
+
+/// Enroll one additional fingerprint under a friendly name, refusing duplicates.
+/// Returns Ok(true) if a finger was enrolled, Ok(false) if skipped (duplicate or
+/// user declined). Used by both `fingerprint add` and first-time `enable`.
+fn enroll_named_finger(user: &str, name: Option<String>) -> Result<bool> {
+    use linhello_fingerprint::{self as fp, VerifyOutcome};
+
+    let Some(slot) = fp::free_finger(user) else {
+        bail!("all ten finger slots are already enrolled — remove one with `fprintd-delete` first.");
+    };
+
+    // Duplicate check: if the user already has fingers, scan once and make sure
+    // the finger they're about to add isn't already enrolled.
+    if fp::has_enrollment(user) {
+        println!(
+            "First, briefly touch the finger you want to add — I'll check it isn't \
+             already enrolled."
+        );
+        match fp::verify_once(user) {
+            VerifyOutcome::Match => {
+                // Identify which name(s) it could be (fprintd-verify doesn't name
+                // the matched slot, so list the enrolled ones).
+                let existing: Vec<String> = fp::enrolled_fingers(user)
+                    .iter()
+                    .map(|s| match fingerprint_name(user, s) {
+                        Some(n) => format!("{n} [{s}]"),
+                        None => s.clone(),
+                    })
+                    .collect();
+                println!(
+                    "✗ That finger is already enrolled (you have: {}). Not adding a duplicate.",
+                    existing.join(", ")
+                );
+                return Ok(false);
+            }
+            VerifyOutcome::NoMatch => println!("  good — that's a new finger; let's enroll it."),
+            VerifyOutcome::Unavailable => {
+                println!("  (couldn't run the duplicate check; continuing with enrollment.)")
+            }
+        }
+    }
+
+    // Friendly name.
+    let name = match name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            print!("Name for this fingerprint (e.g. \"Right thumb\"): ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s).ok();
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                slot.replace('-', " ")
+            } else {
+                s
+            }
+        }
+    };
+
+    println!("Enrolling \"{name}\" — touch the sensor repeatedly until complete…");
+    if fp::enroll_finger(user, slot).context("running fprintd-enroll")? {
+        set_fingerprint_name(user, slot, &name);
+        println!("✓ enrolled \"{name}\" ({slot}).");
+        Ok(true)
+    } else {
+        bail!("fprintd-enroll did not complete; nothing saved.");
+    }
+}
+
 
 fn sbctl_installed() -> bool {
     Command::new("sbctl")
@@ -1238,6 +1370,19 @@ fn main() -> Result<()> {
             FpAction::Enable { user } => {
                 let user = user.map(Ok).unwrap_or_else(current_user)?;
                 fingerprint_enable(&user)?;
+            }
+            FpAction::Disable { user } => {
+                let user = user.map(Ok).unwrap_or_else(current_user)?;
+                fingerprint_disable(&user)?;
+            }
+            FpAction::Add { name, user } => {
+                let user = user.map(Ok).unwrap_or_else(current_user)?;
+                if !linhello_fingerprint::available() {
+                    bail!("no fingerprint reader detected (or fprintd not installed).");
+                }
+                if enroll_named_finger(&user, name)? {
+                    println!("Added. See all with `linhello fingerprint status`.");
+                }
             }
         },
         Cmd::Reseal => match send(Request::Reseal)? {

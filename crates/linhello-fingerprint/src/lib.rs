@@ -119,6 +119,93 @@ pub fn has_enrollment(user: &str) -> bool {
     !enrolled_fingers(user).is_empty()
 }
 
+/// The ten fprintd finger slots, in offer order. A friendly name (Android-style)
+/// is layered on top by the caller; the slot is the fprintd identity.
+pub const FINGERS: [&str; 10] = [
+    "right-index-finger",
+    "left-index-finger",
+    "right-thumb",
+    "left-thumb",
+    "right-middle-finger",
+    "left-middle-finger",
+    "right-ring-finger",
+    "left-ring-finger",
+    "right-little-finger",
+    "left-little-finger",
+];
+
+/// The first finger slot `user` has NOT enrolled, or `None` when all ten are
+/// taken. Used to place a new enrollment without clobbering an existing one.
+pub fn free_finger(user: &str) -> Option<&'static str> {
+    first_free(&enrolled_fingers(user))
+}
+
+/// Pure: first slot not in `taken`. Split out for testing.
+fn first_free(taken: &[String]) -> Option<&'static str> {
+    FINGERS
+        .iter()
+        .copied()
+        .find(|f| !taken.iter().any(|t| t == f))
+}
+
+/// Run `fprintd-enroll -f <finger>` for `user`, inheriting stdio so the user
+/// sees the live "place / lift finger" prompts. Returns Ok(true) on success.
+pub fn enroll_finger(user: &str, finger: &str) -> std::io::Result<bool> {
+    let Some(enroll) = tool("fprintd-enroll") else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "fprintd-enroll not installed",
+        ));
+    };
+    let status = Command::new(enroll)
+        .args(["-f", finger, user])
+        .status()?;
+    Ok(status.success())
+}
+
+/// Outcome of a single dup-check verification (used at enroll time only — auth
+/// verification is performed by pam_fprintd, not here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// The scanned finger matched an already-enrolled template.
+    Match,
+    /// Scanned but did not match any enrolled finger.
+    NoMatch,
+    /// No reader / no enrolled fingers / fprintd unavailable.
+    Unavailable,
+}
+
+/// Scan once and report whether the finger matches any already-enrolled template
+/// (`fprintd-verify`, automatic finger). Used to warn the user that a finger they
+/// are about to add is already enrolled — so we don't store a duplicate.
+pub fn verify_once(user: &str) -> VerifyOutcome {
+    if !has_enrollment(user) {
+        return VerifyOutcome::Unavailable;
+    }
+    let Some(verify) = tool("fprintd-verify") else {
+        return VerifyOutcome::Unavailable;
+    };
+    let Ok(out) = Command::new(verify).arg(user).output() else {
+        return VerifyOutcome::Unavailable;
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    classify_verify_output(&combined)
+}
+
+fn classify_verify_output(output: &str) -> VerifyOutcome {
+    if output.contains("verify-match") {
+        VerifyOutcome::Match
+    } else if output.contains("verify-no-match") {
+        VerifyOutcome::NoMatch
+    } else {
+        VerifyOutcome::Unavailable
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +219,29 @@ mod tests {
             vec!["right-index-finger", "left-index-finger"]
         );
         assert!(parse_enrolled_lines("User x has no fingers enrolled for Synaptics.").is_empty());
+    }
+
+    #[test]
+    fn first_free_picks_next_unused_slot() {
+        assert_eq!(first_free(&[]), Some("right-index-finger"));
+        assert_eq!(
+            first_free(&["right-index-finger".to_string()]),
+            Some("left-index-finger")
+        );
+        let all: Vec<String> = FINGERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(first_free(&all), None);
+    }
+
+    #[test]
+    fn verify_output_classification() {
+        assert_eq!(
+            classify_verify_output("Verify result: verify-match"),
+            VerifyOutcome::Match
+        );
+        assert_eq!(
+            classify_verify_output("Verify result: verify-no-match"),
+            VerifyOutcome::NoMatch
+        );
+        assert_eq!(classify_verify_output("some error"), VerifyOutcome::Unavailable);
     }
 }
