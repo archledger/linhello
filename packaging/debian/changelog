@@ -12,8 +12,15 @@ linhello (0.4.0-1) unstable; urgency=medium
     manual backstop for cases the automatic heal can't cover (Secure Boot off,
     TPM cleared, disk moved): `linhello set-recovery` / `linhello recover`.
   * Validated the previously-pending PolicyAuthorize TPM path on real hardware.
+  * Fingerprint as a standalone secure-tier unlock method (via fprintd). On
+    RGB-only machines (no IR) it's the secure default — unlocking screen, login,
+    and sudo — while RGB-only face stays available as a convenience option.
+    `method = fingerprint` suppresses the face prompt; `pam_fprintd` is wired
+    per distro (pam-auth-update on Debian, authselect on Fedora, guided on Arch).
+    New `linhello fingerprint {status,enable,disable,add}`, named fingerprints,
+    duplicate detection, and a fingerprint step in `setup` and the TUI.
 
- -- Ben <archledger236@gmail.com>  Fri, 19 Jun 2026 10:30:00 -0400
+ -- Ben <archledger236@gmail.com>  Fri, 19 Jun 2026 11:30:00 -0400
 
 linhello (0.3.2-1) unstable; urgency=medium
 

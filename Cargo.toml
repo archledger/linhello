@@ -6,6 +6,7 @@ members = [
     "crates/linhello-biometrics",
     "crates/linhello-liveness",
     "crates/linhello-secureboot",
+    "crates/linhello-fingerprint",
     "crates/linhello-pam",
     "crates/linhello-daemon",
     "crates/linhello-cli",
@@ -24,6 +25,7 @@ linhello-core = { path = "crates/linhello-core" }
 linhello-biometrics = { path = "crates/linhello-biometrics" }
 linhello-liveness = { path = "crates/linhello-liveness" }
 linhello-secureboot = { path = "crates/linhello-secureboot" }
+linhello-fingerprint = { path = "crates/linhello-fingerprint" }
 
 anyhow = "1"
 thiserror = "1"

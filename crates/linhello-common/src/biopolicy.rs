@@ -104,6 +104,138 @@ impl Default for Policy {
     }
 }
 
+// ── Unlock methods & tier selection (face / fingerprint) ─────────────────
+//
+// Methods are NOT combined. Each is a single authenticator with a fixed tier:
+//   * FaceRgb      — RGB-only face → Convenience (live-session unlock only)
+//   * FaceIr       — RGB+IR face   → Secure (login / sudo / polkit)
+//   * Fingerprint  — fprintd       → Secure (login / sudo / polkit)
+// linhello picks a sensible default for the detected hardware and lets the user
+// switch to any other method their hardware supports (explaining the trade-off
+// when they pick a weaker one).
+
+/// A concrete unlock method, each tied to exactly one authenticator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnlockMethod {
+    /// RGB-only face — convenience tier.
+    FaceRgb,
+    /// RGB+IR face with active-IR liveness — secure tier.
+    FaceIr,
+    /// Fingerprint via fprintd — secure tier.
+    Fingerprint,
+}
+
+impl UnlockMethod {
+    /// The assurance tier this method provides.
+    pub fn tier(self) -> Tier {
+        match self {
+            UnlockMethod::FaceRgb => Tier::Convenience,
+            UnlockMethod::FaceIr | UnlockMethod::Fingerprint => Tier::Secure,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnlockMethod::FaceRgb => "face-rgb",
+            UnlockMethod::FaceIr => "face-ir",
+            UnlockMethod::Fingerprint => "fingerprint",
+        }
+    }
+
+    /// Human label for prompts / doctor.
+    pub fn label(self) -> &'static str {
+        match self {
+            UnlockMethod::FaceRgb => "face (RGB only, convenience)",
+            UnlockMethod::FaceIr => "face (RGB + IR, secure)",
+            UnlockMethod::Fingerprint => "fingerprint (secure)",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "face-rgb" | "rgb" => Some(UnlockMethod::FaceRgb),
+            "face-ir" | "ir" => Some(UnlockMethod::FaceIr),
+            "fingerprint" | "finger" | "fp" => Some(UnlockMethod::Fingerprint),
+            _ => None,
+        }
+    }
+}
+
+/// Which methods this host can actually offer right now (hardware present and,
+/// for biometrics, enrolled). Derived by the daemon from camera + fprintd probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AvailableMethods {
+    /// RGB camera usable for face.
+    pub face_rgb: bool,
+    /// IR camera present (secure face possible).
+    pub face_ir: bool,
+    /// Fingerprint reader present with at least one enrolled finger (usable NOW).
+    pub fingerprint: bool,
+    /// Fingerprint reader + fprintd present, regardless of enrollment. Drives the
+    /// *recommendation* ("enroll a finger") even before any finger exists.
+    pub fingerprint_capable: bool,
+}
+
+impl AvailableMethods {
+    /// Every method the user may select on this host, strongest tier first.
+    /// (FaceRgb is always offered when an RGB camera exists, as the
+    /// convenience-tier opt-down.)
+    pub fn selectable(self) -> Vec<UnlockMethod> {
+        let mut v = Vec::new();
+        if self.face_ir {
+            v.push(UnlockMethod::FaceIr);
+        }
+        if self.fingerprint {
+            v.push(UnlockMethod::Fingerprint);
+        }
+        if self.face_rgb {
+            v.push(UnlockMethod::FaceRgb);
+        }
+        v
+    }
+
+    /// The method linhello defaults to: a secure method when one exists,
+    /// otherwise the convenience RGB face. `None` means no biometric method is
+    /// available at all (password only). When BOTH secure methods exist the
+    /// default is `FaceIr` but the user is expected to be offered the choice
+    /// (see [`needs_user_choice`]).
+    pub fn default_method(self) -> Option<UnlockMethod> {
+        if self.face_ir {
+            Some(UnlockMethod::FaceIr)
+        } else if self.fingerprint {
+            Some(UnlockMethod::Fingerprint)
+        } else if self.face_rgb {
+            Some(UnlockMethod::FaceRgb)
+        } else {
+            None
+        }
+    }
+
+    /// True when two distinct *secure* methods exist (IR face AND fingerprint),
+    /// so linhello should let the user pick rather than silently defaulting.
+    pub fn needs_user_choice(self) -> bool {
+        self.face_ir && self.fingerprint_capable
+    }
+
+    /// The strongest method this host's *hardware* supports — what linhello
+    /// recommends the user set up — regardless of whether the biometric is
+    /// enrolled yet. This is what the wizard/doctor should present as the goal:
+    /// on an RGB-only machine with a reader it recommends `Fingerprint` (secure),
+    /// not the convenience RGB face that merely happens to work today.
+    pub fn recommended_method(self) -> Option<UnlockMethod> {
+        if self.face_ir {
+            Some(UnlockMethod::FaceIr)
+        } else if self.fingerprint_capable {
+            Some(UnlockMethod::Fingerprint)
+        } else if self.face_rgb {
+            Some(UnlockMethod::FaceRgb)
+        } else {
+            None
+        }
+    }
+}
+
 /// Classify a PAM service into an operation class. `warm` disambiguates a
 /// live-session screen unlock from a fresh greeter login when one service
 /// (e.g. `gdm-password`) drives both.
@@ -238,6 +370,101 @@ mod tests {
         p.screen_unlock = ModalityReq::Off;
         assert_eq!(decide(OperationClass::ScreenUnlock, Tier::Secure, &p), Action::Deny);
         assert_eq!(decide(OperationClass::ScreenUnlock, Tier::Convenience, &p), Action::Deny);
+    }
+
+    #[test]
+    fn method_tiers_are_correct() {
+        assert_eq!(UnlockMethod::FaceRgb.tier(), Tier::Convenience);
+        assert_eq!(UnlockMethod::FaceIr.tier(), Tier::Secure);
+        assert_eq!(UnlockMethod::Fingerprint.tier(), Tier::Secure);
+        assert_eq!(UnlockMethod::parse("fp"), Some(UnlockMethod::Fingerprint));
+        assert_eq!(UnlockMethod::parse("face_ir"), Some(UnlockMethod::FaceIr));
+        assert_eq!(UnlockMethod::parse("nope"), None);
+    }
+
+    #[test]
+    fn rgb_only_defaults_to_convenience() {
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: false,
+            fingerprint_capable: false,
+        };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceRgb));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::FaceRgb));
+        assert!(!av.needs_user_choice());
+        assert_eq!(av.selectable(), vec![UnlockMethod::FaceRgb]);
+    }
+
+    #[test]
+    fn rgb_plus_unenrolled_reader_recommends_fingerprint() {
+        // The bug the TUI surfaced: a reader is PRESENT but not enrolled yet. The
+        // *active* method is still convenience face, but the RECOMMENDATION must
+        // be the secure fingerprint (enroll it), not convenience face.
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: false,        // not enrolled yet
+            fingerprint_capable: true, // reader present
+        };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceRgb)); // works now
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::Fingerprint)); // goal
+    }
+
+    #[test]
+    fn rgb_plus_fingerprint_defaults_to_secure_fingerprint() {
+        // The user's example, once enrolled: RGB-only camera + fingerprint →
+        // fingerprint is both the default AND the recommendation.
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: true,
+            fingerprint_capable: true,
+        };
+        assert_eq!(av.default_method(), Some(UnlockMethod::Fingerprint));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::Fingerprint));
+        assert!(!av.needs_user_choice()); // only one secure method
+        assert_eq!(
+            av.selectable(),
+            vec![UnlockMethod::Fingerprint, UnlockMethod::FaceRgb]
+        );
+    }
+
+    #[test]
+    fn ir_only_is_secure_face() {
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: true,
+            fingerprint: false,
+            fingerprint_capable: false,
+        };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceIr));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::FaceIr));
+        assert!(!av.needs_user_choice());
+    }
+
+    #[test]
+    fn ir_and_fingerprint_lets_user_choose() {
+        // Both secure → linhello should prompt rather than silently picking.
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: true,
+            fingerprint: true,
+            fingerprint_capable: true,
+        };
+        assert!(av.needs_user_choice());
+        assert_eq!(
+            av.selectable(),
+            vec![UnlockMethod::FaceIr, UnlockMethod::Fingerprint, UnlockMethod::FaceRgb]
+        );
+    }
+
+    #[test]
+    fn no_biometrics_means_password_only() {
+        let av = AvailableMethods::default();
+        assert_eq!(av.default_method(), None);
+        assert_eq!(av.recommended_method(), None);
+        assert!(av.selectable().is_empty());
     }
 
     #[test]

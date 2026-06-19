@@ -72,6 +72,7 @@ enum Screen {
     Enroll,
     Calibrate,
     Identify,
+    Fingerprint,
     Password,
     Pam,
     Done,
@@ -90,6 +91,7 @@ impl Screen {
             Screen::Enroll => "Enroll",
             Screen::Calibrate => "Calibrate",
             Screen::Identify => "Identify",
+            Screen::Fingerprint => "Fingerprint",
             Screen::Password => "Password",
             Screen::Pam => "Login wiring",
             Screen::Done => "Done",
@@ -100,7 +102,7 @@ impl Screen {
 
 /// The linear wizard path. `Uninstall` is intentionally excluded — it is a side
 /// screen, not a step.
-const ORDER: [Screen; 11] = [
+const ORDER: [Screen; 12] = [
     Screen::Welcome,
     Screen::Install,
     Screen::Doctor,
@@ -109,6 +111,7 @@ const ORDER: [Screen; 11] = [
     Screen::Enroll,
     Screen::Calibrate,
     Screen::Identify,
+    Screen::Fingerprint,
     Screen::Password,
     Screen::Pam,
     Screen::Done,
@@ -260,6 +263,20 @@ struct App {
     /// Set true once the user explicitly saves a camera selection this session
     /// (or an existing cameras.conf is present) — gates leaving the Cameras step.
     cameras_saved: bool,
+    /// Fingerprint reader name (None when no reader / fprintd absent), snapshot.
+    fp_reader: Option<String>,
+    /// Enrolled fingers for the active profile, snapshot at screen entry.
+    fp_enrolled: Vec<String>,
+    /// Detected unlock methods (camera tiers + fingerprint), snapshot at entry —
+    /// so the render path never spawns busctl/fprintd/camera probes.
+    fp_methods: linhello_common::biopolicy::AvailableMethods,
+    /// (slot, friendly name) for each enrolled finger, snapshot at entry.
+    fp_named: Vec<(String, Option<String>)>,
+    /// Configured `method` from policy.conf (e.g. "fingerprint" / "auto"), snapshot.
+    fp_method: String,
+    /// Set by the Fingerprint screen to ask the event loop to suspend the TUI
+    /// and run the interactive enroll + PAM-wiring flow, then resume.
+    pending_fp_enable: bool,
     status: String,
     should_quit: bool,
 }
@@ -319,6 +336,12 @@ impl App {
             activity: Vec::new(),
             last_poll: Instant::now(),
             cameras_saved,
+            fp_reader: None,
+            fp_enrolled: Vec::new(),
+            fp_methods: linhello_common::biopolicy::AvailableMethods::default(),
+            fp_named: Vec::new(),
+            fp_method: "auto".into(),
+            pending_fp_enable: false,
             status: String::new(),
             should_quit: false,
         }
@@ -408,18 +431,39 @@ impl App {
         if self.gate().is_err() {
             return;
         }
-        let i = self.step_index();
-        if i + 1 < ORDER.len() {
-            self.screen = ORDER[i + 1];
-            self.on_enter();
+        let mut i = self.step_index();
+        while i + 1 < ORDER.len() {
+            i += 1;
+            if self.screen_applicable(ORDER[i]) {
+                self.screen = ORDER[i];
+                self.on_enter();
+                return;
+            }
         }
     }
 
     fn prev(&mut self) {
-        let i = self.step_index();
-        if i > 0 {
-            self.screen = ORDER[i - 1];
-            self.on_enter();
+        let mut i = self.step_index();
+        while i > 0 {
+            i -= 1;
+            if self.screen_applicable(ORDER[i]) {
+                self.screen = ORDER[i];
+                self.on_enter();
+                return;
+            }
+        }
+    }
+
+    /// Whether a wizard step applies to this host. The TPM password-seal
+    /// (`Password`) exists only so SECURE-tier **face** can release the login
+    /// password (keyring unlock / sudo-without-prompt). On an RGB-only
+    /// (convenience) face tier, face never unseals, so the step is meaningless —
+    /// skip it. (Fingerprint, the secure method here, uses pam_fprintd, not this
+    /// TPM password envelope.)
+    fn screen_applicable(&self, screen: Screen) -> bool {
+        match screen {
+            Screen::Password => linhello_biometrics::camera::ir_device().is_some(),
+            _ => true,
         }
     }
 
@@ -453,7 +497,44 @@ impl App {
                 }
             }
             Screen::Pam => self.pam = crate::pamwire::status(),
+            Screen::Fingerprint => self.refresh_fingerprint(),
             _ => {}
+        }
+    }
+
+    /// Snapshot the fingerprint reader + this profile's enrolled fingers (the
+    /// Fingerprint screen renders from these, to avoid spawning busctl/fprintd
+    /// on every 200ms redraw).
+    fn refresh_fingerprint(&mut self) {
+        self.fp_reader = if linhello_fingerprint::available() {
+            Some(
+                linhello_fingerprint::device_name()
+                    .unwrap_or_else(|| "fingerprint reader".into()),
+            )
+        } else {
+            None
+        };
+        self.fp_enrolled = linhello_fingerprint::enrolled_fingers(&self.active_profile);
+        self.fp_methods = crate::available_methods(&self.active_profile);
+        self.fp_named = self
+            .fp_enrolled
+            .iter()
+            .map(|s| (s.clone(), crate::fingerprint_name(&self.active_profile, s)))
+            .collect();
+        self.fp_method = linhello_common::config::read_kv("policy.conf", "method")
+            .unwrap_or_else(|| "auto".into());
+    }
+
+    fn fingerprint_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Char('e')) {
+            if !linhello_fingerprint::available() {
+                self.status =
+                    "no fingerprint reader detected (or fprintd not installed)".into();
+                return;
+            }
+            // The actual enroll is interactive (touch the sensor) and pam-auth-update
+            // needs a normal terminal, so the event loop suspends the TUI to run it.
+            self.pending_fp_enable = true;
         }
     }
 
@@ -636,6 +717,7 @@ impl App {
             Screen::Identify => self.identify_key(code),
             Screen::Password => self.password_key(code),
             Screen::Pam => self.pam_key(code),
+            Screen::Fingerprint => self.fingerprint_key(code),
             Screen::Doctor if matches!(code, KeyCode::Up) => {
                 self.doctor_scroll = self.doctor_scroll.saturating_sub(1);
             }
@@ -1530,6 +1612,7 @@ impl App {
             Screen::Identify => vec![("Enter", "identify me")],
             Screen::Password => vec![("type", "password"), ("Enter", "seal"), ("Esc", "clear")],
             Screen::Pam => vec![("e", "enable greeter"), ("a", "enable + sudo"), ("d", "disable")],
+            Screen::Fingerprint => vec![("e", "enroll + enable fingerprint")],
             Screen::Done => vec![],
             Screen::Uninstall => vec![],
         }
@@ -1602,6 +1685,7 @@ impl App {
             Screen::Identify => self.body_identify(frame, area),
             Screen::Password => self.body_password(frame, area),
             Screen::Pam => self.body_pam(frame, area),
+            Screen::Fingerprint => self.body_fingerprint(frame, area),
             Screen::Uninstall => self.body_uninstall(frame, area),
             Screen::Done => {
                 let enrolled = !self.install.enrolled_users.is_empty()
@@ -2559,6 +2643,108 @@ impl App {
         ));
         self.body_paragraph(frame, area, lines);
     }
+
+    fn body_fingerprint(&self, frame: &mut Frame, area: Rect) {
+        let av = self.fp_methods;
+        let mut lines = vec![
+            Line::from("Fingerprint — a secure-tier unlock method".bold()),
+            Line::from(""),
+            Line::from("Fingerprint is a standalone secure method (like IR face): it can unlock"),
+            Line::from("the screen, the login screen, and sudo. It is NOT combined with face —"),
+            Line::from("pick whichever you prefer; your password always still works."),
+            Line::from(""),
+        ];
+        match &self.fp_reader {
+            None => {
+                lines.push(Line::from(
+                    "No fingerprint reader detected (or fprintd not installed).".yellow(),
+                ));
+                lines.push(Line::from(
+                    "This step is optional — continue with face / password.",
+                ));
+            }
+            Some(name) => {
+                lines.push(Line::from(format!("reader   : {name}")));
+                if self.fp_named.is_empty() {
+                    lines.push(Line::from(format!("enrolled : none   (profile: {})", self.active_profile)));
+                } else {
+                    lines.push(Line::from(format!(
+                        "enrolled : {} finger(s)   (profile: {})",
+                        self.fp_named.len(),
+                        self.active_profile
+                    )));
+                    for (slot, fname) in &self.fp_named {
+                        match fname {
+                            Some(n) => lines.push(Line::from(format!("             • {n}  [{slot}]"))),
+                            None => lines.push(Line::from(format!("             • {slot}"))),
+                        }
+                    }
+                }
+                lines.push(Line::from(format!(
+                    "face cam : {}",
+                    if av.face_ir { "RGB + IR" } else { "RGB only" }
+                )));
+                // Reflect the configured method so the user sees whether face is
+                // currently suppressed in favour of fingerprint.
+                if self.fp_method == "fingerprint" {
+                    lines.push(Line::from(
+                        "method   : fingerprint — face prompts are suppressed".to_string().green(),
+                    ));
+                } else {
+                    lines.push(Line::from(format!("method   : {} (face active)", self.fp_method)));
+                }
+                lines.push(Line::from(""));
+                // Recommendation is based on what the HARDWARE supports (so a
+                // reader that isn't enrolled yet still recommends fingerprint),
+                // shown distinctly from what is actually usable right now.
+                let recommended = av.recommended_method();
+                let active = av.default_method();
+                if let Some(rec) = recommended {
+                    lines.push(Line::from(vec![
+                        Span::raw("recommended : "),
+                        Span::styled(rec.label(), Style::default().fg(Color::Green)),
+                    ]));
+                    if active != recommended {
+                        if let Some(act) = active {
+                            lines.push(Line::from(format!(
+                                "active now  : {}  (until you set up the recommended method)",
+                                act.label()
+                            )));
+                        }
+                    }
+                }
+                lines.push(Line::from(""));
+                if self.fp_enrolled.is_empty() {
+                    if !av.face_ir {
+                        lines.push(Line::from(
+                            "✗ Press e to enroll a finger + enable it — the SECURE option here"
+                                .yellow(),
+                        ));
+                        lines.push(Line::from(
+                            "  (screen unlock + login + sudo). RGB-only face is convenience-tier:"
+                                .yellow(),
+                        ));
+                        lines.push(Line::from("  it only unlocks an already-open session.".yellow()));
+                    } else {
+                        lines.push(Line::from(
+                            "✗ Press e to enroll a finger — a secure alternative to IR face."
+                                .yellow(),
+                        ));
+                    }
+                } else {
+                    lines.push(Line::from(
+                        "✓ Fingerprint enrolled — secure tier active. Press e to re-wire if needed."
+                            .green(),
+                    ));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Pressing e briefly leaves the wizard to run the guided enrollment.".italic(),
+        ));
+        self.body_paragraph(frame, area, lines);
+    }
 }
 
 /// Human role of a PAM file for the wiring screen.
@@ -2607,7 +2793,30 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::
                 }
             }
         }
+        if app.pending_fp_enable {
+            app.pending_fp_enable = false;
+            run_fingerprint_enable_suspended(terminal, &app.active_profile);
+            app.refresh_fingerprint();
+        }
         app.tick();
     }
     Ok(())
+}
+
+/// Suspend the full-screen TUI, run the interactive fingerprint enroll + PAM
+/// wiring in the normal terminal (fprintd-enroll needs to prompt; pam-auth-update
+/// needs a cooked terminal), then re-enter the alternate screen.
+fn run_fingerprint_enable_suspended(terminal: &mut ratatui::DefaultTerminal, user: &str) {
+    use std::io::Write;
+    ratatui::restore();
+    println!("\n— LinuxHello: set up fingerprint —\n");
+    match crate::fingerprint_enable(user) {
+        Ok(()) => println!("\nFingerprint set up."),
+        Err(e) => println!("\nFingerprint setup did not finish: {e}"),
+    }
+    print!("\nPress Enter to return to the wizard… ");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    *terminal = ratatui::init();
 }

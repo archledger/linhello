@@ -25,9 +25,14 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
   anti-spoofing. A plain **RGB-only** webcam still works, but only to unlock an
   *already-logged-in* session (the "convenience" tier); face login/sudo then fall
   back to your password.
+- **…or a fingerprint reader.** On RGB-only laptops (no IR), a fingerprint is a
+  **secure-tier** method on its own — it unlocks the screen, login, **and** sudo,
+  the same as IR face. linhello detects it and can set it up for you (it drives
+  `fprintd`); see [Fingerprint](#-fingerprint-instead-of-or-alongside-face).
 - **Secure Boot — recommended.** With it, your secrets are bound to your boot
   state (the `Medium`/`Full` tiers); without it linhello still runs, but at its
-  weakest TPM tier (no boot-state binding).
+  weakest TPM tier (no boot-state binding). **Firmware/dbx updates don't break
+  face unlock** — on GRUB, linhello re-signs its PCR-7 policy automatically.
 - **Arch Linux or Fedora.** Debian/Ubuntu support is experimental.
 
 ## ⚡ Install
@@ -121,9 +126,10 @@ lighting); auth always takes the best match. Password login and the TTY console
 ## 🎯 Everyday commands
 
 ```sh
-linhello test        # does it recognize me right now?
-linhello doctor      # is everything healthy?
-sudo linhello tui    # re-run setup, manage profiles, or uninstall
+linhello test                 # does it recognize me right now?
+linhello doctor               # is everything healthy?
+linhello fingerprint status   # fingerprint reader / enrolled fingers / method
+sudo linhello tui             # re-run setup, manage profiles, or uninstall
 ```
 
 ## 🔄 Update
@@ -145,8 +151,13 @@ Face templates are encrypted (AES-256-GCM) with a key that only your TPM can
 release — and, when Secure Boot is enabled, only while your boot state is
 untampered (the `Medium`/`Full` tiers; without Secure Boot the key is still
 TPM-sealed but not bound to boot state). Anti-spoofing rejects photos and virtual
-cameras. Kernel updates don't break it.
-The TTY console login is never touched, so there's always a way in. Details:
+cameras. **Neither kernel nor firmware/dbx updates break it** — on a UKI the
+binding follows systemd's signed PCR-11 policy, and on GRUB linhello signs its
+own PCR-7 policy and re-signs it automatically after a firmware update (while
+Secure Boot stays on). A dedicated **recovery passphrase** (separate from your
+login password — `linhello set-recovery` / `linhello recover`) is the manual
+backstop for the rare cases that can't self-heal. The TTY console login is never
+touched, so there's always a way in. Details:
 [`docs/design/signed-pcr-policy.md`](docs/design/signed-pcr-policy.md).
 
 ### Security tiers (what face auth is allowed to do)
@@ -154,19 +165,39 @@ The TTY console login is never touched, so there's always a way in. Details:
 LinuxHello adapts to your camera, and `linhello doctor` shows exactly which tier
 you're on and what each operation does:
 
-- **Secure tier** — RGB **plus a working active-IR** camera. Face can log you in,
-  unlock your keyring, and authorize `sudo`/`polkit`, because IR liveness makes
-  spoofing hard. This is the Windows Hello-equivalent posture.
-- **Convenience tier** — RGB only (most laptops). Face **unlocks an already
-  open session** (screen unlock) but **never releases your password** — login and
-  `sudo` fall back to typing it. RGB-alone can't be trusted to release
-  credentials, so it structurally won't.
+- **Secure tier** — **IR face** (RGB + working active-IR) **or a fingerprint**.
+  Either can log you in, unlock your keyring, and authorize `sudo`/`polkit`:
+  IR liveness makes face-spoofing hard, and a fingerprint is a strong factor on
+  its own. This is the Windows Hello-equivalent posture.
+- **Convenience tier** — RGB-only face (most laptops, no IR or fingerprint). Face
+  **unlocks an already open session** (screen unlock) but **never releases your
+  password** — login and `sudo` fall back to typing it. RGB-alone can't be trusted
+  to release credentials, so it structurally won't.
 
 Anything remote (ssh) or unrecognized is always declined → password. Tune the
 per-operation policy in `/etc/linhello/policy.conf` (keys `screen_unlock`,
 `login`, `sudo`, `polkit` = `off`|`rgb`|`ir`; `tier` = `auto`|`secure`|
-`convenience`); defaults are the safe ones above. Rationale and evidence:
+`convenience`; `method` = `face-rgb`|`face-ir`|`fingerprint`|`auto`); defaults are
+the safe ones above. Rationale and evidence:
 [`docs/design/tiered-biometric-policy.md`](docs/design/tiered-biometric-policy.md).
+
+### 🫆 Fingerprint — instead of, or alongside, face
+
+If your machine has a fingerprint reader, linhello treats it as a **standalone
+secure-tier method** (never blended with face — you pick one). It's especially
+useful on RGB-only laptops, where it's the *only* way to reach the secure tier.
+
+```sh
+linhello fingerprint status        # reader, enrolled fingers, the recommended method
+sudo linhello fingerprint enable   # enroll a finger + wire it for login/sudo
+sudo linhello fingerprint add --name "Right thumb"   # add more, with Android-style names
+sudo linhello fingerprint disable  # stop using it; face/password resume
+```
+
+Verification runs through the standard `fprintd`/`pam_fprintd` (so the greeter
+shows the fingerprint prompt natively), wired per distro automatically. When
+fingerprint is your chosen method, the face prompt is suppressed. Your password
+always works as a fallback. The `setup` wizard and `linhello tui` offer it too.
 
 ## 🆚 Compared to Howdy
 
@@ -180,6 +211,8 @@ approach in a few respects:
 | Credential model | Password sealed in the **TPM**, released on a face match    | PAM module that returns success on a face match (no TPM)       |
 | Anti-spoofing    | Bundles a liveness model that rejects photos/virtual cameras | Its own docs note a well-printed photo can be enough to fool it |
 | Face recognition | InsightFace ONNX (ArcFace + SCRFD)                          | dlib / `face_recognition`                                     |
+| Second factor    | **Fingerprint** as a standalone secure-tier method (via fprintd) | Face only                                                |
+| Update-resilience| Survives kernel **and** firmware/dbx updates (auto re-sign) | A boot/firmware change can require re-enrolling               |
 | Maturity         | New                                                         | Mature, widely packaged                                       |
 
 ## 🧹 Uninstall

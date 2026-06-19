@@ -30,7 +30,36 @@ pub fn probe() -> CapabilityReport {
         onnxruntime_check(),
     ];
     checks.extend(model_checks());
+    if let Some(fp) = fingerprint_check() {
+        checks.push(fp);
+    }
     CapabilityReport { checks }
+}
+
+/// Report the fingerprint reader and, when the face tier is RGB-only (no IR),
+/// suggest fingerprint as a stronger complementary factor. Returns `None` (no
+/// line) when no reader is present, to avoid clutter on machines without one.
+fn fingerprint_check() -> Option<CapabilityCheck> {
+    if !linhello_fingerprint::available() {
+        return None;
+    }
+    let name = linhello_fingerprint::device_name().unwrap_or_else(|| "fingerprint reader".into());
+    let rgb_only = linhello_biometrics::camera::ir_device().is_none();
+    // State-neutral wording: this is a host probe, so it doesn't know whether a
+    // finger is already enrolled. `linhello fingerprint status` shows that.
+    let detail = if rgb_only {
+        format!(
+            "{name} present — a secure-tier method (screen unlock + login + sudo), \
+             stronger than RGB-only face. Manage with `linhello fingerprint` \
+             (RGB-only face stays available as a convenience option)."
+        )
+    } else {
+        format!(
+            "{name} present — a secure-tier alternative to IR face (both unlock \
+             everything); choose either. Manage with `linhello fingerprint`."
+        )
+    };
+    Some(check("Fingerprint", CapabilityStatus::Ok, false, detail))
 }
 
 fn tpm_check() -> CapabilityCheck {

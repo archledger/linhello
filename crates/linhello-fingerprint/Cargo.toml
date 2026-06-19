@@ -1,0 +1,11 @@
+[package]
+name = "linhello-fingerprint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Detection-only crate: drives fprintd's tooling via std::process. No other deps
+# (verification is performed by pam_fprintd in the PAM stack, not here).
+
