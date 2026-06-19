@@ -138,22 +138,42 @@ step — for scripting, headless work, or just to see each piece — every stage
 a plain command (all of these need `sudo`):
 
 ```sh
-sudo linhello doctor                # check TPM, camera, models, ONNX — should say READY
+sudo linhello doctor                # check TPM, camera(s), fingerprint, models, ONNX — should say READY
+
+# ── Option A: face ──────────────────────────────────────────────────────
 sudo linhello enroll --user "$USER" # look at the camera and hold still (captures 5 samples)
 sudo linhello test                  # confirm it recognizes you (safe; can't lock you out)
-
 # Wire face login into your PAM stacks — greeter + lock screen, plus sudo with --sudo.
 # Add --dry-run first to preview the exact edits without changing anything:
 sudo linhello pam enable --sudo
 sudo linhello seal-password         # seal your login password so face login unlocks the keyring
 
-linhello pam status                 # show what's currently wired
+# ── Option B: fingerprint ───────────────────────────────────────────────
+# A standalone secure-tier method — the secure choice on RGB-only laptops.
+# Enrolls a finger and wires pam_fprintd for login/sudo (password stays a fallback):
+sudo linhello fingerprint enable
+sudo linhello fingerprint add --name "Right thumb"   # add more fingers, named (Android-style)
+linhello fingerprint status                          # reader, enrolled fingers, active method
+sudo linhello fingerprint disable                    # stop using it; face/password resume
+
+# ── Recovery passphrase (recommended) ───────────────────────────────────
+# A dedicated backstop, SEPARATE from your login password, for the rare cases
+# the automatic TPM self-heal can't cover (Secure Boot off, TPM cleared, disk moved):
+sudo linhello set-recovery
+sudo linhello recover               # later: restore the template key + re-seal it (no re-enroll)
+
+linhello pam status                 # show what face login is currently wired
 sudo linhello pam disable           # remove face login again (password login always stays)
 ```
 
-Re-run `sudo linhello enroll` anytime to add samples (glasses on/off, varied
-lighting); auth always takes the best match. Password login and the TTY console
-(Ctrl+Alt+F2) are never touched, so you always have a way in.
+Pick the method that fits your hardware — linhello defaults sensibly (fingerprint
+is the secure default on RGB-only machines; IR face on machines with an IR camera)
+and you can switch any time. The chosen method lives in
+`/etc/linhello/policy.conf` (`method = face-rgb|face-ir|fingerprint|auto`); setting
+`fingerprint` suppresses the face prompt, and vice-versa. Re-run
+`sudo linhello enroll` anytime to add face samples (glasses on/off, varied
+lighting). Password login and the TTY console (Ctrl+Alt+F2) are never touched, so
+you always have a way in.
 
 ## 🎯 Everyday commands
 
