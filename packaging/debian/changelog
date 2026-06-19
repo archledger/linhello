@@ -1,3 +1,11 @@
+linhello (0.3.2-1) unstable; urgency=medium
+
+  * Sync Debian package version with the workspace (0.3.2).
+  * First build-test of the Debian packaging on a real Ubuntu box
+    (Ubuntu 26.04, amd64).
+
+ -- Ben <archledger236@gmail.com>  Thu, 18 Jun 2026 21:59:02 -0400
+
 linhello (0.2.0-1) unstable; urgency=medium
 
   * Version bump for the Fedora-port milestone (shared codebase). Debian
