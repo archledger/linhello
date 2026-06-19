@@ -62,3 +62,61 @@ jobs:
         with:
           files: dist/*.rpm
           fail_on_unmatched_files: true
+
+  debian-deb:
+    name: Build & publish deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debhelper devscripts dpkg-dev fakeroot \
+            clang libclang-dev pkg-config \
+            libtss2-dev libssl-dev libpam0g-dev gnupg
+
+      - name: Use a recent Rust toolchain
+        # ort's MSRV (1.81) outpaces the apt `rustc` on older Ubuntu (e.g. the
+        # GitHub runner image's), so pin a current stable rather than apt's.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the tag signature against the pinned key
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if [ ! -f packaging/trusted-signer.asc ]; then
+            echo "::error::packaging/trusted-signer.asc is missing — commit the exported public key."
+            exit 1
+          fi
+          gpg --import packaging/trusted-signer.asc
+          # actions/checkout leaves the tag name resolving to the commit, not the
+          # annotated tag object; re-fetch the real (signed) tag, then verify.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git verify-tag "${GITHUB_REF_NAME}"
+
+      - name: Check the changelog version matches the tag
+        run: |
+          deb_ver=$(dpkg-parsechangelog -l packaging/debian/changelog -S Version)
+          tag_ver="${GITHUB_REF_NAME#v}"
+          # Compare upstream versions (strip the Debian revision, e.g. -1).
+          if [ "${deb_ver%-*}" != "$tag_ver" ]; then
+            echo "::error::debian/changelog version ($deb_ver) does not match tag ${GITHUB_REF_NAME} — bump packaging/debian/changelog."
+            exit 1
+          fi
+
+      - name: Build the .deb
+        run: |
+          cp -rT packaging/debian debian
+          # -d skips the apt cargo/rustc build-dep check; the rustup toolchain
+          # above already provides a new-enough compiler for ort.
+          dpkg-buildpackage -b -us -uc -d
+          mkdir -p dist && cp ../linhello_*_*.deb dist/
+
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true

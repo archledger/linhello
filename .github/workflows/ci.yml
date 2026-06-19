@@ -54,6 +54,46 @@ jobs:
           path: ~/rpmbuild/RPMS/*/*.rpm
           if-no-files-found: error
 
-  # Debian/Ubuntu and Arch jobs are intentionally deferred: Fedora is the focus
-  # for now. Add a debian/ build job (debhelper) and an arch makepkg job here
-  # once those packages are build-tested on their native distros.
+  debian:
+    name: Debian build, test & deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debhelper devscripts dpkg-dev fakeroot \
+            clang libclang-dev pkg-config \
+            libtss2-dev libssl-dev libpam0g-dev
+
+      - name: Use a recent Rust toolchain
+        # ort's MSRV (1.81) outpaces the apt `rustc` on older Ubuntu.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Hardware-free unit tests
+        run: cargo test --release -p linhello-common -p linhello-core
+
+      - name: Sanity-check the Debian changelog
+        run: dpkg-parsechangelog -l packaging/debian/changelog
+
+      - name: Build the .deb
+        run: |
+          cp -rT packaging/debian debian
+          # -d skips the apt cargo/rustc build-dep check; the rustup toolchain
+          # above provides a new-enough compiler for ort.
+          dpkg-buildpackage -b -us -uc -d
+          mkdir -p dist && cp ../linhello_*_*.deb dist/
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linhello-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # The Arch makepkg job stays deferred — add it once the PKGBUILD is
+  # build-tested on a native Arch box.
