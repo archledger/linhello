@@ -141,6 +141,14 @@ pub enum Request {
     /// Set (or clear, with an empty name) a profile's friendly display name.
     /// Root-only.
     SetProfileName { user: String, name: String },
+    /// Wrap the user's current template key under a dedicated recovery
+    /// passphrase (separate from the login password) and persist the recovery
+    /// envelope. Requires the template key to be unsealable now. Root-only.
+    SaveRecovery { user: String, passphrase: SecretBytes },
+    /// Restore the template key from the recovery passphrase and re-seal it under
+    /// the current TPM policy — the manual backstop when the automatic self-heal
+    /// can't run (Secure Boot off, TPM cleared, disk moved). Root-only.
+    RestoreFromRecovery { user: String, passphrase: SecretBytes },
 }
 
 /// One enrolled identity, as reported by [`Request::ListProfiles`].
@@ -350,6 +358,10 @@ pub enum Response {
         candidates: Vec<IdentifyCandidate>,
     },
     ProfileNameSet,
+    /// A recovery passphrase was set (the template key was wrapped under it).
+    RecoverySaved,
+    /// The template key was restored from the recovery passphrase and re-sealed.
+    RecoveryRestored,
     /// Result of [`Request::AuthIntent`]: the decision the daemon *would* make for
     /// this (user, service, tier, warm) without capturing. `engage` is true when
     /// the action is Verify or Unseal (the camera will be lit), false for Deny.

@@ -33,6 +33,12 @@ use linhello_common::{BootMode, SecurityLevel};
 /// systemd actually ships and so could never reach `Full`. PCR 7 (Secure Boot
 /// state) is the separate literal gate ([`LITERAL_PCRS`]), not folded in here.
 pub const AUTHORIZED_PCRS: &[u32] = &[11];
+/// PCRs covered by linhello's *own* authorized signer on a non-UKI (GRUB)
+/// system: PCR 7 (Secure Boot state). Unlike the literal PCR-7 binding, this is
+/// self-healing — linhello re-signs the new PCR-7 policy after a firmware/dbx
+/// update (while Secure Boot stays enabled), so face unlock survives without a
+/// re-enroll. See [`crate::pcrsig`] for the signer.
+pub const LINHELLO_SIGNED_PCRS: &[u32] = &[7];
 /// PCRs covered by the literal fallback. PCR 7 only — stable across kernel
 /// updates (unlike PCR 11).
 pub const LITERAL_PCRS: &[u32] = &[7];
@@ -55,7 +61,14 @@ pub enum PolicyPlan {
 impl PolicyPlan {
     pub fn security_level(&self) -> SecurityLevel {
         match self {
-            PolicyPlan::Authorized { .. } => SecurityLevel::Full,
+            // systemd-signed PCR 11 (full boot-chain measurement) is the
+            // strongest tier; linhello's own PCR-7 signer is self-healing but
+            // coarser (Secure-Boot-state only), so it reports Medium like the
+            // literal PCR-7 binding it upgrades.
+            PolicyPlan::Authorized { pcrs, .. } if pcrs.as_slice() == AUTHORIZED_PCRS => {
+                SecurityLevel::Full
+            }
+            PolicyPlan::Authorized { .. } => SecurityLevel::Medium,
             PolicyPlan::Literal { .. } => SecurityLevel::Medium,
             PolicyPlan::None => SecurityLevel::Basic,
         }
@@ -74,24 +87,33 @@ impl PolicyPlan {
 pub fn plan() -> PolicyPlan {
     let sb = linhello_secureboot::is_secure_boot_enabled();
     let boot = linhello_secureboot::detect_boot_mode();
-    decide(sb, boot, crate::pcrsig::signed_policy_available(), || {
-        crate::pcrsig::load_pubkey_pem().ok()
-    })
+    decide(
+        sb,
+        boot,
+        crate::pcrsig::signed_policy_available(),
+        || crate::pcrsig::load_pubkey_pem().ok(),
+        // Lazily create the per-host signer only when the host-signed path is
+        // actually selected, so machines on the systemd or literal paths never
+        // grow a signing key.
+        || crate::pcrsig::ensure_host_signing_key().ok(),
+    )
 }
 
-/// Pure decision core, split out for testing. `load_pubkey` is only invoked
-/// when the authorized path is otherwise viable.
+/// Pure decision core, split out for testing. The pubkey loaders are only
+/// invoked when their respective authorized path is otherwise viable.
 fn decide(
     secure_boot: bool,
     boot: BootMode,
     signed_available: bool,
-    load_pubkey: impl FnOnce() -> Option<String>,
+    load_systemd_pubkey: impl FnOnce() -> Option<String>,
+    load_host_pubkey: impl FnOnce() -> Option<String>,
 ) -> PolicyPlan {
     if !secure_boot {
         return PolicyPlan::None;
     }
+    // Strongest: a UKI with a trusted systemd PCR-11 signature.
     if matches!(boot, BootMode::Uki) && signed_available {
-        if let Some(pubkey_pem) = load_pubkey() {
+        if let Some(pubkey_pem) = load_systemd_pubkey() {
             return PolicyPlan::Authorized {
                 pcrs: AUTHORIZED_PCRS.to_vec(),
                 pubkey_pem,
@@ -100,8 +122,18 @@ fn decide(
             };
         }
     }
-    // Secure Boot on, but no usable signed policy → bind PCR 7 only. Coarser
-    // than signed PCR 11, but stable across kernel updates.
+    // Secure Boot on, but no systemd-signed UKI (the common GRUB case, or a UKI
+    // without signatures): bind PCR 7 under linhello's OWN authorized signer, so
+    // a firmware/dbx update can be healed by re-signing rather than re-enrolling.
+    if let Some(pubkey_pem) = load_host_pubkey() {
+        return PolicyPlan::Authorized {
+            pcrs: LINHELLO_SIGNED_PCRS.to_vec(),
+            pubkey_pem,
+            policy_ref: Vec::new(),
+        };
+    }
+    // Last resort (host key could not be created): the original literal PCR-7
+    // binding — correct, but not self-healing across Secure Boot changes.
     PolicyPlan::Literal {
         pcrs: LITERAL_PCRS.to_vec(),
     }
@@ -125,14 +157,25 @@ pub fn pcrs_for(level: SecurityLevel) -> &'static [u32] {
 mod tests {
     use super::*;
 
+    // Host signer "available" / "unavailable" helpers for readability.
+    fn host_ok() -> Option<String> {
+        Some("HOSTPEM".into())
+    }
+    fn host_none() -> Option<String> {
+        None
+    }
+
     #[test]
     fn no_secure_boot_is_none() {
-        assert_eq!(decide(false, BootMode::Uki, true, || None), PolicyPlan::None);
+        assert_eq!(
+            decide(false, BootMode::Uki, true, || None, host_ok),
+            PolicyPlan::None
+        );
     }
 
     #[test]
     fn uki_with_signed_policy_is_authorized() {
-        let plan = decide(true, BootMode::Uki, true, || Some("PEM".into()));
+        let plan = decide(true, BootMode::Uki, true, || Some("PEM".into()), host_ok);
         assert_eq!(
             plan,
             PolicyPlan::Authorized {
@@ -144,22 +187,53 @@ mod tests {
     }
 
     #[test]
-    fn uki_without_signatures_falls_back_to_pcr7_literal() {
-        // The crux: a UKI box with no signed policy must NOT bind [7,11]
-        // (which breaks on kernel update) — it binds PCR 7 only.
-        let plan = decide(true, BootMode::Uki, false, || None);
-        assert_eq!(plan, PolicyPlan::Literal { pcrs: vec![7] });
+    fn uki_without_signatures_uses_host_signed_pcr7() {
+        // A UKI box with no systemd signature now binds PCR 7 under linhello's
+        // OWN signer (self-healing) rather than a fragile literal.
+        let plan = decide(true, BootMode::Uki, false, || None, host_ok);
+        assert_eq!(
+            plan,
+            PolicyPlan::Authorized {
+                pcrs: vec![7],
+                pubkey_pem: "HOSTPEM".into(),
+                policy_ref: Vec::new()
+            }
+        );
     }
 
     #[test]
-    fn signed_but_pubkey_unreadable_falls_back() {
-        let plan = decide(true, BootMode::Uki, true, || None);
-        assert_eq!(plan, PolicyPlan::Literal { pcrs: vec![7] });
+    fn signed_but_systemd_pubkey_unreadable_uses_host_signed_pcr7() {
+        let plan = decide(true, BootMode::Uki, true, || None, host_ok);
+        assert_eq!(
+            plan,
+            PolicyPlan::Authorized {
+                pcrs: vec![7],
+                pubkey_pem: "HOSTPEM".into(),
+                policy_ref: Vec::new()
+            }
+        );
     }
 
     #[test]
-    fn secure_boot_non_uki_is_pcr7_literal() {
-        let plan = decide(true, BootMode::Grub, true, || Some("PEM".into()));
+    fn secure_boot_grub_is_host_signed_pcr7() {
+        // The crux of this change: a GRUB box with Secure Boot on now self-heals
+        // via linhello's PCR-7 signer instead of the brittle literal binding.
+        let plan = decide(true, BootMode::Grub, true, || Some("PEM".into()), host_ok);
+        assert_eq!(
+            plan,
+            PolicyPlan::Authorized {
+                pcrs: vec![7],
+                pubkey_pem: "HOSTPEM".into(),
+                policy_ref: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn host_key_unavailable_falls_back_to_literal() {
+        // If the host signing key can't be created, fall back to the original
+        // literal PCR-7 binding rather than disabling TPM protection.
+        let plan = decide(true, BootMode::Grub, false, || None, host_none);
         assert_eq!(plan, PolicyPlan::Literal { pcrs: vec![7] });
     }
 }

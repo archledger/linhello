@@ -1,3 +1,20 @@
+linhello (0.4.0-1) unstable; urgency=medium
+
+  * Self-healing TPM binding on GRUB systems. A firmware/dbx update (e.g. via
+    fwupd) moves PCR 7 and previously broke face unlock until a re-enroll. The
+    template key is now sealed under a PolicyAuthorize policy signed by a
+    per-host key, and the new PCR-7 state is re-signed automatically on the
+    first unlock after the change — while Secure Boot stays enabled — so face
+    unlock survives firmware updates with no re-enrollment.
+  * Boot mode is detected automatically: UKI keeps systemd's signed PCR-11
+    policy; GRUB uses linhello's own PCR-7 signer.
+  * New dedicated recovery passphrase (separate from the login password), the
+    manual backstop for cases the automatic heal can't cover (Secure Boot off,
+    TPM cleared, disk moved): `linhello set-recovery` / `linhello recover`.
+  * Validated the previously-pending PolicyAuthorize TPM path on real hardware.
+
+ -- Ben <archledger236@gmail.com>  Fri, 19 Jun 2026 10:30:00 -0400
+
 linhello (0.3.2-1) unstable; urgency=medium
 
   * Sync Debian package version with the workspace (0.3.2).

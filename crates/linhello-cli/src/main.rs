@@ -100,6 +100,21 @@ enum Cmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Set (or replace) a dedicated recovery passphrase for your face template,
+    /// separate from your login password. It's the manual backstop the automatic
+    /// TPM self-heal can't cover (Secure Boot turned off, TPM cleared, disk
+    /// moved). Like a BitLocker/LUKS recovery key — store it somewhere safe.
+    SetRecovery {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Restore face unlock from your recovery passphrase: unwraps the template
+    /// key and re-seals it to the current TPM state. No re-enrollment. Use when
+    /// face unlock is wedged and the automatic self-heal didn't kick in.
+    Recover {
+        #[arg(long)]
+        user: Option<String>,
+    },
     Reseal,
     Secureboot {
         #[command(subcommand)]
@@ -301,6 +316,41 @@ fn current_user() -> Result<String> {
 
 fn send(req: Request) -> Result<Response> {
     client::request(&req).map_err(|e| anyhow::anyhow!("daemon: {e}"))
+}
+
+/// Prompt for a recovery passphrase (with confirmation) and ask the daemon to
+/// wrap `user`'s template key under it. Shared by `set-recovery` and `setup`.
+fn set_recovery_interactive(user: &str) -> Result<()> {
+    use zeroize::Zeroize;
+    let mut pw = rpassword::prompt_password("Recovery passphrase: ")
+        .context("reading passphrase from TTY")?
+        .into_bytes();
+    let mut confirm = rpassword::prompt_password("Confirm: ")
+        .context("reading passphrase confirmation")?
+        .into_bytes();
+    let matched = pw == confirm;
+    confirm.zeroize();
+    if !matched {
+        pw.zeroize();
+        bail!("passphrases do not match");
+    }
+    if pw.is_empty() {
+        pw.zeroize();
+        bail!("recovery passphrase must not be empty");
+    }
+    let resp = send(Request::SaveRecovery {
+        user: user.to_string(),
+        passphrase: SecretBytes::new(std::mem::take(&mut pw)),
+    });
+    pw.zeroize();
+    match resp? {
+        Response::RecoverySaved => {
+            println!("recovery passphrase set for {user}");
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
 }
 
 fn sbctl_installed() -> bool {
@@ -815,10 +865,32 @@ fn run_setup() -> Result<()> {
 
     // Step 5 — optional enrollment.
     println!("Step 5/5 — enrollment");
-    if prompt_yes(&format!("  enroll {user}'s face now? [y/N] ")) {
+    let enrolled = if prompt_yes(&format!("  enroll {user}'s face now? [y/N] ")) {
         enroll_guided(&user, false, 5)?;
+        true
     } else {
         println!("  skipped — run `linhello enroll` when ready.");
+        false
+    };
+
+    // Optional recovery passphrase — the manual backstop for the rare cases the
+    // automatic TPM self-heal can't cover. Only offered once a template key
+    // exists to wrap (i.e. after enrollment).
+    if enrolled {
+        println!();
+        println!(
+            "Recovery passphrase (optional) — a backstop, SEPARATE from your login\n\
+             password, for when the automatic self-heal can't run (Secure Boot off,\n\
+             TPM cleared, disk moved). Without it, those rare cases need a re-enroll."
+        );
+        if prompt_yes("  set a recovery passphrase now? [y/N] ") {
+            if let Err(e) = set_recovery_interactive(&user) {
+                println!("  recovery passphrase not set: {e}");
+                println!("  you can set one later with `sudo linhello set-recovery`.");
+            }
+        } else {
+            println!("  skipped — set one later with `sudo linhello set-recovery`.");
+        }
     }
 
     println!("\nSetup complete. Try `linhello test`.");
@@ -1009,6 +1081,36 @@ fn main() -> Result<()> {
             pw.zeroize(); // belt-and-suspenders; take() already emptied it
             match resp? {
                 Response::PasswordSealed => println!("password sealed for {user}"),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        Cmd::SetRecovery { user } => {
+            let user = user.map(Ok).unwrap_or_else(current_user)?;
+            println!(
+                "Set a recovery passphrase for {user}'s face template.\n\
+                 This is SEPARATE from your login password and is your backstop if\n\
+                 the automatic TPM self-heal can't run (Secure Boot off, TPM cleared,\n\
+                 disk moved). Store it somewhere safe — like a BitLocker recovery key."
+            );
+            set_recovery_interactive(&user)?;
+        }
+        Cmd::Recover { user } => {
+            use zeroize::Zeroize;
+            let user = user.map(Ok).unwrap_or_else(current_user)?;
+            let mut pw = rpassword::prompt_password(format!("Recovery passphrase for {user}: "))
+                .context("reading passphrase from TTY")?
+                .into_bytes();
+            let resp = send(Request::RestoreFromRecovery {
+                user: user.clone(),
+                passphrase: SecretBytes::new(std::mem::take(&mut pw)),
+            });
+            pw.zeroize();
+            match resp? {
+                Response::RecoveryRestored => println!(
+                    "restored {user}: template key re-sealed to the current TPM state. \
+                     Try `linhello test`."
+                ),
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }
