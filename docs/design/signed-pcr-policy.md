@@ -5,6 +5,17 @@ runs it). Originally a scoping/design proposal (2026-06-02); this is now the
 as-built record. Two things landed differently from the proposal below and are
 corrected inline: the authorized policy binds **PCR 11 only** (not `[7, 11]` — §3),
 and the §5 security must-fix items are **resolved**.
+
+> **Update (2026-06-19) — GRUB self-heal landed (§8).** The non-UKI path no
+> longer uses a *fragile literal* PCR-7 binding. On GRUB (and any Secure-Boot
+> system without a systemd-signed UKI), linhello now acts as **its own
+> PolicyAuthorize signer over PCR 7** and re-signs the new PCR-7 state after a
+> firmware/dbx update (while Secure Boot stays on) — so face unlock self-heals
+> with **no re-enroll**. This is approach **C**, which §7 Decision 1 had
+> deferred; it is now adopted *specifically for the non-UKI case* (UKI still uses
+> systemd's PCR-11 signature — approach B). A dedicated **recovery passphrase**
+> (separate from the login password) is the manual backstop. See §8.
+
 **Author:** LinuxHello maintainers
 **Goal:** Make LinuxHello a Windows-Hello-class facial unlock for Linux that survives
 kernel, initrd, microcode, and systemd-stub updates **without breaking face auth
@@ -306,11 +317,97 @@ buffer bounds, null checks, and volatile zeroing fail closed.
 
 ## 7. Decisions
 
-1. **Strategy B vs C** — *Decided: B.* PCR signing is enabled in the UKI build and
-   linhello consumes systemd's own `tpm2-pcr-signature.json`; the Arch reference
-   box runs this. (C — linhello's own key + hook — was not pursued.)
+1. **Strategy B vs C** — *Decided: **B for UKI, C for GRUB.*** PCR signing is
+   enabled in the UKI build and linhello consumes systemd's own
+   `tpm2-pcr-signature.json` (approach B; the Arch reference box runs this). For
+   non-UKI systems (GRUB), linhello now *also* runs approach C — its own
+   per-host signing key over PCR 7, re-signing on drift — because there is no
+   systemd signature to consume there. See §8. (Originally C was deferred; the
+   GRUB firmware-update breakage made it necessary.)
 2. **PCR 7 AND-gate** — *Decided: PCR 11 signed policy alone.* A `[7,11]`
    `PolicyPCR` can never match systemd's `pcrs:[11]` signatures, so PCR 7 stays the
    separate `Medium` literal gate, not ANDed into `Full` (see §3).
 3. **Match threshold (L4)** — *Still open:* default remains `0.60`; measuring
    FAR/FRR and making it configurable/auditable is not yet done.
+
+---
+
+## 8. GRUB / non-UKI self-heal: linhello as its own PCR-7 signer (2026-06-19)
+
+### 8.1 The gap this closes
+
+Approach B (§2, §3) makes **UKI** systems update-resilient by consuming systemd's
+signed PCR-11 policy. But a **GRUB** system has no systemd-stub and ships no
+`tpm2-pcr-signature.json`, so it fell back to a *literal* `PolicyPCR` over PCR 7.
+That survives kernel updates (PCR 7 is Secure-Boot state, not kernel hashes) but
+**not a Secure-Boot-variable change**: a `fwupd` **dbx** update (revocation-list
+refresh) moves PCR 7, the literal policy no longer matches, and the template key
+becomes unrecoverable → re-enroll. This is the exact failure observed on a
+ThinkPad after an Intel ME / dbx firmware update (`0x99d`,
+`PCR mismatch: [7] changed since seal`).
+
+The fundamental constraint: once PCR 7 changes and the machine reboots, the old
+key cannot be unsealed, and you cannot reseal to a *future* PCR-7 you don't yet
+know. Any automatic heal therefore needs a PCR-7-independent recovery path.
+
+### 8.2 Design
+
+linhello becomes its **own `PolicyAuthorize` signer over PCR 7** — approach C,
+but per-host and automatic:
+
+- **Key.** A per-host RSA-2048 signing key is generated on first use and stored
+  root-only at `/etc/linhello/pcr-signing-key.pem` (public half at
+  `pcr-signing-pub.pem`). `pcrsig::ensure_host_signing_key`.
+- **Seal.** The template key is sealed under `PolicyAuthorize(host_key)` over
+  PCR 7 (`policy.rs` selects this plan whenever Secure Boot is on and there is no
+  trusted systemd signature). The object's `authPolicy` commits only to the key's
+  Name, **not** a concrete PCR value, so any PCR-7 state with a valid signature
+  unseals. At seal time linhello signs the current PCR-7 policy into
+  `/etc/linhello/pcr-signature.json` (systemd's signature-file schema, reused).
+- **Self-heal (the crux).** Re-signing is folded into the **unseal path**:
+  replay `PolicyPCR` over PCR 7 → get the approved digest → if no signature on
+  file matches it **and Secure Boot is still enabled**, sign the new digest with
+  the host key, persist it, and proceed. The sealed object is untouched. Net
+  effect: the **first** face-unlock attempt after a firmware/dbx update heals
+  itself — passwordless, no re-enroll. `tpm::ensure_host_signature` +
+  `tpm::unseal_authorized`.
+
+### 8.3 Security posture
+
+The gate weakens from "**this exact db/dbx**" to "**any PCR-7 state while Secure
+Boot stays on**" — exactly BitLocker's default PCR-7 behaviour. Concretely:
+
+- **Offline attacker (stolen disk):** still cannot unseal — the secret is
+  TPM-bound; the on-disk signing key only authorizes a *policy*, it does not
+  release key material.
+- **Attacker who disables Secure Boot:** `is_secure_boot_enabled()` is false, so
+  linhello **refuses to re-sign**; the unseal fails and auth falls back to the
+  password. The "Secure Boot must stay on" invariant is preserved.
+- **Attacker who enrolls their own Secure Boot keys** (needs firmware control,
+  normally a firmware password): SB reads "on", linhello would re-sign — the
+  accepted residual of this posture. The template key only decrypts the *face
+  embedding* (a privacy item, not a credential), and face auth falls back to the
+  password regardless, so this is acceptable for the convenience tier.
+
+The two signers are kept distinct and fail-closed: `pcrsig::classify_signer`
+accepts only the pinned systemd key (→ PCR 11, signatures from
+`/run/systemd`) **or** this host's own key (→ PCR 7, signatures from
+`/etc/linhello/pcr-signature.json`); anything else is rejected before the TPM is
+touched.
+
+### 8.4 Recovery passphrase (manual backstop)
+
+For the cases the automatic path *can't* cover — Secure Boot deliberately off,
+TPM cleared, disk moved to new hardware — a **dedicated recovery passphrase**
+(separate from the login/root password, by user request) wraps the template key
+with Argon2id + AES-256-GCM (`recovery.rs`). `linhello set-recovery` stores it;
+`linhello recover` unwraps the key and re-seals it to the current TPM state. Like
+a BitLocker/LUKS recovery key. Never re-enroll.
+
+### 8.5 Validation
+
+Proven on real hardware (`tpm.rs` `#[ignore]` tests, run as root):
+`policy_authorize_roundtrip_and_self_heal_on_drift` exercises seal → sign →
+unseal → **PCR drift (PCR 23)** → stale-signature rejection → **re-sign** →
+unseal on the same object; `production_host_signer_seal_unseal_real_pcr7` runs
+the production `seal_secret`/`unseal` over live **PCR 7**.
