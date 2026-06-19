@@ -446,10 +446,10 @@ fn seal_authorized(
     pubkey_pem: &str,
     policy_ref: &[u8],
 ) -> Result<SealedEnvelope> {
-    // Only ever bind to the pinned trusted signing key. The plan layer already
-    // selects this key via `load_pubkey_pem`, but enforce it here too so no
-    // caller can seal `Full` under an untrusted key.
-    crate::pcrsig::ensure_trusted_pubkey(pubkey_pem)?;
+    // Bind only to a recognized signer: the pinned systemd UKI key, or this
+    // host's own linhello signing key. Anything else is refused so no caller can
+    // seal under an untrusted key.
+    let signer = crate::pcrsig::classify_signer(pubkey_pem)?;
 
     let mut ctx = open_context()?;
     let pcr_values = read_pcr_values(&mut ctx, pcrs)?;
@@ -463,7 +463,7 @@ fn seal_authorized(
     )?;
     let auth_policy = authorize_policy_digest(key_name.value(), policy_ref)?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    let env = with_srk(&mut ctx, |ctx, srk| {
         let tmpl = sealed_template(auth_policy.clone())?;
         let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
         let created = ctx
@@ -474,7 +474,12 @@ fn seal_authorized(
 
         Ok(SealedEnvelope {
             version: crate::envelope::CURRENT_VERSION,
-            mode: SecurityLevel::Full,
+            mode: PolicyPlan::Authorized {
+                pcrs: pcrs.to_vec(),
+                pubkey_pem: pubkey_pem.to_string(),
+                policy_ref: policy_ref.to_vec(),
+            }
+            .security_level(),
             pcrs: pcrs.to_vec(),
             policy: PolicyKind::Authorized {
                 pubkey_pem: pubkey_pem.to_string(),
@@ -484,7 +489,40 @@ fn seal_authorized(
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
         })
-    })
+    })?;
+
+    // For our own signer, emit the signature for the current PCR state now, so
+    // the very first unseal has a signature to present (systemd ships its own).
+    if signer == crate::pcrsig::SignerKind::LinhelloHost {
+        ensure_host_signature(pcrs, policy_ref)?;
+    }
+    Ok(env)
+}
+
+/// Ensure a host signature exists for the *current* PCR state over `pcrs`.
+/// Computes the PolicyPCR digest the TPM will produce at unseal, and if no
+/// matching signature is on file, signs it with the host key and persists it.
+/// This is the single primitive behind both seal-time signing and unseal-time
+/// self-heal. Returns the approved policy digest.
+fn ensure_host_signature(pcrs: &[u32], policy_ref: &[u8]) -> Result<Vec<u8>> {
+    let mut ctx = open_context()?;
+    let sel = pcr_selection(pcrs)?;
+    let approved = compute_policy_digest(&mut ctx, Some(&sel))?;
+    let approved_bytes = approved.value().to_vec();
+
+    let existing = crate::pcrsig::host_signatures(crate::pcrsig::DEFAULT_BANK)?;
+    if crate::pcrsig::find_for_policy(&existing, pcrs, &approved_bytes).is_some() {
+        return Ok(approved_bytes);
+    }
+    let ah = a_hash(&approved_bytes, policy_ref)?;
+    let sig = crate::pcrsig::sign_ahash(ah.value())?;
+    crate::pcrsig::persist_host_signature(
+        crate::pcrsig::DEFAULT_BANK,
+        pcrs,
+        &approved_bytes,
+        &sig,
+    )?;
+    Ok(approved_bytes)
 }
 
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
@@ -548,22 +586,40 @@ fn unseal_authorized(
 ) -> Result<Zeroizing<Vec<u8>>> {
     // The object's authPolicy commits only to the signing key's Name, NOT to a
     // concrete PCR set — so the PCR set replayed below is taken from the
-    // (on-disk, tamperable) envelope. Pin it to the constant the authorized
-    // path always seals with, so a rewritten envelope cannot steer unsealing
-    // onto an attacker-chosen PCR set for which they happen to hold a signed
-    // policy.
-    if env.pcrs.as_slice() != crate::policy::AUTHORIZED_PCRS {
+    // (on-disk, tamperable) envelope. Classify the signer and pin the PCR set to
+    // the constant *that* signer always seals with, so a rewritten envelope
+    // cannot steer unsealing onto an attacker-chosen PCR set for which they
+    // happen to hold a signed policy. `classify_signer` already fails closed if
+    // the key is neither the systemd anchor nor this host's signing key.
+    let signer = crate::pcrsig::classify_signer(pubkey_pem)?;
+    let expected_pcrs = match signer {
+        crate::pcrsig::SignerKind::Systemd => crate::policy::AUTHORIZED_PCRS,
+        crate::pcrsig::SignerKind::LinhelloHost => crate::policy::LINHELLO_SIGNED_PCRS,
+    };
+    if env.pcrs.as_slice() != expected_pcrs {
         return Err(LinuxHelloError::Policy(format!(
-            "authorized envelope binds unexpected PCR set {:?} (expected {:?}); refusing to unseal",
-            env.pcrs,
-            crate::policy::AUTHORIZED_PCRS,
+            "authorized envelope binds unexpected PCR set {:?} (expected {:?} for {:?}); \
+             refusing to unseal",
+            env.pcrs, expected_pcrs, signer,
         )));
     }
-    // Pin the signing key recorded in the envelope to the trusted anchor before
-    // it is loaded into the TPM. `verify_signature` already enforces the key
-    // cryptographically, but this fails closed earlier and with a clear message
-    // if an envelope was rewritten to reference a different (attacker) key.
-    crate::pcrsig::ensure_trusted_pubkey(pubkey_pem)?;
+
+    // SELF-HEAL: for our own signer, make sure a signature exists for the
+    // *current* PCR-7 state before we open the policy session — but ONLY while
+    // Secure Boot is still enabled. After a firmware/dbx update, PCR 7 has moved
+    // and the on-file signature no longer matches; re-signing here (idempotent —
+    // a no-op if a matching signature already exists) lets the very first unseal
+    // succeed without a re-enroll. If Secure Boot has been turned OFF, we refuse
+    // to bless the new state: no signature is written, the unseal below fails,
+    // and auth falls back to the password.
+    if signer == crate::pcrsig::SignerKind::LinhelloHost
+        && linhello_secureboot::is_secure_boot_enabled()
+    {
+        if let Err(e) = ensure_host_signature(&env.pcrs, policy_ref) {
+            tracing::warn!("self-heal re-sign of PCR-7 policy failed: {e}");
+        }
+    }
+
     let mut ctx = open_context()?;
 
     with_srk(&mut ctx, |ctx, srk| {
@@ -585,15 +641,32 @@ fn unseal_authorized(
                     .map_err(tpm_err)?;
                 let approved = ctx.policy_get_digest(policy_session).map_err(tpm_err)?;
 
-                // 2. Find a signature for exactly this PCR set + policy digest.
-                let sigs = crate::pcrsig::load_signatures(crate::pcrsig::DEFAULT_BANK)?;
-                let sig = crate::pcrsig::find_for_policy(&sigs, &env.pcrs, approved.value())
-                    .ok_or_else(|| {
-                        LinuxHelloError::Policy(
+                // 2. Find a signature for exactly this PCR set + policy digest,
+                //    from the source that matches the signer: systemd's runtime
+                //    artifacts, or this host's own signature file.
+                let sigs = match signer {
+                    crate::pcrsig::SignerKind::Systemd => {
+                        crate::pcrsig::load_signatures(crate::pcrsig::DEFAULT_BANK)?
+                    }
+                    crate::pcrsig::SignerKind::LinhelloHost => {
+                        crate::pcrsig::host_signatures(crate::pcrsig::DEFAULT_BANK)?
+                    }
+                };
+                let sig_bytes = crate::pcrsig::find_for_policy(&sigs, &env.pcrs, approved.value())
+                    .map(|s| s.sig.clone())
+                    .ok_or_else(|| match signer {
+                        crate::pcrsig::SignerKind::Systemd => LinuxHelloError::Policy(
                             "no signed PCR policy matches the current boot state \
                              (kernel/UKI not yet enrolled — re-sign required)"
                                 .into(),
-                        )
+                        ),
+                        crate::pcrsig::SignerKind::LinhelloHost => LinuxHelloError::Policy(
+                            "no PCR-7 signature matches the current Secure Boot state. \
+                             If Secure Boot was disabled, face unlock is intentionally \
+                             withheld — re-enable Secure Boot, or use the recovery \
+                             passphrase."
+                                .into(),
+                        ),
                     })?;
 
                 // 3. Verify the signature over aHash = H(approvedPolicy ‖ ref)
@@ -605,7 +678,7 @@ fn unseal_authorized(
                     let signature = Signature::RsaSsa(
                         RsaSignature::create(
                             HashingAlgorithm::Sha256,
-                            PublicKeyRsa::try_from(sig.sig.clone()).map_err(tpm_err)?,
+                            PublicKeyRsa::try_from(sig_bytes.clone()).map_err(tpm_err)?,
                         )
                         .map_err(tpm_err)?,
                     );
@@ -742,6 +815,207 @@ fn a_hash(approved_policy: &[u8], policy_ref: &[u8]) -> Result<Digest> {
     h.update(approved_policy);
     h.update(policy_ref);
     Digest::try_from(h.finalize().to_vec()).map_err(tpm_err)
+}
+
+/// Hardware-in-the-loop validation of the `PolicyAuthorize` round-trip and the
+/// self-heal (re-sign on PCR drift) mechanism, exercised on the real TPM via
+/// PCR 23 (the resettable application PCR) with a throwaway signing key. Gated
+/// behind `--ignored` because it needs `/dev/tpmrm0` (run as root) and mutates
+/// PCR 23. This is the de-risking proof for the `seal_authorized`/
+/// `unseal_authorized` path that was previously HARDWARE-VALIDATION PENDING.
+#[cfg(test)]
+mod hw_validation {
+    use super::*;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+    use tss_esapi::handles::PcrHandle;
+    use tss_esapi::structures::DigestValues;
+
+    // PCR 23: resettable application PCR — safe to extend in a test.
+    const TEST_PCRS: &[u32] = &[23];
+
+    fn gen_key() -> (RsaPrivateKey, String) {
+        let mut rng = rand::thread_rng();
+        let sk = RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+        let pem = RsaPublicKey::from(&sk)
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pem");
+        (sk, pem)
+    }
+
+    /// Seal `secret` under PolicyAuthorize(pubkey) over `pcrs`, returning the
+    /// marshalled public+private blobs (mirrors `seal_authorized` minus the
+    /// systemd-key pin so a throwaway key can be used).
+    fn seal_auth(secret: &[u8], _pcrs: &[u32], pubkey_pem: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut ctx = open_context().unwrap();
+        let key_name = with_handle(
+            &mut ctx,
+            |ctx| load_external_pubkey(ctx, pubkey_pem),
+            |ctx, kh| ctx.tr_get_name((*kh).into()).map_err(tpm_err),
+        )
+        .unwrap();
+        let auth_policy = authorize_policy_digest(key_name.value(), &[]).unwrap();
+        with_srk(&mut ctx, |ctx, srk| {
+            let tmpl = sealed_template(auth_policy.clone())?;
+            let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
+            let created = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
+                })
+                .map_err(tpm_err)?;
+            Ok((
+                created.out_public.marshall().map_err(tpm_err)?,
+                created.out_private.to_vec(),
+            ))
+        })
+        .unwrap()
+    }
+
+    /// Sign the *current* PolicyPCR digest over `pcrs` with `sk` — exactly what
+    /// linhello's self-heal does when it sees no signature for a new PCR state.
+    fn sign_current(sk: &RsaPrivateKey, pcrs: &[u32]) -> Vec<u8> {
+        let mut ctx = open_context().unwrap();
+        let sel = pcr_selection(pcrs).unwrap();
+        let approved = compute_policy_digest(&mut ctx, Some(&sel)).unwrap();
+        let ah = a_hash(approved.value(), &[]).unwrap();
+        sk.sign(Pkcs1v15Sign::new::<Sha256>(), ah.value())
+            .expect("sign")
+    }
+
+    /// Unseal a PolicyAuthorize object given an explicit signature (mirrors
+    /// `unseal_authorized` minus the systemd pin / file discovery).
+    fn unseal_auth(
+        public: &[u8],
+        private: &[u8],
+        pcrs: &[u32],
+        pubkey_pem: &str,
+        sig: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let mut ctx = open_context()?;
+        with_srk(&mut ctx, |ctx, srk| {
+            let pubo = Public::unmarshall(public).map_err(tpm_err)?;
+            let priv_ = Private::try_from(private.to_vec()).map_err(tpm_err)?;
+            let sealed_handle = ctx
+                .execute_with_nullauth_session(|ctx| ctx.load(*srk, priv_, pubo))
+                .map_err(tpm_err)?;
+            let result: Result<Zeroizing<Vec<u8>>> = (|| {
+                with_session(ctx, SessionType::Policy, |ctx, session| {
+                    let ps = PolicySession::try_from(session).map_err(tpm_err)?;
+                    let sel = pcr_selection(pcrs)?;
+                    ctx.policy_pcr(ps, Digest::default(), sel).map_err(tpm_err)?;
+                    let approved = ctx.policy_get_digest(ps).map_err(tpm_err)?;
+                    let kh = load_external_pubkey(ctx, pubkey_pem)?;
+                    let verify: Result<Zeroizing<Vec<u8>>> = (|| {
+                        let key_name = ctx.tr_get_name(kh.into()).map_err(tpm_err)?;
+                        let ah = a_hash(approved.value(), &[])?;
+                        let signature = Signature::RsaSsa(
+                            RsaSignature::create(
+                                HashingAlgorithm::Sha256,
+                                PublicKeyRsa::try_from(sig.to_vec()).map_err(tpm_err)?,
+                            )
+                            .map_err(tpm_err)?,
+                        );
+                        let ticket = ctx.verify_signature(kh, ah, signature).map_err(tpm_err)?;
+                        ctx.policy_authorize(
+                            ps,
+                            approved.clone(),
+                            Nonce::default(),
+                            &key_name,
+                            ticket,
+                        )
+                        .map_err(tpm_err)?;
+                        let data = ctx
+                            .execute_with_session(Some(session), |ctx| {
+                                ctx.unseal(sealed_handle.into())
+                            })
+                            .map_err(tpm_err)?;
+                        Ok(Zeroizing::new(data.to_vec()))
+                    })();
+                    let _ = ctx.flush_context(kh.into());
+                    verify
+                })
+            })();
+            let _ = ctx.flush_context(sealed_handle.into());
+            result
+        })
+    }
+
+    fn extend_pcr23() {
+        let mut ctx = open_context().unwrap();
+        let mut dv = DigestValues::new();
+        dv.set(
+            HashingAlgorithm::Sha256,
+            Digest::try_from(vec![0x5au8; 32]).unwrap(),
+        );
+        ctx.execute_with_nullauth_session(|ctx| ctx.pcr_extend(PcrHandle::Pcr23, dv))
+            .expect("pcr_extend");
+    }
+
+    /// End-to-end on the *production* API: `seal_secret` (which selects the
+    /// host-signed PCR-7 plan on a GRUB + Secure-Boot machine and emits the
+    /// initial signature) followed by `unseal` (classify signer → host
+    /// signatures → PolicyAuthorize) against the live PCR 7. Writes the host
+    /// signing key + signature into `/etc/linhello` — the real migration
+    /// artifacts. Requires GRUB + Secure Boot ON + root + real TPM.
+    #[test]
+    #[ignore = "requires real TPM + GRUB + Secure Boot on, run as root; writes /etc/linhello signing key"]
+    fn production_host_signer_seal_unseal_real_pcr7() {
+        let plan = crate::policy::plan();
+        match &plan {
+            PolicyPlan::Authorized { pcrs, .. } => assert_eq!(
+                pcrs.as_slice(),
+                crate::policy::LINHELLO_SIGNED_PCRS,
+                "expected host-signed PCR-7 plan on this machine"
+            ),
+            other => panic!(
+                "expected host-signed PCR-7 authorized plan; got {other:?}. \
+                 (This test assumes GRUB + Secure Boot on.)"
+            ),
+        }
+
+        let secret = b"linhello-prod-template-key-32byte!";
+        let env = seal_secret(secret).expect("seal under host signer");
+        assert!(
+            matches!(env.policy, PolicyKind::Authorized { .. }),
+            "envelope must be authorized"
+        );
+        assert_eq!(env.pcrs.as_slice(), crate::policy::LINHELLO_SIGNED_PCRS);
+
+        let got = unseal(&env).expect("unseal via host-signed PCR-7 policy");
+        assert_eq!(&*got, secret, "production seal/unseal round-trip must match");
+    }
+
+    #[test]
+    #[ignore = "requires real TPM (/dev/tpmrm0, run as root); mutates PCR 23"]
+    fn policy_authorize_roundtrip_and_self_heal_on_drift() {
+        let secret = b"linhello-template-key-0123456789";
+        let (sk, pem) = gen_key();
+
+        // 1. Seal under PolicyAuthorize, sign the current PCR-23 state, unseal.
+        let (public, private) = seal_auth(secret, TEST_PCRS, &pem);
+        let sig_v1 = sign_current(&sk, TEST_PCRS);
+        let got = unseal_auth(&public, &private, TEST_PCRS, &pem, &sig_v1)
+            .expect("initial unseal must succeed");
+        assert_eq!(&*got, secret, "unsealed secret must match");
+
+        // 2. Simulate a firmware/dbx update: PCR 23 drifts.
+        extend_pcr23();
+
+        // 3. The OLD signature must no longer authorize (policy no longer matches).
+        let stale = unseal_auth(&public, &private, TEST_PCRS, &pem, &sig_v1);
+        assert!(
+            stale.is_err(),
+            "stale signature must NOT unseal after PCR drift"
+        );
+
+        // 4. Self-heal: re-sign the NEW PCR state with the same key — no re-seal,
+        //    no re-enroll. This is exactly what the daemon does when Secure Boot
+        //    is still enabled after a firmware update.
+        let sig_v2 = sign_current(&sk, TEST_PCRS);
+        let healed = unseal_auth(&public, &private, TEST_PCRS, &pem, &sig_v2)
+            .expect("re-signed policy must unseal the SAME sealed object");
+        assert_eq!(&*healed, secret, "self-healed unseal must match");
+    }
 }
 
 #[cfg(test)]

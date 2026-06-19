@@ -100,9 +100,9 @@ fn boot_mode_check() -> CapabilityCheck {
         ),
         BootMode::Grub => check(
             "Boot mode",
-            CapabilityStatus::Warn,
+            CapabilityStatus::Ok,
             false,
-            "GRUB — signed PCR-11 policy needs a UKI; PCR-7 binding still works",
+            "GRUB — uses linhello's self-healing PCR-7 signer (signed PCR-11 would need a UKI)",
         ),
         BootMode::Unknown => check(
             "Boot mode",
@@ -119,14 +119,23 @@ fn signed_policy_check() -> CapabilityCheck {
             "Signed PCR policy",
             CapabilityStatus::Ok,
             false,
-            "systemd PCR signature + public key present — kernel updates won't require re-seal",
+            "systemd PCR-11 signature + public key present — kernel updates won't require re-seal",
+        )
+    } else if linhello_secureboot::is_secure_boot_enabled() {
+        // No systemd-signed UKI, but Secure Boot is on, so linhello acts as its
+        // own PCR-7 signer and re-signs after firmware/dbx updates automatically.
+        check(
+            "Signed PCR policy",
+            CapabilityStatus::Ok,
+            false,
+            "linhello-signed PCR-7 — self-heals after firmware/dbx updates while Secure Boot stays on (no re-enroll)",
         )
     } else {
         check(
             "Signed PCR policy",
             CapabilityStatus::Warn,
             false,
-            "not configured — using stable PCR-7 binding (coarser, but survives kernel updates)",
+            "Secure Boot off — no TPM PCR binding; enable Secure Boot for self-healing PCR-7",
         )
     }
 }

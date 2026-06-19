@@ -9,6 +9,7 @@ pub mod envelope;
 pub mod memlock;
 pub mod pcrsig;
 pub mod policy;
+pub mod recovery;
 pub mod tpm;
 
 pub fn envelope_path() -> PathBuf {
@@ -150,6 +151,75 @@ pub fn unseal_template_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let key = tpm::unseal(&env)?;
     memlock::lock_slice(&key)?;
     Ok(key)
+}
+
+/// Seal a *specific* template key under the current TPM policy and persist the
+/// envelope (0600). Used to re-seal after a recovery, or to bind a freshly
+/// generated key during enrollment.
+pub fn seal_template_key(user: &str, key: &[u8]) -> Result<()> {
+    if key.len() != crypto::KEY_LEN {
+        return Err(LinuxHelloError::Policy(format!(
+            "template key must be {} bytes, got {}",
+            crypto::KEY_LEN,
+            key.len()
+        )));
+    }
+    let kp = template_key_path(user)?;
+    let env = tpm::seal_secret(key)?;
+    env.save(&kp)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+// ── Recovery passphrase (dedicated, separate from the login password) ────
+
+pub fn recovery_envelope_path(user: &str) -> Result<PathBuf> {
+    validate_user(user)?;
+    Ok(PathBuf::from(CONFIG_ROOT)
+        .join(user)
+        .join("recovery_envelope.json"))
+}
+
+/// True if a recovery passphrase has been set for `user`.
+pub fn recovery_exists(user: &str) -> bool {
+    recovery_envelope_path(user)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Wrap the user's *current* template key under a recovery passphrase and
+/// persist the recovery envelope (0600). Requires the template key to be
+/// unsealable now (i.e. run while the TPM path still works, e.g. at enroll).
+pub fn save_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
+    let key = unseal_template_key(user)?;
+    let env = recovery::wrap(passphrase, &key)?;
+    let path = recovery_envelope_path(user)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&env)
+        .map_err(|e| LinuxHelloError::Serde(e.to_string()))?;
+    std::fs::write(&path, json)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Restore the template key from the recovery passphrase and re-seal it under
+/// the current TPM policy — the manual backstop when the automatic self-heal
+/// can't run (Secure Boot off, TPM cleared, disk moved). Face unlock works again
+/// afterwards with no re-enrollment.
+pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
+    let path = recovery_envelope_path(user)?;
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        LinuxHelloError::Policy(format!("no recovery passphrase is set for '{user}'"))
+    })?;
+    let env: recovery::RecoveryEnvelope =
+        serde_json::from_str(&json).map_err(|e| LinuxHelloError::Serde(e.to_string()))?;
+    let key = recovery::unwrap(passphrase, &env)?;
+    seal_template_key(user, &key)?;
+    Ok(())
 }
 
 /// Encrypt raw embedding bytes and write to `embedding.enc`. Creates the

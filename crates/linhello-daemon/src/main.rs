@@ -313,6 +313,28 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        Request::SaveRecovery { user, passphrase } => {
+            if !is_root(peer_uid) {
+                return forbidden("save_recovery");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            task::spawn_blocking(move || do_save_recovery(&user, passphrase))
+                .await
+                .unwrap_or_else(err)
+        }
+        Request::RestoreFromRecovery { user, passphrase } => {
+            if !is_root(peer_uid) {
+                return forbidden("restore_from_recovery");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            task::spawn_blocking(move || do_restore_from_recovery(&user, passphrase))
+                .await
+                .unwrap_or_else(err)
+        }
     }
 }
 
@@ -1063,6 +1085,34 @@ fn do_seal_password(user: &str, password: SecretBytes) -> Response {
     // `password` zeroizes its buffer on drop, covering every return path.
     match linhello_core::seal_password(user, password.expose()) {
         Ok(()) => Response::PasswordSealed,
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_save_recovery(user: &str, passphrase: SecretBytes) -> Response {
+    // `passphrase` zeroizes on drop. save_recovery unseals the current template
+    // key and wraps it under the passphrase, so it must run while the TPM path
+    // still works (i.e. at enroll/setup time).
+    match linhello_core::save_recovery(user, passphrase.expose()) {
+        Ok(()) => Response::RecoverySaved,
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn do_restore_from_recovery(user: &str, passphrase: SecretBytes) -> Response {
+    match linhello_core::restore_from_recovery(user, passphrase.expose()) {
+        Ok(()) => {
+            // Drop any cached (now stale) template key so the next verify reloads
+            // the freshly re-sealed envelope.
+            let cache = get_template_key_cache();
+            let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(user);
+            Response::RecoveryRestored
+        }
         Err(e) => Response::Error {
             message: e.to_string(),
         },

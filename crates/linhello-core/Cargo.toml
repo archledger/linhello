@@ -23,3 +23,6 @@ libc = "0.2"
 # Parse the systemd PCR-policy public key (SPKI PEM) for TPM2 LoadExternal.
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
+# Argon2id KDF for the dedicated recovery passphrase (separate from the login
+# password). Memory-hard so an offline attacker can't cheaply brute-force it.
+argon2 = "0.5"

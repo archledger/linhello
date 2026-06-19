@@ -115,6 +115,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures",
+ "password-hash",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +190,15 @@ name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "block-buffer"
@@ -440,6 +461,7 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -690,7 +712,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linhello-biometrics"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "image",
@@ -707,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-cli"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -726,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-common"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -736,10 +758,11 @@ dependencies = [
 
 [[package]]
 name = "linhello-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "base64 0.22.1",
  "libc",
  "linhello-common",
@@ -757,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-daemon"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -781,7 +804,7 @@ version = "0.3.2"
 
 [[package]]
 name = "linhello-liveness"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "image",
  "linhello-common",
@@ -793,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-pam"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "libc",
  "linhello-common",
@@ -804,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-secureboot"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "linhello-common",
  "tracing",
@@ -1083,6 +1106,17 @@ dependencies = [
  "redox_syscall",
  "smallvec 1.15.1",
  "windows-link",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core",
+ "subtle",
 ]
 
 [[package]]
