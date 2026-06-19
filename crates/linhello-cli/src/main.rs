@@ -100,6 +100,13 @@ enum Cmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Fingerprint modality (via fprintd). On RGB-only machines, fingerprint is
+    /// a stronger factor than face alone — `status` shows the reader/enrollment,
+    /// `enable` guides enrollment. Face/RGB-only keeps working regardless.
+    Fingerprint {
+        #[command(subcommand)]
+        action: FpAction,
+    },
     Reseal,
     Secureboot {
         #[command(subcommand)]
@@ -204,6 +211,21 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum FpAction {
+    /// Show the fingerprint reader, fprintd availability, and enrolled fingers.
+    Status {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Guide fingerprint enrollment (runs `fprintd-enroll`) so it can be used
+    /// as a factor alongside or instead of RGB-only face.
+    Enable {
+        #[arg(long)]
+        user: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SbAction {
     /// Show sbctl key-enrollment state alongside the firmware view.
     Status,
@@ -301,6 +323,66 @@ fn current_user() -> Result<String> {
 
 fn send(req: Request) -> Result<Response> {
     client::request(&req).map_err(|e| anyhow::anyhow!("daemon: {e}"))
+}
+
+/// Print the fingerprint reader / fprintd / enrollment state for `user`.
+fn fingerprint_status(user: &str) {
+    use linhello_fingerprint as fp;
+    if !fp::fprintd_present() {
+        println!("fprintd not installed — install it (and libfprint) to use fingerprint.");
+        return;
+    }
+    if !fp::reader_present() {
+        println!("fprintd is installed, but no fingerprint reader is registered.");
+        return;
+    }
+    let name = fp::device_name().unwrap_or_else(|| "fingerprint reader".into());
+    let fingers = fp::enrolled_fingers(user);
+    let rgb_only = linhello_biometrics::camera::ir_device().is_none();
+    println!("reader      : {name}");
+    println!("face tier   : {}", if rgb_only { "RGB only (convenience)" } else { "RGB + IR (secure)" });
+    if fingers.is_empty() {
+        println!("enrolled    : none for {user}");
+        println!("\nEnroll with `linhello fingerprint enable` (or `fprintd-enroll`).");
+        if rgb_only {
+            println!("On this RGB-only machine, a fingerprint is a stronger factor than face alone.");
+        }
+    } else {
+        println!("enrolled    : {} finger(s) for {user} [{}]", fingers.len(), fingers.join(", "));
+        println!("\nReady. Configure per-operation use in /etc/linhello/policy.conf, e.g.:");
+        println!("  screen_unlock = face|fingerprint");
+        println!("  sudo          = fingerprint");
+    }
+}
+
+/// Guide fingerprint enrollment via fprintd. Keeps RGB-only face fully usable;
+/// this only adds fingerprint as an option.
+fn fingerprint_enable(user: &str) -> Result<()> {
+    use linhello_fingerprint as fp;
+    if !fp::fprintd_present() {
+        bail!("fprintd is not installed. Install fprintd + libfprint, then retry.");
+    }
+    if !fp::reader_present() {
+        bail!("no fingerprint reader is registered with fprintd.");
+    }
+    let enroll = ["/usr/bin/fprintd-enroll", "/bin/fprintd-enroll"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .context("fprintd-enroll not found")?;
+    println!("Enrolling a fingerprint for {user} (follow the prompts; lift and touch repeatedly)…");
+    let status = Command::new(enroll)
+        .arg(user)
+        .status()
+        .context("running fprintd-enroll")?;
+    if !status.success() {
+        bail!("fprintd-enroll did not complete; nothing changed.");
+    }
+    println!("\nEnrolled. To use it, add to /etc/linhello/policy.conf, e.g.:");
+    println!("  screen_unlock = face|fingerprint   # either unlocks");
+    println!("  sudo          = fingerprint        # touch to elevate");
+    println!("Face/RGB-only continues to work; fingerprint is additive.");
+    Ok(())
 }
 
 fn sbctl_installed() -> bool {
@@ -1013,6 +1095,16 @@ fn main() -> Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        Cmd::Fingerprint { action } => match action {
+            FpAction::Status { user } => {
+                let user = user.map(Ok).unwrap_or_else(current_user)?;
+                fingerprint_status(&user);
+            }
+            FpAction::Enable { user } => {
+                let user = user.map(Ok).unwrap_or_else(current_user)?;
+                fingerprint_enable(&user)?;
+            }
+        },
         Cmd::Reseal => match send(Request::Reseal)? {
             Response::Resealed { bytes } => println!("sealed {bytes} bytes"),
             Response::Error { message } => bail!(message),

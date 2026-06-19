@@ -715,6 +715,7 @@ dependencies = [
  "linhello-biometrics",
  "linhello-common",
  "linhello-core",
+ "linhello-fingerprint",
  "linhello-secureboot",
  "ratatui",
  "rpassword",
@@ -763,6 +764,7 @@ dependencies = [
  "linhello-biometrics",
  "linhello-common",
  "linhello-core",
+ "linhello-fingerprint",
  "linhello-liveness",
  "linhello-secureboot",
  "serde",
@@ -771,6 +773,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "linhello-fingerprint"
+version = "0.3.2"
+dependencies = [
+ "linhello-common",
+ "tracing",
 ]
 
 [[package]]

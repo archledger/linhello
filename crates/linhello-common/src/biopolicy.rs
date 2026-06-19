@@ -104,6 +104,101 @@ impl Default for Policy {
     }
 }
 
+// ── Multi-modality expressions (face / fingerprint / password) ───────────
+//
+// A per-operation policy value can now be an expression over modalities, so a
+// machine with no IR can still get a strong factor from a fingerprint reader:
+//   * `face`                  — face only (subject to the face tier, as before)
+//   * `fingerprint`           — fprintd only
+//   * `face|fingerprint`      — EITHER satisfies (alternation)
+//   * `fingerprint+password`  — BOTH required (conjunction)
+//   * `off`                   — disabled (defer to password)
+// The grammar is disjunctive normal form: `A+B | C+D` = (A AND B) OR (C AND D).
+
+/// An authentication modality linhello can require.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Modality {
+    /// Face match (camera; honours the RGB/IR face tier).
+    Face,
+    /// Fingerprint via fprintd.
+    Fingerprint,
+    /// The login password (enforced by PAM's password module, not linhello).
+    Password,
+}
+
+impl Modality {
+    fn parse(tok: &str) -> Option<Self> {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "face" => Some(Modality::Face),
+            "fingerprint" | "finger" | "fp" => Some(Modality::Fingerprint),
+            "password" | "passwd" | "pw" => Some(Modality::Password),
+            _ => None,
+        }
+    }
+}
+
+/// A per-operation modality expression in DNF: a set of AND-groups, any of which
+/// satisfies the operation. An empty `alternatives` means **off** (disabled).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModalityExpr {
+    /// Each inner Vec is an AND-group; the outer Vec is OR over them.
+    pub alternatives: Vec<Vec<Modality>>,
+}
+
+impl ModalityExpr {
+    /// Parse `off` / `face` / `face|fingerprint` / `fingerprint+password` / … .
+    /// Returns `None` on an unrecognized token so callers can fall back to a
+    /// safe default rather than silently mis-parsing a security policy.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("off") || s.is_empty() {
+            return Some(ModalityExpr::default());
+        }
+        let mut alternatives = Vec::new();
+        for group in s.split('|') {
+            let mut mods = Vec::new();
+            for tok in group.split('+') {
+                mods.push(Modality::parse(tok)?);
+            }
+            if mods.is_empty() {
+                return None;
+            }
+            alternatives.push(mods);
+        }
+        Some(ModalityExpr { alternatives })
+    }
+
+    /// True when this operation is disabled.
+    pub fn is_off(&self) -> bool {
+        self.alternatives.is_empty()
+    }
+
+    /// True if any alternative uses `m`.
+    pub fn uses(&self, m: Modality) -> bool {
+        self.alternatives.iter().any(|g| g.contains(&m))
+    }
+
+    /// Given which biometric modalities can actually run right now
+    /// (`face_ok`, `fingerprint_ok`), return the first AND-group that is
+    /// *satisfiable* by the available biometrics (password is assumed available
+    /// — PAM always offers it). `None` means nothing can satisfy this op, so PAM
+    /// should fall straight through to the password. This is what the daemon
+    /// uses to decide which sensors to engage.
+    pub fn satisfiable_group(&self, face_ok: bool, fingerprint_ok: bool) -> Option<&[Modality]> {
+        self.alternatives
+            .iter()
+            .find(|group| {
+                group.iter().all(|m| match m {
+                    Modality::Face => face_ok,
+                    Modality::Fingerprint => fingerprint_ok,
+                    Modality::Password => true,
+                })
+            })
+            .map(|g| g.as_slice())
+    }
+}
+
 /// Classify a PAM service into an operation class. `warm` disambiguates a
 /// live-session screen unlock from a fresh greeter login when one service
 /// (e.g. `gdm-password`) drives both.
@@ -238,6 +333,52 @@ mod tests {
         p.screen_unlock = ModalityReq::Off;
         assert_eq!(decide(OperationClass::ScreenUnlock, Tier::Secure, &p), Action::Deny);
         assert_eq!(decide(OperationClass::ScreenUnlock, Tier::Convenience, &p), Action::Deny);
+    }
+
+    #[test]
+    fn modality_expr_parses_alternation_and_conjunction() {
+        let either = ModalityExpr::parse("face|fingerprint").unwrap();
+        assert_eq!(
+            either.alternatives,
+            vec![vec![Modality::Face], vec![Modality::Fingerprint]]
+        );
+        let both = ModalityExpr::parse("fingerprint+password").unwrap();
+        assert_eq!(
+            both.alternatives,
+            vec![vec![Modality::Fingerprint, Modality::Password]]
+        );
+        assert!(ModalityExpr::parse("off").unwrap().is_off());
+        assert!(ModalityExpr::parse("face").unwrap().uses(Modality::Face));
+        // Aliases.
+        assert_eq!(
+            ModalityExpr::parse("fp+pw").unwrap().alternatives,
+            vec![vec![Modality::Fingerprint, Modality::Password]]
+        );
+        // Unknown token → None (caller keeps the safe default).
+        assert!(ModalityExpr::parse("retina").is_none());
+        assert!(ModalityExpr::parse("face+").is_none());
+    }
+
+    #[test]
+    fn satisfiable_group_picks_available_modalities() {
+        let e = ModalityExpr::parse("face|fingerprint").unwrap();
+        // No IR/face working, but a reader is enrolled → fingerprint alternative.
+        assert_eq!(
+            e.satisfiable_group(false, true),
+            Some(&[Modality::Fingerprint][..])
+        );
+        // Face works → first alternative (face) wins.
+        assert_eq!(e.satisfiable_group(true, false), Some(&[Modality::Face][..]));
+        // Neither biometric available → nothing to engage (fall through to pw).
+        assert_eq!(e.satisfiable_group(false, false), None);
+
+        // Conjunction needs the biometric half present; password is implicit.
+        let both = ModalityExpr::parse("fingerprint+password").unwrap();
+        assert_eq!(
+            both.satisfiable_group(false, true),
+            Some(&[Modality::Fingerprint, Modality::Password][..])
+        );
+        assert_eq!(both.satisfiable_group(false, false), None);
     }
 
     #[test]

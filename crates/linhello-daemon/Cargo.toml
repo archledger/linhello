@@ -15,6 +15,7 @@ linhello-core.workspace = true
 linhello-biometrics.workspace = true
 linhello-liveness.workspace = true
 linhello-secureboot.workspace = true
+linhello-fingerprint.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
