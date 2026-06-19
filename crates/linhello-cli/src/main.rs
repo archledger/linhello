@@ -477,9 +477,26 @@ pub(crate) fn fingerprint_enable(user: &str) -> Result<()> {
             println!("enabled the `fprintd` pam-auth-update profile.");
         }
         DistroFamily::Fedora => {
-            println!("Fedora: enable the fingerprint feature with authselect, e.g.:");
-            println!("  sudo authselect enable-feature with-fingerprint");
-            println!("  sudo authselect apply-changes");
+            // authselect owns system-auth/password-auth on Fedora; enabling its
+            // fingerprint feature wires pam_fprintd the supported way.
+            let enabled = Command::new("authselect")
+                .args(["enable-feature", "with-fingerprint"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let applied = enabled
+                && Command::new("authselect")
+                    .arg("apply-changes")
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            if applied {
+                println!("enabled the authselect `with-fingerprint` feature.");
+            } else {
+                println!("Could not run authselect automatically — enable it manually:");
+                println!("  sudo authselect enable-feature with-fingerprint");
+                println!("  sudo authselect apply-changes");
+            }
         }
         DistroFamily::Arch | DistroFamily::Other => {
             println!("Add `auth sufficient pam_fprintd.so` above pam_unix in the relevant");
@@ -522,7 +539,22 @@ pub(crate) fn fingerprint_disable(user: &str) -> Result<()> {
             println!("removed the `fprintd` pam-auth-update profile.");
         }
         DistroFamily::Fedora => {
-            println!("Fedora: `sudo authselect disable-feature with-fingerprint && sudo authselect apply-changes`");
+            let disabled = Command::new("authselect")
+                .args(["disable-feature", "with-fingerprint"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let applied = disabled
+                && Command::new("authselect")
+                    .arg("apply-changes")
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+            if applied {
+                println!("disabled the authselect `with-fingerprint` feature.");
+            } else {
+                println!("Disable manually: `sudo authselect disable-feature with-fingerprint && sudo authselect apply-changes`");
+            }
         }
         DistroFamily::Arch | DistroFamily::Other => {
             println!("Remove the `auth … pam_fprintd.so` line(s) you added to /etc/pam.d.");
@@ -546,12 +578,21 @@ fn fp_names_file(user: &str) -> String {
 }
 
 /// Friendly name for an enrolled finger slot, if the user gave one.
-fn fingerprint_name(user: &str, slot: &str) -> Option<String> {
+pub(crate) fn fingerprint_name(user: &str, slot: &str) -> Option<String> {
     linhello_common::config::read_kv(&fp_names_file(user), slot).filter(|s| !s.is_empty())
 }
 
 fn set_fingerprint_name(user: &str, slot: &str, name: &str) {
-    let _ = linhello_common::config::write_kv(&fp_names_file(user), slot, name);
+    // The per-user dir exists after face enrollment, but a fingerprint-only user
+    // may not have it yet — create it (root-only) so write_kv doesn't fail.
+    let dir = std::path::Path::new(linhello_common::CONFIG_ROOT).join(user);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("warning: could not create {}: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = linhello_common::config::write_kv(&fp_names_file(user), slot, name) {
+        eprintln!("warning: could not save the fingerprint name: {e}");
+    }
 }
 
 /// Enroll one additional fingerprint under a friendly name, refusing duplicates.
@@ -865,7 +906,7 @@ fn print_policy_status() {
     for op in ops {
         println!("       · {:<19}{:<8}{}", op.operation, op.action, op.effect);
     }
-    println!("       · {:<19}{}", "configure", "/etc/linhello/policy.conf (keys: tier, screen_unlock, login, sudo, polkit)");
+    println!("       · {:<19}{}", "configure", "/etc/linhello/policy.conf (keys: method, tier, screen_unlock, login, sudo, polkit)");
 }
 
 /// Guided face capture: prints instructions and captures `samples` frames,

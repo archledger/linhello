@@ -99,19 +99,29 @@ pub fn enrolled_fingers(user: &str) -> Vec<String> {
     parse_enrolled_lines(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Parse the enrolled-finger names out of `fprintd-list` output, which prints
-/// one ` - #N: <finger-name>` line per enrolled finger. Split out for testing.
+/// Parse the enrolled-finger slots out of `fprintd-list` output, which prints
+/// one ` - #N: <finger-name>` line per enrolled finger. De-duplicated and
+/// order-preserving: fprintd can register the same reader as more than one
+/// device (e.g. `Device/0` and `Device/1`) and then list the identical fingers
+/// under each section — without dedup that would double every slot. Split out
+/// for testing.
 fn parse_enrolled_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            l.strip_prefix('-')
-                .map(str::trim)
-                .filter(|r| r.starts_with('#'))
-                .and_then(|r| r.split(':').nth(1))
-                .map(|name| name.trim().to_string())
-        })
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for l in text.lines() {
+        let l = l.trim();
+        if let Some(slot) = l
+            .strip_prefix('-')
+            .map(str::trim)
+            .filter(|r| r.starts_with('#'))
+            .and_then(|r| r.split(':').nth(1))
+            .map(|name| name.trim().to_string())
+        {
+            if !out.contains(&slot) {
+                out.push(slot);
+            }
+        }
+    }
+    out
 }
 
 /// True when `user` has at least one enrolled finger.
@@ -216,6 +226,21 @@ mod tests {
             vec!["right-index-finger", "left-index-finger"]
         );
         assert!(parse_enrolled_lines("User x has no fingers enrolled for Synaptics.").is_empty());
+    }
+
+    #[test]
+    fn enrolled_dedups_across_duplicate_device_sections() {
+        // fprintd sometimes lists the same reader twice (Device/0 and Device/1)
+        // with identical fingers — the slots must not be double-counted.
+        let sample = "found 2 devices\n\
+            Using device /net/reactivated/Fprint/Device/1\n\
+            Fingerprints for user x on Synaptics Sensors (press):\n - #0: left-index-finger\n - #1: right-index-finger\n\
+            Using device /net/reactivated/Fprint/Device/0\n\
+            Fingerprints for user x on Synaptics Sensors (press):\n - #0: left-index-finger\n - #1: right-index-finger\n";
+        assert_eq!(
+            parse_enrolled_lines(sample),
+            vec!["left-index-finger", "right-index-finger"]
+        );
     }
 
     #[test]

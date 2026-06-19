@@ -270,6 +270,10 @@ struct App {
     /// Detected unlock methods (camera tiers + fingerprint), snapshot at entry —
     /// so the render path never spawns busctl/fprintd/camera probes.
     fp_methods: linhello_common::biopolicy::AvailableMethods,
+    /// (slot, friendly name) for each enrolled finger, snapshot at entry.
+    fp_named: Vec<(String, Option<String>)>,
+    /// Configured `method` from policy.conf (e.g. "fingerprint" / "auto"), snapshot.
+    fp_method: String,
     /// Set by the Fingerprint screen to ask the event loop to suspend the TUI
     /// and run the interactive enroll + PAM-wiring flow, then resume.
     pending_fp_enable: bool,
@@ -335,6 +339,8 @@ impl App {
             fp_reader: None,
             fp_enrolled: Vec::new(),
             fp_methods: linhello_common::biopolicy::AvailableMethods::default(),
+            fp_named: Vec::new(),
+            fp_method: "auto".into(),
             pending_fp_enable: false,
             status: String::new(),
             should_quit: false,
@@ -510,6 +516,13 @@ impl App {
         };
         self.fp_enrolled = linhello_fingerprint::enrolled_fingers(&self.active_profile);
         self.fp_methods = crate::available_methods(&self.active_profile);
+        self.fp_named = self
+            .fp_enrolled
+            .iter()
+            .map(|s| (s.clone(), crate::fingerprint_name(&self.active_profile, s)))
+            .collect();
+        self.fp_method = linhello_common::config::read_kv("policy.conf", "method")
+            .unwrap_or_else(|| "auto".into());
     }
 
     fn fingerprint_key(&mut self, code: KeyCode) {
@@ -2652,19 +2665,34 @@ impl App {
             }
             Some(name) => {
                 lines.push(Line::from(format!("reader   : {name}")));
-                let enrolled = if self.fp_enrolled.is_empty() {
-                    "none".to_string()
+                if self.fp_named.is_empty() {
+                    lines.push(Line::from(format!("enrolled : none   (profile: {})", self.active_profile)));
                 } else {
-                    format!("{} finger(s)", self.fp_enrolled.len())
-                };
-                lines.push(Line::from(format!(
-                    "enrolled : {enrolled}   (profile: {})",
-                    self.active_profile
-                )));
+                    lines.push(Line::from(format!(
+                        "enrolled : {} finger(s)   (profile: {})",
+                        self.fp_named.len(),
+                        self.active_profile
+                    )));
+                    for (slot, fname) in &self.fp_named {
+                        match fname {
+                            Some(n) => lines.push(Line::from(format!("             • {n}  [{slot}]"))),
+                            None => lines.push(Line::from(format!("             • {slot}"))),
+                        }
+                    }
+                }
                 lines.push(Line::from(format!(
                     "face cam : {}",
                     if av.face_ir { "RGB + IR" } else { "RGB only" }
                 )));
+                // Reflect the configured method so the user sees whether face is
+                // currently suppressed in favour of fingerprint.
+                if self.fp_method == "fingerprint" {
+                    lines.push(Line::from(
+                        "method   : fingerprint — face prompts are suppressed".to_string().green(),
+                    ));
+                } else {
+                    lines.push(Line::from(format!("method   : {} (face active)", self.fp_method)));
+                }
                 lines.push(Line::from(""));
                 // Recommendation is based on what the HARDWARE supports (so a
                 // reader that isn't enrolled yet still recommends fingerprint),
