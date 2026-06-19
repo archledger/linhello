@@ -86,6 +86,12 @@ show fingerprint natively. The face method stays handled by `pam_linhello`.
   `linhello fingerprint enable` (enroll via `fprintd-enroll`, then wire
   `pam_fprintd`: `pam-auth-update --enable fprintd` on Debian; authselect
   feature on Fedora; manual stanza guidance elsewhere).
+- **Wizards**: both the headless `setup` and the **TUI** (`linhello tui`) now
+  include a fingerprint step. The TUI gains a dedicated **Fingerprint** screen
+  (after Identify, before Password) that shows the reader, the detected
+  methods/tiers, the recommended default, and — on `e` — suspends the
+  full-screen view to run the interactive `fprintd-enroll` + PAM wiring, then
+  resumes. It is an optional step (does not gate progression).
 
 RGB-only face is unchanged; fingerprint is additive and opt-in.
 
@@ -94,9 +100,7 @@ RGB-only face is unchanged; fingerprint is additive and opt-in.
 1. **`method` in policy.conf**: have the daemon read the chosen method and
    reflect it in `doctor`/`policy-status` (the per-method PAM wiring already
    makes it functional; this is reporting/consistency).
-2. **`setup` integration**: offer the method choice during the wizard when the
-   hardware supports more than one (especially RGB + IR + fingerprint).
-3. **Greeter method-chooser** ("like Windows 11"): investigate per-desktop. On
+2. **Greeter method-chooser** ("like Windows 11"): investigate per-desktop. On
    GDM, fingerprint + password appear natively once `pam_fprintd` is wired; a
    polished click-to-choose chooser is limited by the greeter, not linhello.
    KDE/SDDM differ. Deferred until the core is validated in the field.

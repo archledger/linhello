@@ -326,7 +326,7 @@ fn send(req: Request) -> Result<Response> {
 }
 
 /// Detect which unlock methods this host can offer (hardware + enrollment).
-fn available_methods(user: &str) -> linhello_common::biopolicy::AvailableMethods {
+pub(crate) fn available_methods(user: &str) -> linhello_common::biopolicy::AvailableMethods {
     use linhello_common::biopolicy::AvailableMethods;
     use linhello_fingerprint as fp;
     AvailableMethods {
@@ -401,7 +401,7 @@ fn fingerprint_status(user: &str) {
 /// Enroll a fingerprint and wire `pam_fprintd` so fingerprint becomes a
 /// secure-tier login/sudo method. Password (and any configured face) keep
 /// working; this is additive and reversible.
-fn fingerprint_enable(user: &str) -> Result<()> {
+pub(crate) fn fingerprint_enable(user: &str) -> Result<()> {
     use linhello_common::platform::{self, DistroFamily};
     use linhello_fingerprint as fp;
 
@@ -989,6 +989,34 @@ fn run_setup() -> Result<()> {
         enroll_guided(&user, false, 5)?;
     } else {
         println!("  skipped — run `linhello enroll` when ready.");
+    }
+
+    // Optional — fingerprint (a standalone secure-tier method). Offered when a
+    // reader is present, especially valuable on RGB-only machines where face is
+    // convenience-tier only.
+    if linhello_fingerprint::available() {
+        let av = available_methods(&user);
+        println!();
+        if !av.face_ir {
+            println!(
+                "Optional — a fingerprint reader was detected. On this RGB-only machine, \n\
+                 fingerprint is a SECURE-tier method (screen unlock + login + sudo), stronger \n\
+                 than RGB-only face (convenience: screen unlock only)."
+            );
+        } else {
+            println!(
+                "Optional — a fingerprint reader was detected. It's a secure-tier alternative \n\
+                 to IR face (both unlock everything); you can use either."
+            );
+        }
+        if prompt_yes("  set up fingerprint now (enroll + wire pam_fprintd)? [y/N] ") {
+            if let Err(e) = fingerprint_enable(&user) {
+                println!("  fingerprint setup did not finish: {e}");
+                println!("  you can set it up later with `sudo linhello fingerprint enable`.");
+            }
+        } else {
+            println!("  skipped — set up later with `sudo linhello fingerprint enable`.");
+        }
     }
 
     println!("\nSetup complete. Try `linhello test`.");
