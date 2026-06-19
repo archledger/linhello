@@ -33,7 +33,9 @@ A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): 
   state (the `Medium`/`Full` tiers); without it linhello still runs, but at its
   weakest TPM tier (no boot-state binding). **Firmware/dbx updates don't break
   face unlock** — on GRUB, linhello re-signs its PCR-7 policy automatically.
-- **Arch Linux or Fedora.** Debian/Ubuntu support is experimental.
+- **Arch Linux, Fedora, or Debian/Ubuntu.** All three ship signed packages;
+  Debian/Ubuntu was build-tested on Ubuntu 26.04 (install → daemon auto-starts →
+  `doctor` READY → face screen-unlock confirmed).
 
 ## ⚡ Install
 
@@ -66,6 +68,36 @@ sudo linhello fetch-models
 sudo linhello tui
 ```
 </details>
+
+### Debian / Ubuntu
+
+Download the `_amd64.deb` from the
+[latest release](https://github.com/archledger/linhello/releases/latest), then
+let `apt` install it and pull its dependencies. The daemon starts on install, so
+`linhello doctor` works right away:
+
+```sh
+# 1. Install the package (resolves dependencies; daemon auto-starts)
+sudo apt install ./linhello_*_amd64.deb
+
+# 2. ONNX Runtime isn't in the Debian/Ubuntu repos — fetch the matching prebuild
+sudo linhello fetch-onnx
+
+# 3. Face-recognition models (~250 MB, one time)
+sudo linhello fetch-models
+
+# 4. Set up — pick your camera, enroll, and wire up login (via pam-auth-update)
+sudo linhello tui
+```
+
+Verified on Ubuntu 26.04 (amd64): the `.deb` installs, the daemon auto-starts,
+`linhello doctor` reports READY, and face screen-unlock works through
+`pam-auth-update`. Login wiring uses your distro's `pam-auth-update` profile, so
+the password (and TTY) escape hatch is always preserved.
+
+> **Building the .deb yourself** (instead of the release artifact): from a clone,
+> `cp -rT packaging/debian debian && dpkg-buildpackage -us -uc -b` produces
+> `../linhello_<ver>_amd64.deb`. Needs `debhelper`, `cargo`/`rustc`, and `clang`.
 
 ### Arch Linux
 
