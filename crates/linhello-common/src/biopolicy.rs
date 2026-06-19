@@ -170,8 +170,11 @@ pub struct AvailableMethods {
     pub face_rgb: bool,
     /// IR camera present (secure face possible).
     pub face_ir: bool,
-    /// Fingerprint reader present with at least one enrolled finger.
+    /// Fingerprint reader present with at least one enrolled finger (usable NOW).
     pub fingerprint: bool,
+    /// Fingerprint reader + fprintd present, regardless of enrollment. Drives the
+    /// *recommendation* ("enroll a finger") even before any finger exists.
+    pub fingerprint_capable: bool,
 }
 
 impl AvailableMethods {
@@ -212,7 +215,24 @@ impl AvailableMethods {
     /// True when two distinct *secure* methods exist (IR face AND fingerprint),
     /// so linhello should let the user pick rather than silently defaulting.
     pub fn needs_user_choice(self) -> bool {
-        self.face_ir && self.fingerprint
+        self.face_ir && self.fingerprint_capable
+    }
+
+    /// The strongest method this host's *hardware* supports — what linhello
+    /// recommends the user set up — regardless of whether the biometric is
+    /// enrolled yet. This is what the wizard/doctor should present as the goal:
+    /// on an RGB-only machine with a reader it recommends `Fingerprint` (secure),
+    /// not the convenience RGB face that merely happens to work today.
+    pub fn recommended_method(self) -> Option<UnlockMethod> {
+        if self.face_ir {
+            Some(UnlockMethod::FaceIr)
+        } else if self.fingerprint_capable {
+            Some(UnlockMethod::Fingerprint)
+        } else if self.face_rgb {
+            Some(UnlockMethod::FaceRgb)
+        } else {
+            None
+        }
     }
 }
 
@@ -364,18 +384,45 @@ mod tests {
 
     #[test]
     fn rgb_only_defaults_to_convenience() {
-        let av = AvailableMethods { face_rgb: true, face_ir: false, fingerprint: false };
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: false,
+            fingerprint_capable: false,
+        };
         assert_eq!(av.default_method(), Some(UnlockMethod::FaceRgb));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::FaceRgb));
         assert!(!av.needs_user_choice());
         assert_eq!(av.selectable(), vec![UnlockMethod::FaceRgb]);
     }
 
     #[test]
+    fn rgb_plus_unenrolled_reader_recommends_fingerprint() {
+        // The bug the TUI surfaced: a reader is PRESENT but not enrolled yet. The
+        // *active* method is still convenience face, but the RECOMMENDATION must
+        // be the secure fingerprint (enroll it), not convenience face.
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: false,        // not enrolled yet
+            fingerprint_capable: true, // reader present
+        };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceRgb)); // works now
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::Fingerprint)); // goal
+    }
+
+    #[test]
     fn rgb_plus_fingerprint_defaults_to_secure_fingerprint() {
-        // The user's example: RGB-only camera + fingerprint → default to the
-        // secure fingerprint method, but still offer RGB-only as an opt-down.
-        let av = AvailableMethods { face_rgb: true, face_ir: false, fingerprint: true };
+        // The user's example, once enrolled: RGB-only camera + fingerprint →
+        // fingerprint is both the default AND the recommendation.
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: false,
+            fingerprint: true,
+            fingerprint_capable: true,
+        };
         assert_eq!(av.default_method(), Some(UnlockMethod::Fingerprint));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::Fingerprint));
         assert!(!av.needs_user_choice()); // only one secure method
         assert_eq!(
             av.selectable(),
@@ -385,15 +432,26 @@ mod tests {
 
     #[test]
     fn ir_only_is_secure_face() {
-        let av = AvailableMethods { face_rgb: true, face_ir: true, fingerprint: false };
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: true,
+            fingerprint: false,
+            fingerprint_capable: false,
+        };
         assert_eq!(av.default_method(), Some(UnlockMethod::FaceIr));
+        assert_eq!(av.recommended_method(), Some(UnlockMethod::FaceIr));
         assert!(!av.needs_user_choice());
     }
 
     #[test]
     fn ir_and_fingerprint_lets_user_choose() {
         // Both secure → linhello should prompt rather than silently picking.
-        let av = AvailableMethods { face_rgb: true, face_ir: true, fingerprint: true };
+        let av = AvailableMethods {
+            face_rgb: true,
+            face_ir: true,
+            fingerprint: true,
+            fingerprint_capable: true,
+        };
         assert!(av.needs_user_choice());
         assert_eq!(
             av.selectable(),
@@ -405,6 +463,7 @@ mod tests {
     fn no_biometrics_means_password_only() {
         let av = AvailableMethods::default();
         assert_eq!(av.default_method(), None);
+        assert_eq!(av.recommended_method(), None);
         assert!(av.selectable().is_empty());
     }
 

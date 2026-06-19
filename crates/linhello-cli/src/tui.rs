@@ -425,18 +425,39 @@ impl App {
         if self.gate().is_err() {
             return;
         }
-        let i = self.step_index();
-        if i + 1 < ORDER.len() {
-            self.screen = ORDER[i + 1];
-            self.on_enter();
+        let mut i = self.step_index();
+        while i + 1 < ORDER.len() {
+            i += 1;
+            if self.screen_applicable(ORDER[i]) {
+                self.screen = ORDER[i];
+                self.on_enter();
+                return;
+            }
         }
     }
 
     fn prev(&mut self) {
-        let i = self.step_index();
-        if i > 0 {
-            self.screen = ORDER[i - 1];
-            self.on_enter();
+        let mut i = self.step_index();
+        while i > 0 {
+            i -= 1;
+            if self.screen_applicable(ORDER[i]) {
+                self.screen = ORDER[i];
+                self.on_enter();
+                return;
+            }
+        }
+    }
+
+    /// Whether a wizard step applies to this host. The TPM password-seal
+    /// (`Password`) exists only so SECURE-tier **face** can release the login
+    /// password (keyring unlock / sudo-without-prompt). On an RGB-only
+    /// (convenience) face tier, face never unseals, so the step is meaningless —
+    /// skip it. (Fingerprint, the secure method here, uses pam_fprintd, not this
+    /// TPM password envelope.)
+    fn screen_applicable(&self, screen: Screen) -> bool {
+        match screen {
+            Screen::Password => linhello_biometrics::camera::ir_device().is_some(),
+            _ => true,
         }
     }
 
@@ -2611,7 +2632,6 @@ impl App {
     }
 
     fn body_fingerprint(&self, frame: &mut Frame, area: Rect) {
-        use linhello_common::biopolicy::UnlockMethod;
         let av = self.fp_methods;
         let mut lines = vec![
             Line::from("Fingerprint — a secure-tier unlock method".bold()),
@@ -2646,37 +2666,46 @@ impl App {
                     if av.face_ir { "RGB + IR" } else { "RGB only" }
                 )));
                 lines.push(Line::from(""));
-                if let Some(def) = av.default_method() {
+                // Recommendation is based on what the HARDWARE supports (so a
+                // reader that isn't enrolled yet still recommends fingerprint),
+                // shown distinctly from what is actually usable right now.
+                let recommended = av.recommended_method();
+                let active = av.default_method();
+                if let Some(rec) = recommended {
                     lines.push(Line::from(vec![
-                        Span::raw("recommended: "),
-                        Span::styled(def.label(), Style::default().fg(Color::Green)),
+                        Span::raw("recommended : "),
+                        Span::styled(rec.label(), Style::default().fg(Color::Green)),
                     ]));
-                }
-                let others: Vec<&str> = av
-                    .selectable()
-                    .into_iter()
-                    .filter(|m| Some(*m) != av.default_method())
-                    .map(UnlockMethod::label)
-                    .collect();
-                if !others.is_empty() {
-                    lines.push(Line::from(format!("alternatives: {}", others.join("; "))));
+                    if active != recommended {
+                        if let Some(act) = active {
+                            lines.push(Line::from(format!(
+                                "active now  : {}  (until you set up the recommended method)",
+                                act.label()
+                            )));
+                        }
+                    }
                 }
                 lines.push(Line::from(""));
                 if self.fp_enrolled.is_empty() {
-                    lines.push(Line::from(
-                        "✗ Not set up — press e to enroll a finger and wire it in.".yellow(),
-                    ));
                     if !av.face_ir {
                         lines.push(Line::from(
-                            "This machine is RGB-only for face, so fingerprint is the strongest",
+                            "✗ Press e to enroll a finger + enable it — the SECURE option here"
+                                .yellow(),
                         ));
                         lines.push(Line::from(
-                            "option (RGB-only face is convenience-tier: screen unlock only).",
+                            "  (screen unlock + login + sudo). RGB-only face is convenience-tier:"
+                                .yellow(),
+                        ));
+                        lines.push(Line::from("  it only unlocks an already-open session.".yellow()));
+                    } else {
+                        lines.push(Line::from(
+                            "✗ Press e to enroll a finger — a secure alternative to IR face."
+                                .yellow(),
                         ));
                     }
                 } else {
                     lines.push(Line::from(
-                        "✓ A fingerprint is enrolled. Press e to (re)wire pam_fprintd if needed."
+                        "✓ Fingerprint enrolled — secure tier active. Press e to re-wire if needed."
                             .green(),
                     ));
                 }

@@ -335,6 +335,7 @@ pub(crate) fn available_methods(user: &str) -> linhello_common::biopolicy::Avail
         face_rgb: !linhello_biometrics::camera::enumerate().is_empty(),
         face_ir: linhello_biometrics::camera::ir_device().is_some(),
         fingerprint: fp::available() && fp::has_enrollment(user),
+        fingerprint_capable: fp::available(),
     }
 }
 
@@ -367,14 +368,27 @@ fn fingerprint_status(user: &str) {
     println!("face camera   : {}", if av.face_ir { "RGB + IR" } else { "RGB only" });
     println!();
 
-    match av.default_method() {
+    let recommended = av.recommended_method();
+    let active = av.default_method();
+    match recommended {
         None => println!("no biometric method available — password only."),
-        Some(def) => {
-            println!("default       : {} [{:?} tier]", def.label(), def.tier());
+        Some(rec) => {
+            println!("recommended   : {} [{:?} tier]", rec.label(), rec.tier());
+            // Show what actually works right now only when it differs from the
+            // recommendation (e.g. a reader is present but not enrolled yet).
+            if active != recommended {
+                match active {
+                    Some(act) => println!(
+                        "active now    : {} — until you set up the recommended method",
+                        act.label()
+                    ),
+                    None => println!("active now    : password only — nothing set up yet"),
+                }
+            }
             let others: Vec<&str> = av
                 .selectable()
                 .into_iter()
-                .filter(|&m| m != def)
+                .filter(|&m| Some(m) != recommended)
                 .map(UnlockMethod::label)
                 .collect();
             if !others.is_empty() {
@@ -385,14 +399,19 @@ fn fingerprint_status(user: &str) {
                     "\nBoth face (IR) and fingerprint are secure-tier — choose either. \
                      Set with `/etc/linhello/policy.conf` key `method = face-ir|fingerprint`."
                 );
-            } else if matches!(def, UnlockMethod::Fingerprint) {
-                println!(
-                    "\nThis machine is RGB-only for face, so fingerprint is the secure default \
-                     (unlocks screen + login + sudo). You can opt down to RGB-only face \
-                     (convenience: screen unlock only) if you prefer — `method = face-rgb`."
-                );
-            } else if matches!(def, UnlockMethod::FaceRgb) && fp::available() {
-                println!("\nEnroll a fingerprint (`linhello fingerprint enable`) for a secure-tier method.");
+            } else if matches!(rec, UnlockMethod::Fingerprint) {
+                if fp::has_enrollment(user) {
+                    println!(
+                        "\nFingerprint is the secure method here (screen + login + sudo). \
+                         You can opt down to RGB-only face (convenience) — `method = face-rgb`."
+                    );
+                } else {
+                    println!(
+                        "\nThis machine is RGB-only for face, so fingerprint is the secure choice \
+                         (screen + login + sudo). Set it up: `linhello fingerprint enable`. \
+                         RGB-only face (convenience: screen unlock only) keeps working meanwhile."
+                    );
+                }
             }
         }
     }
