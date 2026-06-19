@@ -1,12 +1,11 @@
-# LinuxHello: Fingerprint as a First-Class Modality
+# LinuxHello: Fingerprint as a First-Class Secure-Tier Method
 
-**Status:** **Phase 1 implemented** (detection, suggestion, modality-expression
-engine, CLI). Phase 2 (daemon auth orchestration + PAM composition) is
-roadmapped below.
-**Goal:** On machines with an **RGB-only** camera (no IR → convenience tier),
-let the user add a **fingerprint** as a stronger factor, while keeping RGB-only
-face fully usable for those who prefer it. Fingerprint becomes a first-class
-modality the policy engine can require, suggest, and combine with face/password.
+**Status:** **Phase 1 implemented** (tier/method model, detection, suggestion,
+CLI + `pam_fprintd` wiring). Phase 2 (greeter method-chooser) is deferred — see §5.
+**Goal:** Treat fingerprint as a standalone **secure-tier** unlock method
+(equal to IR face), never combined with face. linhello picks a sensible default
+for the detected hardware, lets the user switch to any method their hardware
+supports, and explains the trade-off when they pick a weaker one.
 
 ---
 
@@ -38,54 +37,69 @@ auth-critical verify):
 
 (A future swap to a typed `zbus` client is possible without changing callers.)
 
-## 3. Policy model: modality expressions
+## 3. Methods & tiers — NOT combined
 
-`policy.conf` per-operation values become expressions over
-`{face, fingerprint, password}` in disjunctive normal form
-(`linhello_common::biopolicy::ModalityExpr`):
+Each method is a single authenticator with a fixed tier
+(`linhello_common::biopolicy::UnlockMethod`):
 
-```
-screen_unlock = face|fingerprint     # EITHER unlocks
-sudo          = fingerprint          # touch to elevate
-login         = fingerprint+password # BOTH required
-polkit        = off                  # always password
-```
+| Method | Tier | Can unlock |
+|---|---|---|
+| `face-rgb` | Convenience | live-session screen unlock only |
+| `face-ir` | Secure | screen unlock + login + sudo + polkit |
+| `fingerprint` | Secure | screen unlock + login + sudo + polkit |
 
-`|` is alternation (any AND-group satisfies); `+` is conjunction (all of the
-group). `ModalityExpr::satisfiable_group(face_ok, fingerprint_ok)` picks the
-first group the currently-available biometrics can satisfy, so the daemon knows
-which sensors to engage and when to fall through to the password.
+Methods are **never** combined (no `face+fingerprint`, no `fingerprint+password`).
+A single secure method already unlocks everything; the password is always the
+universal fallback (enforced by PAM), so it needs no explicit conjunction.
 
-## 4. What ships in Phase 1
+`AvailableMethods` (what the host detects: RGB cam, IR cam, enrolled fingerprint)
+drives selection:
+
+| Detected | Default | User may also pick |
+|---|---|---|
+| RGB only | `face-rgb` (convenience) | — |
+| RGB + fingerprint | **`fingerprint`** (secure) | `face-rgb` (convenience, with limits explained) |
+| RGB + IR | `face-ir` (secure) | `face-rgb` |
+| RGB + IR + fingerprint | `face-ir` (secure) — **user is asked**, both are secure | `fingerprint`, `face-rgb` |
+
+`default_method()` / `selectable()` / `needs_user_choice()` implement this. The
+chosen method is recorded in `/etc/linhello/policy.conf` (`method = …`).
+
+## 4. Mechanism: fprintd via `pam_fprintd`
+
+Fingerprint verification is done by **`pam_fprintd`** in the PAM stack, *not* by
+linhello. linhello detects the reader, recommends the tier/method, and **wires
+`pam_fprintd`** for the fingerprint method (per distro). This is the standard
+integration, avoids any device-claim fight, and is what lets the desktop greeter
+show fingerprint natively. The face method stays handled by `pam_linhello`.
+
+## 5. What ships in Phase 1
 
 - `linhello-fingerprint` crate: `available()`, `reader_present()`,
-  `device_name()`, `enrolled_fingers()`, `has_enrollment()`, `verify()`.
-- `doctor`: a **Fingerprint** line — on RGB-only machines it suggests enrolling
-  a fingerprint as a stronger factor; otherwise notes it as an optional second
-  factor. Absent reader → no line (no clutter).
-- CLI: `linhello fingerprint status` (reader, tier, enrolled fingers) and
-  `linhello fingerprint enable` (guides `fprintd-enroll`).
-- `ModalityExpr` parser + decision helper, unit-tested.
+  `device_name()`, `enrolled_fingers()`, `has_enrollment()` (detection only —
+  verification belongs to `pam_fprintd`).
+- `UnlockMethod` / `AvailableMethods` tier-selection model in `biopolicy`,
+  unit-tested.
+- `doctor`: a **Fingerprint** line framing it as a secure-tier method (the
+  default on RGB-only machines, or an equal alternative to IR face).
+- CLI: `linhello fingerprint status` (reader, methods, default, suggestion) and
+  `linhello fingerprint enable` (enroll via `fprintd-enroll`, then wire
+  `pam_fprintd`: `pam-auth-update --enable fprintd` on Debian; authselect
+  feature on Fedora; manual stanza guidance elsewhere).
 
-RGB-only face is unchanged: fingerprint is purely additive and opt-in.
+RGB-only face is unchanged; fingerprint is additive and opt-in.
 
-## 5. Phase 2 roadmap (daemon orchestration + PAM)
+## 6. Phase 2 roadmap
 
-1. **policy.conf**: parse the per-operation values as `ModalityExpr` (keep the
-   existing `off/rgb/ir` face values working — map them onto `face` expressions).
-2. **Daemon** `do_authenticate` / `do_auth_intent`: compute
-   `face_ok` (tier + enrollment) and `fingerprint_ok`
-   (`linhello_fingerprint::has_enrollment`), pick the satisfiable group, and
-   engage the modalities in order (face capture, then fingerprint `verify`),
-   returning success only when a full AND-group passes. Convenience-tier
-   credential release stays gated: a biometric group that includes `password`
-   (or any login/elevation op) still defers the secret to PAM's password module.
-3. **PAM**: the `password` conjunct is enforced by composing `pam_unix` after
-   `pam_linhello` (linhello cannot verify passwords itself). The PAM-wiring layer
-   (`pamwire.rs`) emits the right stanza ordering per the policy. `pam_fprintd`
-   is **not** added to the stack — linhello owns the fingerprint modality.
-4. **Enrollment UX**: offer fingerprint in `setup` when RGB-only + reader, and
-   record per-user opt-in.
-5. **Validation**: end-to-end with a really-enrolled finger on the Synaptics
-   reader (Phase 1 validated detection + the no-enrollment fall-through; a live
-   match needs a physically enrolled print).
+1. **`method` in policy.conf**: have the daemon read the chosen method and
+   reflect it in `doctor`/`policy-status` (the per-method PAM wiring already
+   makes it functional; this is reporting/consistency).
+2. **`setup` integration**: offer the method choice during the wizard when the
+   hardware supports more than one (especially RGB + IR + fingerprint).
+3. **Greeter method-chooser** ("like Windows 11"): investigate per-desktop. On
+   GDM, fingerprint + password appear natively once `pam_fprintd` is wired; a
+   polished click-to-choose chooser is limited by the greeter, not linhello.
+   KDE/SDDM differ. Deferred until the core is validated in the field.
+4. **Validation**: end-to-end login/sudo with a physically enrolled finger
+   (Phase 1 validated detection + the tier-selection model; live auth runs
+   through `pam_fprintd`).

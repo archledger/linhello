@@ -46,23 +46,29 @@ fn fingerprint_check() -> Option<CapabilityCheck> {
     let name = linhello_fingerprint::device_name().unwrap_or_else(|| "fingerprint reader".into());
     let rgb_only = linhello_biometrics::camera::ir_device().is_none();
     if rgb_only {
-        // The convenience-tier case the user asked about: face is RGB-only, but a
-        // fingerprint reader is available — a stronger, optional second factor.
+        // The case the user asked about: face is RGB-only (convenience tier), but
+        // a fingerprint reader is available — a SECURE-tier method on its own.
         Some(check(
             "Fingerprint",
             CapabilityStatus::Ok,
             false,
             format!(
-                "{name} present — stronger than RGB-only face; enroll with `fprintd-enroll`, \
-                 then `linhello fingerprint enable`. (Face/RGB-only still works on its own.)"
+                "{name} present — a secure-tier method (screen unlock + login + sudo), \
+                 stronger than RGB-only face. Set it up with `linhello fingerprint enable`. \
+                 (RGB-only face stays available as a convenience option.)"
             ),
         ))
     } else {
+        // RGB + IR already gives a secure face tier; fingerprint is an equal
+        // secure-tier alternative the user may prefer.
         Some(check(
             "Fingerprint",
             CapabilityStatus::Ok,
             false,
-            format!("{name} present — available as an optional second factor"),
+            format!(
+                "{name} present — a secure-tier alternative to IR face (both unlock \
+                 everything); choose either. Set up with `linhello fingerprint enable`."
+            ),
         ))
     }
 }

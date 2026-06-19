@@ -6,5 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-linhello-common.workspace = true
-tracing.workspace = true
+# Detection-only crate: drives fprintd's tooling via std::process. No other deps
+# (verification is performed by pam_fprintd in the PAM stack, not here).
+

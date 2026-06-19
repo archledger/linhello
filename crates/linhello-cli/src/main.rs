@@ -325,64 +325,152 @@ fn send(req: Request) -> Result<Response> {
     client::request(&req).map_err(|e| anyhow::anyhow!("daemon: {e}"))
 }
 
-/// Print the fingerprint reader / fprintd / enrollment state for `user`.
-fn fingerprint_status(user: &str) {
+/// Detect which unlock methods this host can offer (hardware + enrollment).
+fn available_methods(user: &str) -> linhello_common::biopolicy::AvailableMethods {
+    use linhello_common::biopolicy::AvailableMethods;
     use linhello_fingerprint as fp;
-    if !fp::fprintd_present() {
-        println!("fprintd not installed — install it (and libfprint) to use fingerprint.");
-        return;
-    }
-    if !fp::reader_present() {
-        println!("fprintd is installed, but no fingerprint reader is registered.");
-        return;
-    }
-    let name = fp::device_name().unwrap_or_else(|| "fingerprint reader".into());
-    let fingers = fp::enrolled_fingers(user);
-    let rgb_only = linhello_biometrics::camera::ir_device().is_none();
-    println!("reader      : {name}");
-    println!("face tier   : {}", if rgb_only { "RGB only (convenience)" } else { "RGB + IR (secure)" });
-    if fingers.is_empty() {
-        println!("enrolled    : none for {user}");
-        println!("\nEnroll with `linhello fingerprint enable` (or `fprintd-enroll`).");
-        if rgb_only {
-            println!("On this RGB-only machine, a fingerprint is a stronger factor than face alone.");
-        }
-    } else {
-        println!("enrolled    : {} finger(s) for {user} [{}]", fingers.len(), fingers.join(", "));
-        println!("\nReady. Configure per-operation use in /etc/linhello/policy.conf, e.g.:");
-        println!("  screen_unlock = face|fingerprint");
-        println!("  sudo          = fingerprint");
+    AvailableMethods {
+        // An RGB camera is assumed present if any capture device resolves; the
+        // daemon's camera binding is authoritative, but for advice this is fine.
+        face_rgb: !linhello_biometrics::camera::enumerate().is_empty(),
+        face_ir: linhello_biometrics::camera::ir_device().is_some(),
+        fingerprint: fp::available() && fp::has_enrollment(user),
     }
 }
 
-/// Guide fingerprint enrollment via fprintd. Keeps RGB-only face fully usable;
-/// this only adds fingerprint as an option.
-fn fingerprint_enable(user: &str) -> Result<()> {
+/// Print the unlock methods, their tiers, the default, and the suggestion.
+fn fingerprint_status(user: &str) {
+    use linhello_common::biopolicy::UnlockMethod;
     use linhello_fingerprint as fp;
+
+    let reader = if fp::available() {
+        fp::device_name().unwrap_or_else(|| "fingerprint reader".into())
+    } else if fp::fprintd_present() {
+        "none registered".into()
+    } else {
+        "fprintd not installed".into()
+    };
+    let fingers = fp::enrolled_fingers(user);
+    let av = available_methods(user);
+
+    println!("reader        : {reader}");
+    if fp::available() {
+        println!(
+            "enrolled      : {}",
+            if fingers.is_empty() {
+                "no fingers — run `linhello fingerprint enable`".into()
+            } else {
+                format!("{} finger(s) [{}]", fingers.len(), fingers.join(", "))
+            }
+        );
+    }
+    println!("face camera   : {}", if av.face_ir { "RGB + IR" } else { "RGB only" });
+    println!();
+
+    match av.default_method() {
+        None => println!("no biometric method available — password only."),
+        Some(def) => {
+            println!("default       : {} [{:?} tier]", def.label(), def.tier());
+            let others: Vec<&str> = av
+                .selectable()
+                .into_iter()
+                .filter(|&m| m != def)
+                .map(UnlockMethod::label)
+                .collect();
+            if !others.is_empty() {
+                println!("alternatives  : {}", others.join("; "));
+            }
+            if av.needs_user_choice() {
+                println!(
+                    "\nBoth face (IR) and fingerprint are secure-tier — choose either. \
+                     Set with `/etc/linhello/policy.conf` key `method = face-ir|fingerprint`."
+                );
+            } else if matches!(def, UnlockMethod::Fingerprint) {
+                println!(
+                    "\nThis machine is RGB-only for face, so fingerprint is the secure default \
+                     (unlocks screen + login + sudo). You can opt down to RGB-only face \
+                     (convenience: screen unlock only) if you prefer — `method = face-rgb`."
+                );
+            } else if matches!(def, UnlockMethod::FaceRgb) && fp::available() {
+                println!("\nEnroll a fingerprint (`linhello fingerprint enable`) for a secure-tier method.");
+            }
+        }
+    }
+}
+
+/// Enroll a fingerprint and wire `pam_fprintd` so fingerprint becomes a
+/// secure-tier login/sudo method. Password (and any configured face) keep
+/// working; this is additive and reversible.
+fn fingerprint_enable(user: &str) -> Result<()> {
+    use linhello_common::platform::{self, DistroFamily};
+    use linhello_fingerprint as fp;
+
     if !fp::fprintd_present() {
-        bail!("fprintd is not installed. Install fprintd + libfprint, then retry.");
+        bail!("fprintd is not installed. Install fprintd + libpam-fprintd, then retry.");
     }
     if !fp::reader_present() {
         bail!("no fingerprint reader is registered with fprintd.");
     }
-    let enroll = ["/usr/bin/fprintd-enroll", "/bin/fprintd-enroll"]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .copied()
-        .context("fprintd-enroll not found")?;
-    println!("Enrolling a fingerprint for {user} (follow the prompts; lift and touch repeatedly)…");
-    let status = Command::new(enroll)
-        .arg(user)
-        .status()
-        .context("running fprintd-enroll")?;
-    if !status.success() {
-        bail!("fprintd-enroll did not complete; nothing changed.");
+
+    // 1. Enroll (interactive — user lifts and touches the sensor).
+    if fp::has_enrollment(user) {
+        println!("{user} already has an enrolled fingerprint; skipping enrollment.");
+    } else {
+        let enroll = abs_tool("fprintd-enroll").context("fprintd-enroll not found")?;
+        println!("Enrolling a fingerprint for {user} (follow the prompts; lift and touch repeatedly)…");
+        let status = Command::new(enroll)
+            .arg(user)
+            .status()
+            .context("running fprintd-enroll")?;
+        if !status.success() {
+            bail!("fprintd-enroll did not complete; nothing was wired.");
+        }
     }
-    println!("\nEnrolled. To use it, add to /etc/linhello/policy.conf, e.g.:");
-    println!("  screen_unlock = face|fingerprint   # either unlocks");
-    println!("  sudo          = fingerprint        # touch to elevate");
-    println!("Face/RGB-only continues to work; fingerprint is additive.");
+
+    // 2. Wire pam_fprintd per distro so the greeter/sudo offer it. Password
+    //    always remains (the fprintd PAM profile is sufficient, never required).
+    println!("\nWiring fingerprint into PAM (password stays as fallback)…");
+    match platform::distro_family() {
+        DistroFamily::Debian => {
+            // libpam-fprintd ships the `fprintd` pam-auth-update profile.
+            if !std::path::Path::new("/usr/share/pam-configs/fprintd").exists() {
+                bail!("libpam-fprintd is not installed (no /usr/share/pam-configs/fprintd). \
+                       Install it (`apt install libpam-fprintd`) and retry.");
+            }
+            let st = Command::new("pam-auth-update")
+                .args(["--enable", "fprintd"])
+                .status()
+                .context("running pam-auth-update")?;
+            if !st.success() {
+                bail!("pam-auth-update --enable fprintd failed; run it manually to review.");
+            }
+            println!("enabled the `fprintd` pam-auth-update profile.");
+        }
+        DistroFamily::Fedora => {
+            println!("Fedora: enable the fingerprint feature with authselect, e.g.:");
+            println!("  sudo authselect enable-feature with-fingerprint");
+            println!("  sudo authselect apply-changes");
+        }
+        DistroFamily::Arch | DistroFamily::Other => {
+            println!("Add `auth sufficient pam_fprintd.so` above pam_unix in the relevant");
+            println!("/etc/pam.d files (e.g. system-local-login, sudo, and your greeter),");
+            println!("or use your distro's helper if it has one.");
+        }
+    }
+
+    println!(
+        "\nDone. Fingerprint is now a secure-tier method (screen unlock + login + sudo).\n\
+         Your password still works everywhere; any configured face unlock is unchanged."
+    );
     Ok(())
+}
+
+/// Resolve a tool to an absolute path (no $PATH trust).
+fn abs_tool(name: &str) -> Option<std::path::PathBuf> {
+    ["/usr/bin", "/bin", "/usr/local/bin"]
+        .iter()
+        .map(|d| std::path::PathBuf::from(d).join(name))
+        .find(|p| p.exists())
 }
 
 fn sbctl_installed() -> bool {

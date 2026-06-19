@@ -11,27 +11,16 @@
 //!   * `fprintd-list <user>` — which fingers are enrolled
 //!   * `fprintd-verify <user>` — run one verification
 //!
-//! This makes fingerprint a first-class modality linhello can require, suggest,
-//! and combine with face/password in its policy engine — while fprintd remains
-//! the single owner of the hardware (no device-claim fights with `pam_fprintd`).
+//! This lets linhello detect, recommend, and (via PAM wiring) enable fingerprint
+//! as a standalone **secure-tier** method. Verification itself is performed by
+//! `pam_fprintd` in the PAM stack — linhello never claims the device, so it
+//! coexists cleanly with the desktop greeter's native fingerprint prompt.
 
-use linhello_common::{LinuxHelloError, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
 const FPRINT_BUS: &str = "net.reactivated.Fprint";
 const DEVICE0: &str = "/net/reactivated/Fprint/Device/0";
-
-/// Outcome of a single `verify` attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyOutcome {
-    /// A finger matched an enrolled template.
-    Match,
-    /// A finger was read but did not match.
-    NoMatch,
-    /// No enrolled fingers / no reader / fprintd unavailable.
-    Unavailable,
-}
 
 /// Resolve a tool to an absolute path under the standard system dirs. Returns
 /// `None` if not installed. Absolute paths only — never trust `$PATH` for an
@@ -107,8 +96,12 @@ pub fn enrolled_fingers(user: &str) -> Vec<String> {
     let Ok(out) = Command::new(list).arg(user).output() else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    // fprintd-list prints one " - #N: <finger-name>" line per enrolled finger.
+    parse_enrolled_lines(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the enrolled-finger names out of `fprintd-list` output, which prints
+/// one ` - #N: <finger-name>` line per enrolled finger. Split out for testing.
+fn parse_enrolled_lines(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|l| {
             let l = l.trim();
@@ -126,94 +119,18 @@ pub fn has_enrollment(user: &str) -> bool {
     !enrolled_fingers(user).is_empty()
 }
 
-/// Run a single fprintd verification for `user`. This prompts the user to touch
-/// the sensor (fprintd drives the interaction) and returns the outcome. Used by
-/// the daemon when the policy engine selects the fingerprint modality.
-pub fn verify(user: &str) -> Result<VerifyOutcome> {
-    let verify = tool("fprintd-verify")
-        .ok_or_else(|| LinuxHelloError::Policy("fprintd-verify not installed".into()))?;
-    if !has_enrollment(user) {
-        return Ok(VerifyOutcome::Unavailable);
-    }
-    let out = Command::new(verify)
-        .arg(user)
-        .output()
-        .map_err(|e| LinuxHelloError::Policy(format!("run fprintd-verify: {e}")))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(classify_verify_output(&combined, out.status.success()))
-}
-
-/// Map fprintd-verify output to an outcome. fprintd prints `verify-match` /
-/// `verify-no-match`; older builds rely on the exit status. Split out for tests.
-fn classify_verify_output(output: &str, success: bool) -> VerifyOutcome {
-    if output.contains("verify-match") {
-        VerifyOutcome::Match
-    } else if output.contains("verify-no-match") || output.contains("verify-unknown-error") {
-        VerifyOutcome::NoMatch
-    } else if output.contains("no fingers enrolled") || output.contains("NoEnrolledPrints") {
-        VerifyOutcome::Unavailable
-    } else if success {
-        // Exit 0 with no explicit token: treat as a match (older fprintd-verify
-        // returns non-zero on no-match, 0 on match).
-        VerifyOutcome::Match
-    } else {
-        VerifyOutcome::NoMatch
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_verify_match() {
-        assert_eq!(
-            classify_verify_output("Verify result: verify-match (done)", true),
-            VerifyOutcome::Match
-        );
-    }
-
-    #[test]
-    fn parses_verify_no_match() {
-        assert_eq!(
-            classify_verify_output("Verify result: verify-no-match (done)", false),
-            VerifyOutcome::NoMatch
-        );
-    }
-
-    #[test]
-    fn parses_no_enrollment() {
-        assert_eq!(
-            classify_verify_output("User has no fingers enrolled for Synaptics Sensors.", false),
-            VerifyOutcome::Unavailable
-        );
-    }
-
-    #[test]
-    fn bare_exit_zero_is_match() {
-        assert_eq!(classify_verify_output("", true), VerifyOutcome::Match);
-        assert_eq!(classify_verify_output("", false), VerifyOutcome::NoMatch);
-    }
-
-    #[test]
     fn enrolled_line_parser() {
         // The real `fprintd-list` enrolled-finger line shape.
         let sample = "Fingerprints for user x on Synaptics (press):\n - #0: right-index-finger\n - #1: left-index-finger\n";
-        let fingers: Vec<String> = sample
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.strip_prefix('-')
-                    .map(str::trim)
-                    .filter(|r| r.starts_with('#'))
-                    .and_then(|r| r.split(':').nth(1))
-                    .map(|name| name.trim().to_string())
-            })
-            .collect();
-        assert_eq!(fingers, vec!["right-index-finger", "left-index-finger"]);
+        assert_eq!(
+            parse_enrolled_lines(sample),
+            vec!["right-index-finger", "left-index-finger"]
+        );
+        assert!(parse_enrolled_lines("User x has no fingers enrolled for Synaptics.").is_empty());
     }
 }

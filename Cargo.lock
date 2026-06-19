@@ -778,10 +778,6 @@ dependencies = [
 [[package]]
 name = "linhello-fingerprint"
 version = "0.3.2"
-dependencies = [
- "linhello-common",
- "tracing",
-]
 
 [[package]]
 name = "linhello-liveness"

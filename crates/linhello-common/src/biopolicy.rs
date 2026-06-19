@@ -104,98 +104,115 @@ impl Default for Policy {
     }
 }
 
-// ── Multi-modality expressions (face / fingerprint / password) ───────────
+// ── Unlock methods & tier selection (face / fingerprint) ─────────────────
 //
-// A per-operation policy value can now be an expression over modalities, so a
-// machine with no IR can still get a strong factor from a fingerprint reader:
-//   * `face`                  — face only (subject to the face tier, as before)
-//   * `fingerprint`           — fprintd only
-//   * `face|fingerprint`      — EITHER satisfies (alternation)
-//   * `fingerprint+password`  — BOTH required (conjunction)
-//   * `off`                   — disabled (defer to password)
-// The grammar is disjunctive normal form: `A+B | C+D` = (A AND B) OR (C AND D).
+// Methods are NOT combined. Each is a single authenticator with a fixed tier:
+//   * FaceRgb      — RGB-only face → Convenience (live-session unlock only)
+//   * FaceIr       — RGB+IR face   → Secure (login / sudo / polkit)
+//   * Fingerprint  — fprintd       → Secure (login / sudo / polkit)
+// linhello picks a sensible default for the detected hardware and lets the user
+// switch to any other method their hardware supports (explaining the trade-off
+// when they pick a weaker one).
 
-/// An authentication modality linhello can require.
+/// A concrete unlock method, each tied to exactly one authenticator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Modality {
-    /// Face match (camera; honours the RGB/IR face tier).
-    Face,
-    /// Fingerprint via fprintd.
+#[serde(rename_all = "kebab-case")]
+pub enum UnlockMethod {
+    /// RGB-only face — convenience tier.
+    FaceRgb,
+    /// RGB+IR face with active-IR liveness — secure tier.
+    FaceIr,
+    /// Fingerprint via fprintd — secure tier.
     Fingerprint,
-    /// The login password (enforced by PAM's password module, not linhello).
-    Password,
 }
 
-impl Modality {
-    fn parse(tok: &str) -> Option<Self> {
-        match tok.trim().to_ascii_lowercase().as_str() {
-            "face" => Some(Modality::Face),
-            "fingerprint" | "finger" | "fp" => Some(Modality::Fingerprint),
-            "password" | "passwd" | "pw" => Some(Modality::Password),
+impl UnlockMethod {
+    /// The assurance tier this method provides.
+    pub fn tier(self) -> Tier {
+        match self {
+            UnlockMethod::FaceRgb => Tier::Convenience,
+            UnlockMethod::FaceIr | UnlockMethod::Fingerprint => Tier::Secure,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnlockMethod::FaceRgb => "face-rgb",
+            UnlockMethod::FaceIr => "face-ir",
+            UnlockMethod::Fingerprint => "fingerprint",
+        }
+    }
+
+    /// Human label for prompts / doctor.
+    pub fn label(self) -> &'static str {
+        match self {
+            UnlockMethod::FaceRgb => "face (RGB only, convenience)",
+            UnlockMethod::FaceIr => "face (RGB + IR, secure)",
+            UnlockMethod::Fingerprint => "fingerprint (secure)",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "face-rgb" | "rgb" => Some(UnlockMethod::FaceRgb),
+            "face-ir" | "ir" => Some(UnlockMethod::FaceIr),
+            "fingerprint" | "finger" | "fp" => Some(UnlockMethod::Fingerprint),
             _ => None,
         }
     }
 }
 
-/// A per-operation modality expression in DNF: a set of AND-groups, any of which
-/// satisfies the operation. An empty `alternatives` means **off** (disabled).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ModalityExpr {
-    /// Each inner Vec is an AND-group; the outer Vec is OR over them.
-    pub alternatives: Vec<Vec<Modality>>,
+/// Which methods this host can actually offer right now (hardware present and,
+/// for biometrics, enrolled). Derived by the daemon from camera + fprintd probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AvailableMethods {
+    /// RGB camera usable for face.
+    pub face_rgb: bool,
+    /// IR camera present (secure face possible).
+    pub face_ir: bool,
+    /// Fingerprint reader present with at least one enrolled finger.
+    pub fingerprint: bool,
 }
 
-impl ModalityExpr {
-    /// Parse `off` / `face` / `face|fingerprint` / `fingerprint+password` / … .
-    /// Returns `None` on an unrecognized token so callers can fall back to a
-    /// safe default rather than silently mis-parsing a security policy.
-    pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("off") || s.is_empty() {
-            return Some(ModalityExpr::default());
+impl AvailableMethods {
+    /// Every method the user may select on this host, strongest tier first.
+    /// (FaceRgb is always offered when an RGB camera exists, as the
+    /// convenience-tier opt-down.)
+    pub fn selectable(self) -> Vec<UnlockMethod> {
+        let mut v = Vec::new();
+        if self.face_ir {
+            v.push(UnlockMethod::FaceIr);
         }
-        let mut alternatives = Vec::new();
-        for group in s.split('|') {
-            let mut mods = Vec::new();
-            for tok in group.split('+') {
-                mods.push(Modality::parse(tok)?);
-            }
-            if mods.is_empty() {
-                return None;
-            }
-            alternatives.push(mods);
+        if self.fingerprint {
+            v.push(UnlockMethod::Fingerprint);
         }
-        Some(ModalityExpr { alternatives })
+        if self.face_rgb {
+            v.push(UnlockMethod::FaceRgb);
+        }
+        v
     }
 
-    /// True when this operation is disabled.
-    pub fn is_off(&self) -> bool {
-        self.alternatives.is_empty()
+    /// The method linhello defaults to: a secure method when one exists,
+    /// otherwise the convenience RGB face. `None` means no biometric method is
+    /// available at all (password only). When BOTH secure methods exist the
+    /// default is `FaceIr` but the user is expected to be offered the choice
+    /// (see [`needs_user_choice`]).
+    pub fn default_method(self) -> Option<UnlockMethod> {
+        if self.face_ir {
+            Some(UnlockMethod::FaceIr)
+        } else if self.fingerprint {
+            Some(UnlockMethod::Fingerprint)
+        } else if self.face_rgb {
+            Some(UnlockMethod::FaceRgb)
+        } else {
+            None
+        }
     }
 
-    /// True if any alternative uses `m`.
-    pub fn uses(&self, m: Modality) -> bool {
-        self.alternatives.iter().any(|g| g.contains(&m))
-    }
-
-    /// Given which biometric modalities can actually run right now
-    /// (`face_ok`, `fingerprint_ok`), return the first AND-group that is
-    /// *satisfiable* by the available biometrics (password is assumed available
-    /// — PAM always offers it). `None` means nothing can satisfy this op, so PAM
-    /// should fall straight through to the password. This is what the daemon
-    /// uses to decide which sensors to engage.
-    pub fn satisfiable_group(&self, face_ok: bool, fingerprint_ok: bool) -> Option<&[Modality]> {
-        self.alternatives
-            .iter()
-            .find(|group| {
-                group.iter().all(|m| match m {
-                    Modality::Face => face_ok,
-                    Modality::Fingerprint => fingerprint_ok,
-                    Modality::Password => true,
-                })
-            })
-            .map(|g| g.as_slice())
+    /// True when two distinct *secure* methods exist (IR face AND fingerprint),
+    /// so linhello should let the user pick rather than silently defaulting.
+    pub fn needs_user_choice(self) -> bool {
+        self.face_ir && self.fingerprint
     }
 }
 
@@ -336,49 +353,59 @@ mod tests {
     }
 
     #[test]
-    fn modality_expr_parses_alternation_and_conjunction() {
-        let either = ModalityExpr::parse("face|fingerprint").unwrap();
-        assert_eq!(
-            either.alternatives,
-            vec![vec![Modality::Face], vec![Modality::Fingerprint]]
-        );
-        let both = ModalityExpr::parse("fingerprint+password").unwrap();
-        assert_eq!(
-            both.alternatives,
-            vec![vec![Modality::Fingerprint, Modality::Password]]
-        );
-        assert!(ModalityExpr::parse("off").unwrap().is_off());
-        assert!(ModalityExpr::parse("face").unwrap().uses(Modality::Face));
-        // Aliases.
-        assert_eq!(
-            ModalityExpr::parse("fp+pw").unwrap().alternatives,
-            vec![vec![Modality::Fingerprint, Modality::Password]]
-        );
-        // Unknown token → None (caller keeps the safe default).
-        assert!(ModalityExpr::parse("retina").is_none());
-        assert!(ModalityExpr::parse("face+").is_none());
+    fn method_tiers_are_correct() {
+        assert_eq!(UnlockMethod::FaceRgb.tier(), Tier::Convenience);
+        assert_eq!(UnlockMethod::FaceIr.tier(), Tier::Secure);
+        assert_eq!(UnlockMethod::Fingerprint.tier(), Tier::Secure);
+        assert_eq!(UnlockMethod::parse("fp"), Some(UnlockMethod::Fingerprint));
+        assert_eq!(UnlockMethod::parse("face_ir"), Some(UnlockMethod::FaceIr));
+        assert_eq!(UnlockMethod::parse("nope"), None);
     }
 
     #[test]
-    fn satisfiable_group_picks_available_modalities() {
-        let e = ModalityExpr::parse("face|fingerprint").unwrap();
-        // No IR/face working, but a reader is enrolled → fingerprint alternative.
-        assert_eq!(
-            e.satisfiable_group(false, true),
-            Some(&[Modality::Fingerprint][..])
-        );
-        // Face works → first alternative (face) wins.
-        assert_eq!(e.satisfiable_group(true, false), Some(&[Modality::Face][..]));
-        // Neither biometric available → nothing to engage (fall through to pw).
-        assert_eq!(e.satisfiable_group(false, false), None);
+    fn rgb_only_defaults_to_convenience() {
+        let av = AvailableMethods { face_rgb: true, face_ir: false, fingerprint: false };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceRgb));
+        assert!(!av.needs_user_choice());
+        assert_eq!(av.selectable(), vec![UnlockMethod::FaceRgb]);
+    }
 
-        // Conjunction needs the biometric half present; password is implicit.
-        let both = ModalityExpr::parse("fingerprint+password").unwrap();
+    #[test]
+    fn rgb_plus_fingerprint_defaults_to_secure_fingerprint() {
+        // The user's example: RGB-only camera + fingerprint → default to the
+        // secure fingerprint method, but still offer RGB-only as an opt-down.
+        let av = AvailableMethods { face_rgb: true, face_ir: false, fingerprint: true };
+        assert_eq!(av.default_method(), Some(UnlockMethod::Fingerprint));
+        assert!(!av.needs_user_choice()); // only one secure method
         assert_eq!(
-            both.satisfiable_group(false, true),
-            Some(&[Modality::Fingerprint, Modality::Password][..])
+            av.selectable(),
+            vec![UnlockMethod::Fingerprint, UnlockMethod::FaceRgb]
         );
-        assert_eq!(both.satisfiable_group(false, false), None);
+    }
+
+    #[test]
+    fn ir_only_is_secure_face() {
+        let av = AvailableMethods { face_rgb: true, face_ir: true, fingerprint: false };
+        assert_eq!(av.default_method(), Some(UnlockMethod::FaceIr));
+        assert!(!av.needs_user_choice());
+    }
+
+    #[test]
+    fn ir_and_fingerprint_lets_user_choose() {
+        // Both secure → linhello should prompt rather than silently picking.
+        let av = AvailableMethods { face_rgb: true, face_ir: true, fingerprint: true };
+        assert!(av.needs_user_choice());
+        assert_eq!(
+            av.selectable(),
+            vec![UnlockMethod::FaceIr, UnlockMethod::Fingerprint, UnlockMethod::FaceRgb]
+        );
+    }
+
+    #[test]
+    fn no_biometrics_means_password_only() {
+        let av = AvailableMethods::default();
+        assert_eq!(av.default_method(), None);
+        assert!(av.selectable().is_empty());
     }
 
     #[test]
