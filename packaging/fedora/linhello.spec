@@ -33,8 +33,11 @@ Requires:       pam
 Requires:       libv4l
 # ONNX Runtime is not in Fedora main (RPMFusion/COPR or self-built). The daemon
 # dlopens it and reports an actionable error if absent, so keep it weak rather
-# than block install on a package the user may have provided out of band.
-Recommends:     onnxruntime
+# than block install on a package the user may have provided out of band. The
+# >= 1.24 floor matches the ABI linhello is built against (the ort 2.0.0-rc.12
+# crate, which supports ONNX Runtime 1.17-1.24; the COPR ships 1.24.x) so a fresh
+# install pulls a compatible runtime — raise it alongside any ort crate bump.
+Recommends:     onnxruntime >= 1.24
 
 # SELinux policy scriptlet requirements (semodule, restorecon, policy store).
 %{?selinux_requires}
