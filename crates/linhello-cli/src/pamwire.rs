@@ -140,7 +140,7 @@ pub fn status() -> Vec<ServiceStatus> {
 
 /// Files whose `pam_linhello` presence indicates active wiring, per distro.
 fn inspect_files() -> Vec<PathBuf> {
-    match platform::distro_family() {
+    let mut v: Vec<PathBuf> = match platform::distro_family() {
         DistroFamily::Debian => vec![PathBuf::from("/etc/pam.d/common-auth")]
             .into_iter()
             .filter(|p| p.exists())
@@ -153,40 +153,34 @@ fn inspect_files() -> Vec<PathBuf> {
         .filter(|p| p.exists())
         .collect(),
         DistroFamily::Arch | DistroFamily::Other => {
-            // Status shows the wiring PLAN: one lockscreen row (the service we
-            // would/do manage), not every unwirable leftover.
             let mut v: Vec<PathBuf> =
                 GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-            if let Some(plan) = lockscreen_plan() {
-                v.push(plan.etc);
-            }
             let sudo = PathBuf::from(SUDO);
             if sudo.exists() {
                 v.push(sudo);
             }
             v
         }
+    };
+    // The KDE lockscreen row is shown on every family (it's desktop-, not
+    // distro-specific): the wiring PLAN — the one service we would/do manage.
+    if let Some(plan) = lockscreen_plan() {
+        v.push(plan.etc);
     }
+    v
 }
 
 /// Enable face login. Edits the greeter (and `sudo` when `include_sudo`) on
 /// Arch-style distros; returns manual guidance on Debian/Fedora. `dry_run`
 /// computes the changes without writing.
 pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
-    match platform::distro_family() {
-        DistroFamily::Debian => debian_enable(dry_run),
-        DistroFamily::Fedora => fedora_enable(dry_run),
+    let mut changes = match platform::distro_family() {
+        DistroFamily::Debian => debian_enable(dry_run)?,
+        DistroFamily::Fedora => fedora_enable(dry_run)?,
         DistroFamily::Arch | DistroFamily::Other => {
             let mut changes = Vec::new();
             for g in GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()) {
                 changes.push(edit_in(&g, GREETER_STANZA, dry_run)?);
-            }
-            if let Some(plan) = lockscreen_plan() {
-                changes.push(if plan.etc.exists() {
-                    edit_in(&plan.etc, plan.stanza, dry_run)?
-                } else {
-                    create_override_from(&plan.etc, plan.vendor, plan.stanza, dry_run)?
-                });
             }
             if include_sudo {
                 let sudo = PathBuf::from(SUDO);
@@ -194,37 +188,58 @@ pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
                     changes.push(edit_in(&sudo, SUFFICIENT_STANZA, dry_run)?);
                 }
             }
-            Ok(changes)
+            changes
         }
+    };
+    // The KDE lockscreen (kscreenlocker) is desktop-specific, not distro-specific.
+    // On Debian/Fedora the shared system-auth/password-auth stacks (wired above)
+    // drive the greeter and sudo but NOT kscreenlocker, which runs its own
+    // `kde` / `kde-fingerprint` PAM services in parallel at lock time — so
+    // lock-screen face unlock needs this wiring on EVERY family, not just Arch.
+    // (Previously this lived only in the Arch arm, so KDE-on-Fedora/Debian users
+    // got working sudo/login face auth but a dead lock screen.)
+    if let Some(plan) = lockscreen_plan() {
+        changes.push(if plan.etc.exists() {
+            edit_in(&plan.etc, plan.stanza, dry_run)?
+        } else {
+            create_override_from(&plan.etc, plan.vendor, plan.stanza, dry_run)?
+        });
     }
+    Ok(changes)
 }
 
 /// Remove face-auth from the greeter and `sudo` stacks (Arch-style); manual
 /// guidance on Debian/Fedora.
 pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
-    match platform::distro_family() {
-        DistroFamily::Debian => debian_disable(dry_run),
-        DistroFamily::Fedora => fedora_disable(dry_run),
+    let mut changes = match platform::distro_family() {
+        DistroFamily::Debian => debian_disable(dry_run)?,
+        DistroFamily::Fedora => fedora_disable(dry_run)?,
         // include_sudo: true — disable must clean sudo even though enable makes
         // it opt-in, otherwise `auth sufficient pam_linhello.so` is left behind
         // (a dangling reference once the module is removed).
         DistroFamily::Arch | DistroFamily::Other => existing_targets(true)
             .into_iter()
             .map(|p| remove_in(&p, dry_run))
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
+    };
+    // Symmetric with enable(): unwire the KDE lockscreen on every family. Both
+    // services are tried (an older LinuxHello wired `kde`; current prefers
+    // `kde-fingerprint`) so disable cleans whichever carries our line.
+    for p in [KDE_FP_LOCKSCREEN, KDE_LOCKSCREEN] {
+        if Path::new(p).exists() {
+            changes.push(remove_in(Path::new(p), dry_run)?);
+        }
     }
+    Ok(changes)
 }
 
 /// Targets for disable/uninstall: every file we might have wired, including
 /// BOTH lockscreen services (an older LinuxHello wired `kde`; current prefers
 /// `kde-fingerprint` — unwiring must clean whichever exists).
 fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
+    // Greeter + sudo only. The KDE lockscreen services are unwired separately in
+    // `disable()` (on every family), so they are intentionally not listed here.
     let mut v: Vec<PathBuf> = GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-    for p in [KDE_FP_LOCKSCREEN, KDE_LOCKSCREEN] {
-        if Path::new(p).exists() {
-            v.push(PathBuf::from(p));
-        }
-    }
     if include_sudo {
         let sudo = PathBuf::from(SUDO);
         if sudo.exists() {
