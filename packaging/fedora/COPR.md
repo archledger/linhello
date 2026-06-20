@@ -61,6 +61,33 @@ LinuxHello release bumps the `ort` crate). `linhello` is rebuilt every release.
 > the bundled prebuilt (no network). `linhello.spec` compiles the Rust workspace,
 > which fetches crates — hence `--enable-net on` above.
 
+## Automated builds from releases (Packit)
+
+`linhello` is rebuilt automatically on every release by [Packit](https://packit.dev),
+configured in [`.packit.yaml`](../../.packit.yaml). When a signed `v*` tag is
+pushed and `release.yml` publishes the GitHub Release, Packit submits a COPR
+build of `linhello` for that exact tag (it generates the source tarball from the
+tag, so the build always matches the released commit).
+
+**One-time setup:** install the **Packit** GitHub App on the repository
+(<https://github.com/marketplace/packit-as-a-service>) and grant it access to
+`archledger/linhello`. The COPR project (`archledger/linhello`) and its
+`fedora-44-x86_64` chroot already exist, so no further COPR-side config is
+needed; Packit submits builds into it.
+
+**`onnxruntime` is *not* automated.** Its source is Microsoft's external prebuilt
+binary (not this repo), so Packit's git-archive source generation doesn't apply.
+Rebuild it manually only when its pinned version changes — i.e. when a release
+bumps the `ort` crate ABI (e.g. 1.22.0 → 1.24.4 for `ort` rc.10 → rc.12):
+
+```sh
+packaging/fedora/build-srpms.sh v<tag>
+copr-cli build linhello target/rpmbuild/SRPMS/onnxruntime-*.src.rpm   # before linhello
+```
+
+So a normal release is fully automatic; an ABI-bump release is one extra manual
+`onnxruntime` upload, then Packit handles `linhello`.
+
 ## Verifying a build locally first
 
 `build-srpms.sh` produces the exact SRPMs COPR consumes. To dry-run a full build

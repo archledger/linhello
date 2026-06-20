@@ -1,0 +1,30 @@
+# Packit configuration — auto-build the Fedora COPR from GitHub releases.
+# https://packit.dev/docs/configuration
+#
+# On each published GitHub Release (created by .github/workflows/release.yml from
+# a signed v* tag), Packit builds linhello in the archledger/linhello COPR.
+# Packit generates the source tarball from the release tag (git archive), so it
+# always matches the exact released commit — no dependency on the spec's
+# release-archive URL resolving.
+#
+# NOTE: this automates the `linhello` package only. The `onnxruntime` package is
+# the official Microsoft prebuilt (its Source0 is an external binary, not this
+# repo), so Packit's git-archive source generation does not apply to it. Rebuild
+# onnxruntime manually when its pinned version changes (see packaging/fedora/COPR.md):
+#   packaging/fedora/build-srpms.sh v<tag>
+#   copr-cli build linhello target/rpmbuild/SRPMS/onnxruntime-*.src.rpm
+
+specfile_path: packaging/fedora/linhello.spec
+upstream_package_name: linhello
+downstream_package_name: linhello
+
+# Release tags are `v0.4.1`, `v0.4.0`, … — strip the leading `v` for {version}.
+upstream_tag_template: "v{version}"
+
+jobs:
+  - job: copr_build
+    trigger: release
+    owner: archledger
+    project: linhello
+    targets:
+      - fedora-44-x86_64
