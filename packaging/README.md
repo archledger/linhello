@@ -46,7 +46,7 @@ ONNX Runtime is the one dependency not packaged everywhere (not in Debian/Fedora
 main; Arch has it). Options, in order of smoothness:
 
 - **Fedora COPR** — ships a version-matched `onnxruntime` RPM
-  ([`fedora/onnxruntime.spec`](fedora/onnxruntime.spec)) alongside `linhello`, so
+  ([`fedora/onnxruntime/onnxruntime.spec`](fedora/onnxruntime/onnxruntime.spec)) alongside `linhello`, so
   `dnf install linhello` pulls it natively. See [`fedora/COPR.md`](fedora/COPR.md).
 - **`linhello fetch-onnx`** — one command that downloads + installs the official
   Microsoft prebuilt matching our ABI (the fallback for direct-RPM/source installs).

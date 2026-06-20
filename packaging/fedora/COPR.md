@@ -15,8 +15,15 @@ repositories:
 
 | Package      | Spec                  | What it is |
 |--------------|-----------------------|------------|
-| `onnxruntime`| `onnxruntime.spec`    | Official Microsoft prebuilt `libonnxruntime.so`, version-matched to the `ort` crate LinuxHello is built against (1.22.x ↔ ort 2.0.0-rc.10). |
+| `onnxruntime`| `onnxruntime/onnxruntime.spec`    | Official Microsoft prebuilt `libonnxruntime.so`, version-matched to the `ort` crate LinuxHello is built against (1.22.x ↔ ort 2.0.0-rc.10). |
 | `linhello`   | `linhello.spec`       | The daemon/CLI/PAM module. `Recommends: onnxruntime`, so `dnf` pulls it from the same COPR by default. |
+
+> **Layout note:** `onnxruntime.spec` lives in its **own subdirectory**
+> (`packaging/fedora/onnxruntime/`), leaving exactly one `.spec` directly under
+> `packaging/fedora/`. This is deliberate: Packit's `copr_build` hands COPR the
+> spec's directory, and COPR's auto-SRPM step aborts with *"too many specfiles"*
+> if it finds more than one `.spec` there. Don't move `onnxruntime.spec` back up
+> beside `linhello.spec` — it breaks the Packit-driven COPR build.
 
 ## One-time: create the project
 
@@ -38,7 +45,7 @@ the chroot. (The stricter, network-free alternative is to `cargo vendor` the
 dependencies into the SRPM — not done yet.) `onnxruntime` itself builds offline
 — its tarball is bundled in the SRPM.
 
-(Add `fedora-NN-aarch64` chroots later — `onnxruntime.spec` already supports
+(Add `fedora-NN-aarch64` chroots later — `onnxruntime/onnxruntime.spec` already supports
 aarch64; `build-srpms.sh` must then be run on/for that arch.)
 
 ## Each release: build + upload
@@ -57,7 +64,7 @@ copr-cli build linhello target/rpmbuild/SRPMS/linhello-*.src.rpm
 `onnxruntime` only needs rebuilding when its pinned version changes (i.e. when a
 LinuxHello release bumps the `ort` crate). `linhello` is rebuilt every release.
 
-> COPR builds each SRPM in a clean mock chroot. `onnxruntime.spec` just unpacks
+> COPR builds each SRPM in a clean mock chroot. `onnxruntime/onnxruntime.spec` just unpacks
 > the bundled prebuilt (no network). `linhello.spec` compiles the Rust workspace,
 > which fetches crates — hence `--enable-net on` above.
 

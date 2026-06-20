@@ -134,7 +134,7 @@ gdm/sddm/lightdm/system-login — extend with Debian/Fedora variants).
 | Distro | Format | Channel | Status |
 |---|---|---|---|
 | Arch | `packaging/arch/PKGBUILD` | native `.pkg.tar.zst` (`make dist` → `makepkg` → `pacman`); `sudo linhello update` rebuilds from the signed tag | **done** (AUR was dropped in favour of the native package + `linhello update`) |
-| Fedora/RHEL | `packaging/fedora/linhello.spec` (+ `onnxruntime.spec`) | **COPR** (`%post`/`%postun`; authselect) | **done, COPR live** |
+| Fedora/RHEL | `packaging/fedora/linhello.spec` (+ `onnxruntime/onnxruntime.spec`) | **COPR** (`%post`/`%postun`; authselect) | **done, COPR live** |
 | Debian/Ubuntu | `packaging/debian/` (`.deb`, dpkg-buildpackage, `pam-auth-update` in `postinst`) | PPA or release `.deb` | authored, **not yet build-tested** |
 
 Dependency name map (for the spec/control files):
