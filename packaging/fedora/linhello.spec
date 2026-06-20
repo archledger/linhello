@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -148,20 +148,34 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
-* Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.2-1
+* Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.1-1
+- Rebuild against the ort 2.0.0-rc.12 crate and ONNX Runtime 1.24.4 (the COPR's
+  onnxruntime package moves 1.22.0 -> 1.24.4 to match). rc.12 gates its bound API
+  surface behind `api-NN` features, so the `ort` dependency now selects `api-24`
+  explicitly under default-features = off. No user-facing behavior change.
+
+* Fri Jun 19 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.0-1
+- Self-healing TPM binding on GRUB systems (PolicyAuthorize policy re-signed on
+  the first unlock after a PCR-7 move, e.g. an fwupd dbx update), automatic
+  boot-mode detection (UKI PCR-11 vs GRUB PCR-7), a dedicated recovery
+  passphrase (`linhello set-recovery` / `recover`), and fingerprint as a
+  standalone secure-tier unlock method via fprintd (named fingerprints,
+  duplicate detection, per-distro pam_fprintd wiring, TUI/setup integration).
+
+* Thu Jun 18 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.3.2-1
 - Arch packaging/update fix: `linhello package`/`update` no longer mis-select the
   makepkg `-debug` split (which carries no binaries) as the installable. PKGBUILD
   now builds a single stripped package (options=!debug) and the package picker
   skips -debug/-dbgsym artifacts. No functional change on Fedora.
 
-* Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.1-1
+* Thu Jun 18 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.3.1-1
 - Fedora install polish: %post now enables + starts the daemon (so `linhello
   doctor` works immediately); new `linhello fetch-onnx` installs the matching
   ONNX Runtime where it isn't packaged; `linhello deps` routes ONNX to fetch-onnx
   instead of a non-existent Fedora package; fetch-models reliably restarts the
   daemon. Groundwork for the Fedora COPR (native dnf install/update with deps).
 
-* Wed Jun 17 2026 archledger <archledger236@gmail.com> - 0.3.0-1
+* Wed Jun 17 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.3.0-1
 - Hardware-adaptive tiered biometric policy: Secure tier (RGB + working IR)
   unseals the TPM password for login/sudo/polkit; Convenience tier (RGB-only)
   verifies for live-session screen unlock but never unseals credentials.
@@ -174,11 +188,11 @@ fi
 - SELinux: linhellod_t reads logind warm-session state and Secure Boot state
   (efivarfs); device-probe retry to ride out Windows-Hello USB resets.
 
-* Tue Jun 16 2026 archledger <archledger236@gmail.com> - 0.2.0-1
+* Tue Jun 16 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.2.0-1
 - Fedora port milestone: confined daemon SELinux domain (linhellod_t,
   runtime-validated), per-distro reseal trigger, sysusers group, dependency
   surfacing, `linhello fetch-models`, PAM rpath fix, TUI wiring-status fix.
 
-* Tue Jun 16 2026 archledger <archledger236@gmail.com> - 0.1.0-1
+* Tue Jun 16 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.1.0-1
 - Initial Fedora package: confined daemon (linhellod_t), sysusers group,
   systemd unit, PAM module. Face login wired via `linhello pam enable`.

@@ -29,16 +29,13 @@ pub fn ensure_initialized() -> Result<()> {
                 }
             }
         }
-        ort::init()
-            .with_name("linhello")
-            .commit()
-            .map(|_| ())
-            .map_err(|e| {
-                format!(
-                    "ort init: {e} (is the onnxruntime package installed? \
-                     set ORT_DYLIB_PATH to override)"
-                )
-            })
+        // ort rc.12: commit() returns bool (false = an environment was already
+        // committed) and defers dylib loading to the first Session, so it can't
+        // report a missing/broken libonnxruntime here. The dylib-presence probe
+        // above keeps the common failure actionable; any genuine load error still
+        // surfaces when a Session is built (callers map it there).
+        ort::init().with_name("linhello").commit();
+        Ok(())
     });
     outcome.clone().map_err(bio_err)
 }

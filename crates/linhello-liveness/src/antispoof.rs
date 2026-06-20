@@ -31,20 +31,18 @@ static ORT_INIT: Once = Once::new();
 /// pull that crate as a dep (it would create a circular graph with biometrics
 /// consuming liveness). Both resolve the dylib via `linhello_common::platform`.
 fn ensure_ort() -> Result<()> {
-    let mut err: Option<String> = None;
     ORT_INIT.call_once(|| {
         if std::env::var_os("ORT_DYLIB_PATH").is_none() {
             if let Some(path) = linhello_common::platform::onnxruntime_dylib() {
                 std::env::set_var("ORT_DYLIB_PATH", path);
             }
         }
-        if let Err(e) = ort::init().with_name("linhello-liveness").commit() {
-            err = Some(format!("ort init: {e}"));
-        }
+        // ort rc.12: commit() returns bool (false = an environment was already
+        // committed elsewhere) and no longer loads the dylib here — ONNX Runtime
+        // is loaded lazily on the first Session, where a missing/broken
+        // libonnxruntime is reported (the path probe above keeps that actionable).
+        let _ = ort::init().with_name("linhello-liveness").commit();
     });
-    if let Some(e) = err {
-        return Err(LinuxHelloError::Biometrics(e));
-    }
     Ok(())
 }
 

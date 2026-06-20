@@ -11,5 +11,7 @@ tracing.workspace = true
 serde = { workspace = true }
 
 image = { version = "0.25", default-features = false }
-ndarray = "0.16"
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.17"
+# `api-24` pins the bound OrtApi level to ONNX Runtime 1.24 (see linhello-biometrics
+# for why this is required under default-features = false with ort rc.12).
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }

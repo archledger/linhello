@@ -1,7 +1,7 @@
 Source: linhello
 Section: admin
 Priority: optional
-Maintainer: Ben <archledger236@gmail.com>
+Maintainer: wisbendji fimerlus <archledger236@gmail.com>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,

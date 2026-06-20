@@ -1,3 +1,12 @@
+linhello (0.4.1-1) unstable; urgency=medium
+
+  * Rebuild against the ort 2.0.0-rc.12 crate and ONNX Runtime 1.24.4. rc.12
+    gates its bound API surface behind `api-NN` features, so the `ort`
+    dependency now selects `api-24` explicitly under default-features off. No
+    user-facing behavior change.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Sat, 20 Jun 2026 12:00:00 -0400
+
 linhello (0.4.0-1) unstable; urgency=medium
 
   * Self-healing TPM binding on GRUB systems. A firmware/dbx update (e.g. via
@@ -20,7 +29,7 @@ linhello (0.4.0-1) unstable; urgency=medium
     New `linhello fingerprint {status,enable,disable,add}`, named fingerprints,
     duplicate detection, and a fingerprint step in `setup` and the TUI.
 
- -- Ben <archledger236@gmail.com>  Fri, 19 Jun 2026 11:30:00 -0400
+ -- wisbendji fimerlus <archledger236@gmail.com>  Fri, 19 Jun 2026 11:30:00 -0400
 
 linhello (0.3.2-1) unstable; urgency=medium
 
@@ -28,14 +37,14 @@ linhello (0.3.2-1) unstable; urgency=medium
   * First build-test of the Debian packaging on a real Ubuntu box
     (Ubuntu 26.04, amd64).
 
- -- Ben <archledger236@gmail.com>  Thu, 18 Jun 2026 21:59:02 -0400
+ -- wisbendji fimerlus <archledger236@gmail.com>  Thu, 18 Jun 2026 21:59:02 -0400
 
 linhello (0.2.0-1) unstable; urgency=medium
 
   * Version bump for the Fedora-port milestone (shared codebase). Debian
     packaging remains authored-but-not-yet-build-tested.
 
- -- Ben <archledger236@gmail.com>  Tue, 16 Jun 2026 12:00:00 +0000
+ -- wisbendji fimerlus <archledger236@gmail.com>  Tue, 16 Jun 2026 12:00:00 +0000
 
 linhello (0.1.0-1) unstable; urgency=medium
 
@@ -43,4 +52,4 @@ linhello (0.1.0-1) unstable; urgency=medium
     Reseal trigger (kernel postinst.d) installed via `linhello reseal-hook
     install` in postinst. Face login wired via `linhello pam enable`.
 
- -- Ben <archledger236@gmail.com>  Tue, 16 Jun 2026 00:00:00 +0000
+ -- wisbendji fimerlus <archledger236@gmail.com>  Tue, 16 Jun 2026 00:00:00 +0000

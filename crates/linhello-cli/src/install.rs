@@ -745,11 +745,12 @@ pub fn fetch_models(force: bool) -> Result<Vec<String>, String> {
 }
 
 /// Official Microsoft ONNX Runtime prebuilt matching the `ort` crate ABI
-/// (onnxruntime 1.22.x ↔ ort 2.0.0-rc.10). HTTPS from the upstream release is the
-/// trust anchor; the per-arch SHA-256s pin the exact tarballs.
-const ORT_VERSION: &str = "1.22.0";
-const ORT_X64_SHA256: &str = "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3";
-const ORT_AARCH64_SHA256: &str = "bb76395092d150b52c7092dc6b8f2fe4d80f0f3bf0416d2f269193e347e24702";
+/// (ort 2.0.0-rc.12 supports onnxruntime 1.17-1.24, so 1.24.x is the newest
+/// matching runtime). HTTPS from the upstream release is the trust anchor; the
+/// per-arch SHA-256s pin the exact tarballs.
+const ORT_VERSION: &str = "1.24.4";
+const ORT_X64_SHA256: &str = "3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747";
+const ORT_AARCH64_SHA256: &str = "866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e";
 
 /// `linhello fetch-onnx` — download the official Microsoft ONNX Runtime prebuilt
 /// for this architecture and install `libonnxruntime.so*` into `/usr/local/lib`
