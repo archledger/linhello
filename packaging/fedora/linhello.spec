@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -148,6 +148,20 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Sat Jun 20 2026 archledger <archledger236@gmail.com> - 0.4.1-1
+- Rebuild against the ort 2.0.0-rc.12 crate and ONNX Runtime 1.24.4 (the COPR's
+  onnxruntime package moves 1.22.0 -> 1.24.4 to match). rc.12 gates its bound API
+  surface behind `api-NN` features, so the `ort` dependency now selects `api-24`
+  explicitly under default-features = off. No user-facing behavior change.
+
+* Fri Jun 19 2026 archledger <archledger236@gmail.com> - 0.4.0-1
+- Self-healing TPM binding on GRUB systems (PolicyAuthorize policy re-signed on
+  the first unlock after a PCR-7 move, e.g. an fwupd dbx update), automatic
+  boot-mode detection (UKI PCR-11 vs GRUB PCR-7), a dedicated recovery
+  passphrase (`linhello set-recovery` / `recover`), and fingerprint as a
+  standalone secure-tier unlock method via fprintd (named fingerprints,
+  duplicate detection, per-distro pam_fprintd wiring, TUI/setup integration).
+
 * Thu Jun 18 2026 archledger <archledger236@gmail.com> - 0.3.2-1
 - Arch packaging/update fix: `linhello package`/`update` no longer mis-select the
   makepkg `-debug` split (which carries no binaries) as the installable. PKGBUILD

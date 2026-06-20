@@ -16,8 +16,12 @@ serde = { workspace = true }
 v4l = "0.14"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-ndarray = "0.16"
+ndarray = "0.17"
 
 # ONNX Runtime bindings — load the system libonnxruntime at runtime
 # (install: `sudo pacman -S onnxruntime-cpu`). Set ORT_DYLIB_PATH to override.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+# `api-24` pins the bound OrtApi level to ONNX Runtime 1.24 (the runtime the COPR
+# ships): rc.12 gates the API surface behind `api-NN` features and compiles its
+# execution-provider modules (e.g. VitisAI) unconditionally, so with
+# default-features off an api level must be selected explicitly or `ort` won't build.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
