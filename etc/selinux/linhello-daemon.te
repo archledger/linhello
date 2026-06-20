@@ -118,6 +118,18 @@ allow linhellod_t init_var_run_t:dir search_dir_perms;
 allow linhellod_t systemd_logind_var_run_t:dir search_dir_perms;
 allow linhellod_t systemd_logind_var_run_t:file read_file_perms;
 
+# Fingerprint capability probe: the daemon shells out to `busctl` to ask fprintd
+# (net.reactivated.Fprint, system bus) whether a reader is present and its name
+# (capabilities::probe -> linhello_fingerprint). Run busctl in the daemon's own
+# domain (execute_no_trans on bin_t) and let it use the system D-Bus to chat with
+# fprintd. Without this, linhellod_t is denied { execute } on /usr/bin/busctl
+# (bin_t) under enforcing and the probe retries, flooding setroubleshoot.
+corecmd_exec_bin(linhellod_t)
+dbus_system_bus_client(linhellod_t)
+optional_policy(`
+    fprintd_dbus_chat(linhellod_t)
+')
+
 ########################################
 #
 # Display-manager (greeter / lock screen) access to the socket
