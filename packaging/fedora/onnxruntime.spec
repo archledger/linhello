@@ -60,11 +60,11 @@ ln -s libonnxruntime.so.%{ortver} %{buildroot}%{_libdir}/libonnxruntime.so
 %{_libdir}/libonnxruntime.so
 
 %changelog
-* Sat Jun 20 2026 archledger <archledger236@gmail.com> - 1.24.4-1
+* Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 1.24.4-1
 - Update to the official Microsoft ONNX Runtime 1.24.4 prebuilt (CPU) to match
   the ort 2.0.0-rc.12 ABI (rc.12 supports ONNX Runtime 1.17-1.24; 1.24.4 is the
   newest in that range).
 
-* Thu Jun 18 2026 archledger <archledger236@gmail.com> - 1.22.0-1
+* Thu Jun 18 2026 wisbendji fimerlus <archledger236@gmail.com> - 1.22.0-1
 - Repackage the official Microsoft ONNX Runtime 1.22.0 prebuilt (CPU) for the
   LinuxHello COPR — matches the ort 2.0.0-rc.10 ABI.
