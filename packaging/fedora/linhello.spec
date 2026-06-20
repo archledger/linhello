@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.2
+Version:        0.4.3
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -151,6 +151,15 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.3-1
+- SELinux: allow the confined daemon (linhellod_t) to run `busctl` and chat with
+  fprintd over the system D-Bus. The fingerprint capability probe shells out to
+  `busctl` (net.reactivated.Fprint); under enforcing this was denied { execute }
+  on /usr/bin/busctl, and the repeated probe flooded setroubleshoot. Adds
+  corecmd_exec_bin + dbus_system_bus_client + fprintd_dbus_chat to the daemon
+  policy module. Validated on Fedora 44 (enforcing): the probe path runs with
+  zero AVCs.
+
 * Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.2-1
 - Floor the onnxruntime weak dependency at `>= 1.24` so a dnf upgrade can't pair
   linhello (built against ort 2.0.0-rc.12 / ONNX Runtime 1.24.x) with a pre-1.24

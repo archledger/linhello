@@ -1,3 +1,12 @@
+linhello (0.4.3-1) unstable; urgency=medium
+
+  * SELinux (Fedora/RPM only): allow the confined daemon to run `busctl` and chat
+    with fprintd over the system D-Bus, so the fingerprint capability probe no
+    longer floods setroubleshoot with execute denials under enforcing. No code
+    change; Debian ships no SELinux policy, version synced with the workspace.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Sat, 20 Jun 2026 14:30:00 -0400
+
 linhello (0.4.2-1) unstable; urgency=medium
 
   * Packaging: floor the Fedora onnxruntime weak dependency at >= 1.24 to enforce
