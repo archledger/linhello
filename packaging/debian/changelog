@@ -1,3 +1,12 @@
+linhello (0.4.2-1) unstable; urgency=medium
+
+  * Packaging: floor the Fedora onnxruntime weak dependency at >= 1.24 to enforce
+    the ort 2.0.0-rc.12 / ONNX Runtime 1.24.x ABI pairing. Debian vendors ONNX
+    Runtime out-of-band (linhello fetch-onnx), so there is no apt dependency to
+    floor here; the version is synced with the workspace. No code change.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Sat, 20 Jun 2026 13:30:00 -0400
+
 linhello (0.4.1-1) unstable; urgency=medium
 
   * Rebuild against the ort 2.0.0-rc.12 crate and ONNX Runtime 1.24.4. rc.12

@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.1
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -151,6 +151,11 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.2-1
+- Floor the onnxruntime weak dependency at `>= 1.24` so a dnf upgrade can't pair
+  linhello (built against ort 2.0.0-rc.12 / ONNX Runtime 1.24.x) with a pre-1.24
+  onnxruntime, which would break the runtime ABI. Packaging only; no code change.
+
 * Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.1-1
 - Rebuild against the ort 2.0.0-rc.12 crate and ONNX Runtime 1.24.4 (the COPR's
   onnxruntime package moves 1.22.0 -> 1.24.4 to match). rc.12 gates its bound API
