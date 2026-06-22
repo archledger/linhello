@@ -566,6 +566,18 @@ impl App {
                 for c in &changes {
                     self.log_activity(format!("   {}", c.describe()));
                 }
+                // Wiring alone doesn't cover the KDE/Plasma lock screen, which
+                // runs PAM as the user: pam_linhello can only reach the
+                // 0660 root:linhello socket if the user is in the `linhello`
+                // group. Headless `setup`/`pam enable` do this; the wizard must
+                // too, or face unlock works for sudo/login but never the lock
+                // screen. (We run as root here, so the usermod succeeds.)
+                if enable {
+                    for line in crate::ensure_socket_group_membership() {
+                        self.pam_note.push(line.clone());
+                        self.log_activity(format!("   {line}"));
+                    }
+                }
             }
             Err(e) => {
                 self.pam_note = vec![format!("error: {e}")];
@@ -2604,6 +2616,7 @@ impl App {
             Line::from(""),
             Line::from("What it wires:".bold()),
             Line::from("  • login screen — face unlock + keyring  (needed for LinuxHello)"),
+            Line::from("  • lock screen — face unlock  (adds you to the 'linhello' group)"),
             Line::from("  • sudo — face for sudo prompts  (optional)"),
             Line::from(""),
         ];
