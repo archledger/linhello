@@ -1797,6 +1797,17 @@ fn pam_enable_cmd(sudo: bool, dry_run: bool) -> Result<()> {
         println!("  {}", c.describe());
     }
     if !dry_run {
+        // Wiring alone isn't enough for the KDE/Plasma lock screen: kscreenlocker
+        // runs PAM as the *user*, not root, so `pam_linhello` can only reach the
+        // 0660 root:linhello socket if the user is in the `linhello` group. sudo
+        // and the display-manager greeter run PAM as root and don't need this, so
+        // the missing membership silently breaks only the lock screen. `pam enable`
+        // already runs as root, so fix it here too (not just in `setup`).
+        println!();
+        println!("Socket group (lock-screen access):");
+        group_membership_setup_step();
+    }
+    if !dry_run {
         println!();
         println!("Escape hatch preserved: face-auth is a fallback — if the camera or TPM");
         println!("is unavailable you can still type your password, and the TTY login");
