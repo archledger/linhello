@@ -667,7 +667,7 @@ fn enroll_named_finger(user: &str, name: Option<String>) -> Result<bool> {
 
 /// Prompt for a recovery passphrase (with confirmation) and ask the daemon to
 /// wrap `user`'s template key under it. Shared by `set-recovery` and `setup`.
-fn set_recovery_interactive(user: &str) -> Result<()> {
+pub(crate) fn set_recovery_interactive(user: &str) -> Result<()> {
     use zeroize::Zeroize;
     let mut pw = rpassword::prompt_password("Recovery passphrase: ")
         .context("reading passphrase from TTY")?
@@ -2220,7 +2220,7 @@ fn group_membership_setup_step() {
 /// `setup` step: install the post-update reseal trigger for this distro, gated
 /// via `reseal_hook_plan()`. Silent skip when the distro has no known mechanism;
 /// never fails setup.
-fn reseal_hook_setup_step() -> Result<()> {
+pub(crate) fn reseal_hook_setup_step() -> Result<()> {
     use linhello_common::platform;
     let Some(plan) = platform::reseal_hook_plan() else {
         println!("  no known kernel-update trigger for this distro — reseal manually after updates.");
@@ -2247,7 +2247,7 @@ fn reseal_hook_setup_step() -> Result<()> {
 /// isn't already loaded. Gated via `selinux_policy_plan()` — a silent no-op on
 /// Arch / AppArmor. Never fails setup over a missing source; it points the user
 /// at the manual command instead.
-fn selinux_setup_step() -> Result<()> {
+pub(crate) fn selinux_setup_step() -> Result<()> {
     use linhello_common::platform;
     let Some(plan) = platform::selinux_policy_plan() else {
         println!("  SELinux not in use on this system — no policy needed.");

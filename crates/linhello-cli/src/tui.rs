@@ -177,6 +177,9 @@ const ACTIVITY_MAX: usize = 200;
 /// satisfy sudo/greeter at all.
 enum PasswordStep {
     Entry { input: String },
+    /// Re-enter the password to confirm it — `first` holds the original entry so
+    /// a typo can't silently seal the wrong password.
+    Confirm { first: String, input: String },
     Sealed,
     Failed(String),
 }
@@ -277,6 +280,16 @@ struct App {
     /// Set by the Fingerprint screen to ask the event loop to suspend the TUI
     /// and run the interactive enroll + PAM-wiring flow, then resume.
     pending_fp_enable: bool,
+    /// Set by the Login-wiring screen to ask the event loop to suspend and run
+    /// the platform-integration steps (SELinux policy + reseal hook) that print
+    /// and prompt, then resume. Mirrors `setup`'s step 2.
+    pending_platform_setup: bool,
+    /// Set by the Done screen to ask the event loop to suspend and run the
+    /// interactive recovery-passphrase entry, then resume.
+    pending_recovery: bool,
+    /// Whether socket-group membership has been ensured this session (done once
+    /// on entering the Login-wiring screen, regardless of the PAM action).
+    group_ensured: bool,
     status: String,
     should_quit: bool,
 }
@@ -342,6 +355,9 @@ impl App {
             fp_named: Vec::new(),
             fp_method: "auto".into(),
             pending_fp_enable: false,
+            pending_platform_setup: false,
+            pending_recovery: false,
+            group_ensured: false,
             status: String::new(),
             should_quit: false,
         }
@@ -496,7 +512,22 @@ impl App {
                     };
                 }
             }
-            Screen::Pam => self.pam = crate::pamwire::status(),
+            Screen::Pam => {
+                self.pam = crate::pamwire::status();
+                // Ensure socket-group membership unconditionally on reaching the
+                // Login-wiring screen — not only when the user hits enable. A
+                // returning user whose PAM is already wired but who isn't in the
+                // `linhello` group still needs this, or the lock screen (which
+                // runs PAM as the user) can't reach the 0660 root:linhello
+                // socket. Headless `setup` does it unconditionally too. Once per
+                // session; idempotent.
+                if !self.group_ensured {
+                    self.group_ensured = true;
+                    for line in crate::ensure_socket_group_membership() {
+                        self.log_activity(line);
+                    }
+                }
+            }
             Screen::Fingerprint => self.refresh_fingerprint(),
             _ => {}
         }
@@ -566,18 +597,11 @@ impl App {
                 for c in &changes {
                     self.log_activity(format!("   {}", c.describe()));
                 }
-                // Wiring alone doesn't cover the KDE/Plasma lock screen, which
-                // runs PAM as the user: pam_linhello can only reach the
-                // 0660 root:linhello socket if the user is in the `linhello`
-                // group. Headless `setup`/`pam enable` do this; the wizard must
-                // too, or face unlock works for sudo/login but never the lock
-                // screen. (We run as root here, so the usermod succeeds.)
-                if enable {
-                    for line in crate::ensure_socket_group_membership() {
-                        self.pam_note.push(line.clone());
-                        self.log_activity(format!("   {line}"));
-                    }
-                }
+                // Socket-group membership (so the user-run lock screen can reach
+                // the 0660 root:linhello socket) is handled unconditionally when
+                // the Login-wiring screen is entered — see `on_enter` — so it
+                // applies even when PAM is already wired and the user never hits
+                // enable. No need to repeat it here.
             }
             Err(e) => {
                 self.pam_note = vec![format!("error: {e}")];
@@ -702,7 +726,12 @@ impl App {
             self.install_key(code);
             return;
         }
-        if self.screen == Screen::Password && matches!(self.password, PasswordStep::Entry { .. }) {
+        if self.screen == Screen::Password
+            && matches!(
+                self.password,
+                PasswordStep::Entry { .. } | PasswordStep::Confirm { .. }
+            )
+        {
             self.password_key(code);
             return;
         }
@@ -730,6 +759,10 @@ impl App {
             Screen::Password => self.password_key(code),
             Screen::Pam => self.pam_key(code),
             Screen::Fingerprint => self.fingerprint_key(code),
+            // Recovery passphrase — the manual backstop, separate from the login
+            // password, for when the automatic TPM self-heal can't run. Entry is
+            // interactive (typed twice), so the event loop suspends for it.
+            Screen::Done if matches!(code, KeyCode::Char('r')) => self.pending_recovery = true,
             Screen::Doctor if matches!(code, KeyCode::Up) => {
                 self.doctor_scroll = self.doctor_scroll.saturating_sub(1);
             }
@@ -1002,8 +1035,46 @@ impl App {
                         self.password = PasswordStep::Entry { input };
                         return;
                     }
+                    // Confirm before sealing: a sealed typo would silently hand
+                    // the wrong password to the login screen and never unlock.
+                    self.status = "re-enter the same password to confirm".to_string();
+                    self.password = PasswordStep::Confirm {
+                        first: input,
+                        input: String::new(),
+                    };
+                }
+                _ => self.password = PasswordStep::Entry { input },
+            },
+            PasswordStep::Confirm { mut first, mut input } => match code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.password = PasswordStep::Confirm { first, input };
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.password = PasswordStep::Confirm { first, input };
+                }
+                KeyCode::Esc => {
+                    first.zeroize();
+                    input.zeroize();
+                    self.status = "password entry cleared".to_string();
+                    self.password = PasswordStep::Entry {
+                        input: String::new(),
+                    };
+                }
+                KeyCode::Enter => {
+                    if input != first {
+                        first.zeroize();
+                        input.zeroize();
+                        self.status = "passwords do not match — start over".to_string();
+                        self.password = PasswordStep::Entry {
+                            input: String::new(),
+                        };
+                        return;
+                    }
                     let user = self.active_profile.clone();
-                    let secret = SecretBytes::new(input.clone().into_bytes());
+                    let secret = SecretBytes::new(first.clone().into_bytes());
+                    first.zeroize();
                     input.zeroize();
                     self.password = match crate::send(Request::SealPassword {
                         user: user.clone(),
@@ -1024,7 +1095,7 @@ impl App {
                         Err(e) => PasswordStep::Failed(e.to_string()),
                     };
                 }
-                _ => self.password = PasswordStep::Entry { input },
+                _ => self.password = PasswordStep::Confirm { first, input },
             },
             // Sealed / Failed: r re-enters, arrows navigate.
             other => match code {
@@ -1160,8 +1231,22 @@ impl App {
 
     fn pam_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('e') => self.pam_apply(true, false),
-            KeyCode::Char('a') => self.pam_apply(true, true),
+            // After wiring login, run the platform integration (SELinux policy
+            // + reseal hook) that makes the greeter/lock screen actually reach
+            // the daemon and keeps TPM envelopes valid across kernel updates —
+            // the same step `setup` runs. It prints/prompts, so it's deferred to
+            // the event loop, which suspends the TUI for it.
+            KeyCode::Char('e') => {
+                self.pam_apply(true, false);
+                self.pending_platform_setup = true;
+            }
+            KeyCode::Char('a') => {
+                self.pam_apply(true, true);
+                self.pending_platform_setup = true;
+            }
+            // Run platform integration on its own — for the returning user whose
+            // PAM is already wired but who still needs the SELinux policy / hook.
+            KeyCode::Char('p') => self.pending_platform_setup = true,
             KeyCode::Char('d') => self.pam_apply(false, false),
             KeyCode::Right => self.next(),
             KeyCode::Left => self.prev(),
@@ -1622,10 +1707,15 @@ impl App {
             Screen::Enroll => vec![("Enter", "start enrolling")],
             Screen::Calibrate => vec![("c", "calibrate")],
             Screen::Identify => vec![("Enter", "identify me")],
-            Screen::Password => vec![("type", "password"), ("Enter", "seal"), ("Esc", "clear")],
-            Screen::Pam => vec![("e", "enable greeter"), ("a", "enable + sudo"), ("d", "disable")],
+            Screen::Password => vec![("type", "password"), ("Enter", "confirm → seal"), ("Esc", "clear")],
+            Screen::Pam => vec![
+                ("e", "enable greeter"),
+                ("a", "enable + sudo"),
+                ("p", "platform setup"),
+                ("d", "disable"),
+            ],
             Screen::Fingerprint => vec![("e", "enroll + enable fingerprint")],
-            Screen::Done => vec![],
+            Screen::Done => vec![("r", "recovery passphrase")],
             Screen::Uninstall => vec![],
         }
     }
@@ -1717,6 +1807,13 @@ impl App {
                             .yellow(),
                     ));
                 }
+                lines.push(Line::from(""));
+                lines.push(Line::from(
+                    "Optional: press r to set a recovery passphrase — a backstop, separate from",
+                ));
+                lines.push(Line::from(
+                    "your login password, for when the automatic TPM self-heal can't run.",
+                ));
                 lines.push(Line::from(""));
                 lines.push(Line::from("Press q to exit.".italic()));
                 self.body_paragraph(frame, area, lines)
@@ -2575,7 +2672,24 @@ impl App {
                     Span::styled("▏", Style::default().fg(Color::Gray)),
                 ]),
                 Line::from(""),
-                Line::from("Type it (hidden), Enter to seal. Esc clears. It is never written to disk in the clear.".italic()),
+                Line::from("Type it (hidden), Enter to continue. Esc clears. It is never written to disk in the clear.".italic()),
+            ],
+            PasswordStep::Confirm { input, .. } => vec![
+                Line::from("Confirm your login password".bold()),
+                Line::from(""),
+                Line::from("Type the same password again to make sure there's no typo —"),
+                Line::from("a sealed typo would silently fail to unlock anything later."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Confirm password: "),
+                    Span::styled(
+                        "•".repeat(input.chars().count()),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("▏", Style::default().fg(Color::Gray)),
+                ]),
+                Line::from(""),
+                Line::from("Enter to seal. Esc starts over.".italic()),
             ],
             PasswordStep::Sealed => vec![
                 Line::from("Password sealed.".green().bold()),
@@ -2618,6 +2732,9 @@ impl App {
             Line::from("  • login screen — face unlock + keyring  (needed for LinuxHello)"),
             Line::from("  • lock screen — face unlock  (adds you to the 'linhello' group)"),
             Line::from("  • sudo — face for sudo prompts  (optional)"),
+            Line::from(
+                "  • platform integration — SELinux policy + reseal hook  (p, or auto on enable)",
+            ),
             Line::from(""),
         ];
         if self.pam.is_empty() {
@@ -2649,7 +2766,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(format!(
-            "[{distro}]   e = enable (login screen)   a = enable + sudo   d = remove"
+            "[{distro}]   e = enable   a = enable + sudo   p = platform setup   d = remove"
         )));
         lines.push(Line::from(
             "Password login always keeps working; the TTY login is never touched.".italic(),
@@ -2811,6 +2928,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::
             run_fingerprint_enable_suspended(terminal, &app.active_profile);
             app.refresh_fingerprint();
         }
+        if app.pending_platform_setup {
+            app.pending_platform_setup = false;
+            run_platform_setup_suspended(terminal);
+            app.pam = crate::pamwire::status();
+            app.install = crate::install::InstallState::detect();
+        }
+        if app.pending_recovery {
+            app.pending_recovery = false;
+            run_recovery_suspended(terminal, &app.active_profile);
+        }
         app.tick();
     }
     Ok(())
@@ -2826,6 +2953,49 @@ fn run_fingerprint_enable_suspended(terminal: &mut ratatui::DefaultTerminal, use
     match crate::fingerprint_enable(user) {
         Ok(()) => println!("\nFingerprint set up."),
         Err(e) => println!("\nFingerprint setup did not finish: {e}"),
+    }
+    print!("\nPress Enter to return to the wizard… ");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    *terminal = ratatui::init();
+}
+
+/// Suspend the TUI to run the platform-integration steps that `setup` runs:
+/// install the SELinux policy (so the greeter/lock screen can reach the daemon)
+/// and the post-update reseal hook. Both print progress and prompt y/N, which
+/// needs a normal terminal — hence the suspend. No-ops on distros where they
+/// don't apply.
+fn run_platform_setup_suspended(terminal: &mut ratatui::DefaultTerminal) {
+    use std::io::Write;
+    ratatui::restore();
+    println!("\n— LinuxHello: platform integration (SELinux, reseal hook) —\n");
+    if let Err(e) = crate::selinux_setup_step() {
+        println!("  SELinux step did not finish: {e}");
+    }
+    if let Err(e) = crate::reseal_hook_setup_step() {
+        println!("  reseal-hook step did not finish: {e}");
+    }
+    print!("\nPress Enter to return to the wizard… ");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    *terminal = ratatui::init();
+}
+
+/// Suspend the TUI to set a recovery passphrase (typed twice, masked). The
+/// prompt reads from the TTY, so the full-screen UI is torn down for it.
+fn run_recovery_suspended(terminal: &mut ratatui::DefaultTerminal, user: &str) {
+    use std::io::Write;
+    ratatui::restore();
+    println!("\n— LinuxHello: recovery passphrase —\n");
+    println!(
+        "A backstop SEPARATE from your login password, for when the automatic\n\
+         self-heal can't run (Secure Boot off, TPM cleared, disk moved).\n"
+    );
+    match crate::set_recovery_interactive(user) {
+        Ok(()) => println!("\nRecovery passphrase set."),
+        Err(e) => println!("\nRecovery passphrase not set: {e}"),
     }
     print!("\nPress Enter to return to the wizard… ");
     let _ = std::io::stdout().flush();
