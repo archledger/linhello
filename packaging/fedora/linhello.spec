@@ -61,6 +61,15 @@ enable` (and `linhello setup`) after install.
 %autosetup -n %{name}-%{version}
 
 %build
+# Copr/mock builders intermittently fail the crates.io sparse-index fetch with
+# `download of config.json failed / curl failed` (HTTP/2 multiplexing against the
+# registry is flaky under build-farm network contention). Harden the fetch so a
+# transient blip retries instead of failing the whole build: many retries, and
+# plain serial HTTP/1.1 connections to the registry. These only affect cargo's
+# network step; the resulting binaries are identical.
+export CARGO_NET_RETRY=10
+export CARGO_HTTP_MULTIPLEXING=false
+
 # Rust workspace + the C PAM shim (cargo fetches crates; needs network — vendor
 # or use rust2rpm for an offline Koji build). PAMDIR must match the install
 # step: it is baked into pam_linhello.so's RUNPATH so it can dlopen
