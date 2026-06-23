@@ -5,6 +5,9 @@ case "$1" in
         # Install the per-distro reseal trigger (gated -> kernel postinst.d on
         # Debian). Best-effort; failure must not break package configuration.
         linhello reseal-hook install >/dev/null 2>&1 || true
+        # Activate the camera-refresh udev rule now rather than at next boot.
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+        udevadm trigger --subsystem-match=video4linux --action=add >/dev/null 2>&1 || true
         ;;
 esac
 #DEBHELPER#

@@ -4,6 +4,9 @@ post_install() {
     # the per-distro reseal trigger (gated -> pacman hook on Arch).
     systemd-sysusers /usr/lib/sysusers.d/linhello.conf 2>/dev/null || true
     linhello reseal-hook install >/dev/null 2>&1 || true
+    # Activate the camera-refresh udev rule now rather than only at next boot.
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=video4linux --action=add >/dev/null 2>&1 || true
     cat <<'EOF'
 
 LinuxHello installed. Next steps:
@@ -25,6 +28,8 @@ EOF
 
 post_upgrade() {
     systemctl daemon-reload || true
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=video4linux --action=add >/dev/null 2>&1 || true
     systemctl try-restart linhellod || true
 }
 
