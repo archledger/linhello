@@ -450,27 +450,23 @@ pub fn update(user: &str) -> Result<Vec<String>, String> {
     // (rpm/deb/pkg) when its build tooling is present, so the system tracks a
     // real package; otherwise fall back to the from-source `make install`.
     let fmt = platform::package_format();
-    let native = fmt
-        .build_tool()
-        .map(on_path)
-        .unwrap_or(false)
-        .then(|| build_native_package(&root, fmt))
-        .and_then(|r| r.ok());
-    match native {
-        Some((pkg, blog)) => {
-            log.push(format!("distro {}: native {} package", platform::distro_family().as_str(), fmt.as_str()));
-            log.extend(blog);
-            log.extend(install_native_package(&pkg, fmt)?);
-        }
-        None => {
-            log.push(format!(
-                "no native {} build tooling — installing from source (make install)",
-                fmt.as_str()
-            ));
-            log.push("building (cargo build --release)…".to_string());
-            run_streamed(owner, &root, "cargo", &["build", "--release"])?;
-            log.extend(deploy_from(&root, user)?);
-        }
+    if fmt.build_tool().map(on_path).unwrap_or(false) {
+        // Native package build. A failure here is a real error — propagate it
+        // rather than silently falling back to a source install, which detaches
+        // the system from package tracking (the cause of a split CLI/daemon
+        // version where pacman still believes an older build is installed).
+        let (pkg, blog) = build_native_package(&root, fmt)?;
+        log.push(format!("distro {}: native {} package", platform::distro_family().as_str(), fmt.as_str()));
+        log.extend(blog);
+        log.extend(install_native_package(&pkg, fmt)?);
+    } else {
+        log.push(format!(
+            "no native {} build tooling — installing from source (make install)",
+            fmt.as_str()
+        ));
+        log.push("building (cargo build --release)…".to_string());
+        run_streamed(owner, &root, "cargo", &["build", "--release"])?;
+        log.extend(deploy_from(&root, user)?);
     }
 
     // Extend login wiring only when the operator had already opted in: re-run
@@ -609,12 +605,51 @@ pub fn build_native_package(
             Ok((rpm, log))
         }
         PackageFormat::Pkg => {
-            run_streamed(owner, root, "make", &["dist"])?;
-            let archdir = root.join("packaging/arch");
-            run_streamed(owner, &archdir, "makepkg", &["-f", "--noconfirm"])?;
-            let pkg = newest_built(&archdir, "linhello-", ".pkg.tar.zst")
+            // makepkg refuses to run as root, so the build must happen as an
+            // unprivileged user. Prefer the checkout's owner; when building
+            // from the root-owned managed clone there is no such user, so fall
+            // back to whoever invoked sudo (SUDO_UID). Without either we cannot
+            // proceed — surface that instead of silently degrading to source.
+            let mk_uid = owner.or_else(sudo_uid).ok_or_else(|| {
+                "makepkg cannot run as root and no unprivileged user was found \
+                 (run via `sudo` so SUDO_USER is set, or build as a normal user)"
+                    .to_string()
+            })?;
+            // Stage PKGBUILD + the source tarball in a dedicated build dir the
+            // build user owns; the root-owned checkout itself stays untouched
+            // and makepkg gets a writable working tree.
+            let build = root.join("target/arch-build");
+            let _ = std::fs::remove_dir_all(&build);
+            std::fs::create_dir_all(&build)
+                .map_err(|e| format!("creating {}: {e}", build.display()))?;
+            // Own the dir before writing into it: when `owner` is the build
+            // user, the owner-run `git archive` below needs write access here.
+            run_streamed(None, &build, "chown", &[&mk_uid.to_string(), "."])?;
+            let tar = build.join(format!("linhello-{ver}.tar.gz"));
+            run_streamed(
+                owner,
+                root,
+                "git",
+                &[
+                    "archive",
+                    "--format=tar.gz",
+                    &format!("--prefix=linhello-{ver}/"),
+                    "-o",
+                    &tar.to_string_lossy(),
+                    "HEAD",
+                ],
+            )?;
+            for f in ["PKGBUILD", "linhello.install"] {
+                std::fs::copy(root.join("packaging/arch").join(f), build.join(f))
+                    .map_err(|e| format!("staging {f}: {e}"))?;
+            }
+            // Normalise ownership of everything staged (the tarball is root-owned
+            // when produced from the managed clone) so makepkg can read/write it.
+            run_streamed(None, &build, "chown", &["-R", &mk_uid.to_string(), "."])?;
+            run_makepkg(mk_uid, &build)?;
+            let pkg = newest_built(&build, "linhello-", ".pkg.tar.zst")
                 .ok_or_else(|| "makepkg produced no package".to_string())?;
-            log.push(format!("built {}", pkg.display()));
+            log.push(format!("built {} (as uid {mk_uid})", pkg.display()));
             Ok((pkg, log))
         }
         PackageFormat::Deb => {
@@ -843,6 +878,35 @@ pub fn install_native_package(pkg: &Path, fmt: PackageFormat) -> Result<Vec<Stri
     };
     run_streamed(None, Path::new("/"), mgr, &args)?;
     Ok(vec![format!("installed {} via {mgr}", pkg.display())])
+}
+
+/// Uid of the user who invoked `sudo`, when non-root. Lets a root-driven build
+/// (e.g. `sudo linhello update` from the root-owned managed clone) fall back to
+/// the real user for tooling that refuses to run as root, such as makepkg.
+fn sudo_uid() -> Option<u32> {
+    std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&u| u != 0)
+}
+
+/// Run makepkg as `uid` with output inherited. `-H` resets HOME to that user's
+/// home so cargo's registry cache (under ~/.cargo) resolves; makepkg itself
+/// hard-refuses to run as root, which is why this never uses uid 0.
+fn run_makepkg(uid: u32, cwd: &Path) -> Result<(), String> {
+    let status = Command::new("sudo")
+        .arg("-u")
+        .arg(format!("#{uid}"))
+        .arg("-H")
+        .arg("makepkg")
+        .args(["-f", "--noconfirm"])
+        .current_dir(cwd)
+        .status()
+        .map_err(|e| format!("running makepkg: {e} (is base-devel installed?)"))?;
+    if !status.success() {
+        return Err("makepkg failed (see output above)".to_string());
+    }
+    Ok(())
 }
 
 /// Run `prog args` in `cwd`, output inherited (the user watches git/cargo
