@@ -1,6 +1,6 @@
 # Maintainer: wisbendji fimerlus <archledger236@gmail.com>
 pkgname=linhello
-pkgver=0.4.5
+pkgver=0.4.6
 pkgrel=1
 pkgdesc="TPM-backed facial authentication and PAM keyring unlock for Linux"
 arch=('x86_64')

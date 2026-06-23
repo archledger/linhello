@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.5
+Version:        0.4.6
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,6 +169,19 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.6-1
+- Recover face auth after suspend/resume. UVC webcams commonly fail to resume
+  from USB suspend, leaving the camera present but wedged — the greeter hung on
+  "Looking for your face…" with no camera engaging and survived reboots until the
+  camera power-cycled. Fixed three ways: (1) bound the previously-unbounded camera
+  enumeration/resolution with a deadline (shared with the capture deadline) so a
+  frozen camera can never hang the PAM stack — it degrades to the password within
+  seconds; (2) log the screen-unlock Verify outcome + elapsed time, which was
+  silent and made the failure undiagnosable; (3) add a systemd system-sleep hook
+  that try-restarts linhellod on resume to re-open the camera and re-resolve its
+  cgroup device access (the camera-refresh udev rule only fires on a re-enumerate,
+  which a resume often skips).
+
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.5-1
 - `linhello update`: build the Arch native package as an unprivileged user.
   When updating from the root-owned managed clone (/var/lib/linhello/src),
