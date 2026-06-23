@@ -1,3 +1,19 @@
+linhello (0.4.4-1) unstable; urgency=medium
+
+  * Plasma 6 / KDE lock screen + login fixes: the daemon classifies the
+    `plasmalogin` greeter (and -greeter/-autologin) as login/unlock; the KDE lock
+    screen is wired on Debian (not just Arch); `setup`/`pam enable` and the TUI
+    wizard add the user to the `linhello` group so the user-run greeter can reach
+    the daemon socket.
+  * Close a camera cgroup device boot-race with a udev rule + oneshot that
+    refreshes the daemon's device access once the webcam enumerates; reload udev
+    rules on install so it takes effect without a reboot.
+  * TUI wizard parity with `linhello setup`: install the reseal hook, add group
+    membership unconditionally, offer a recovery passphrase, and confirm the
+    login password (typed twice) before sealing.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Tue, 23 Jun 2026 12:00:00 -0400
+
 linhello (0.4.3-1) unstable; urgency=medium
 
   * SELinux (Fedora/RPM only): allow the confined daemon to run `busctl` and chat

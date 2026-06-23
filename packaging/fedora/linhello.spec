@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.3
+Version:        0.4.4
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -140,6 +140,11 @@ fi
 # auth is ready on the next boot. Non-fatal so a sandbox/container install that
 # can't talk to systemd still succeeds.
 %{_bindir}/systemctl enable --now linhellod.service >/dev/null 2>&1 || :
+# Activate the camera-refresh udev rule now, not just at next boot: reload the
+# rules and replay video4linux add events so a live install picks up the webcam
+# and (via the rule's SYSTEMD_WANTS) refreshes the daemon's device access.
+udevadm control --reload-rules >/dev/null 2>&1 || :
+udevadm trigger --subsystem-match=video4linux --action=add >/dev/null 2>&1 || :
 
 %preun
 %systemd_preun linhellod.service
@@ -154,6 +159,26 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.4-1
+- Fedora KDE / Plasma 6 lock screen + login fixes. Three independent bugs:
+  (1) the daemon now classifies the Plasma 6.4 `plasmalogin` greeter (and its
+  -greeter/-autologin variants) as login/unlock instead of Unknown→deny, so
+  reboot login via plasmalogin works; (2) the KDE lock screen, which runs PAM as
+  the user, is wired on Fedora/Debian (not just Arch) and `setup`/`pam enable`
+  (and the TUI wizard) now add the user to the `linhello` group so the
+  unprivileged greeter can reach the 0660 root:linhello socket; (3) a camera
+  cgroup device boot-race is closed with a udev rule + oneshot that refreshes the
+  daemon's device access once the webcam enumerates (the daemon could start
+  before the USB camera registered major 81, yielding EPERM on /dev/video0 with
+  no SELinux AVC).
+- Packaging: reload udev rules and replay video4linux add events on install, so
+  the camera-refresh rule takes effect on a live install without a reboot.
+- TUI wizard parity with `linhello setup`: it now installs the SELinux policy +
+  reseal hook (previously only displayed them), adds the socket-group membership
+  unconditionally, offers a recovery passphrase, and confirms the login password
+  (typed twice) before sealing it.
+- Experimental: Arch `plasmalogin` greeter PAM wiring (unvalidated on hardware).
+
 * Sat Jun 20 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.3-1
 - SELinux: allow the confined daemon (linhellod_t) to run `busctl` and chat with
   fprintd over the system D-Bus. The fingerprint capability probe shells out to
