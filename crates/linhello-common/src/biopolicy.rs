@@ -264,6 +264,9 @@ fn is_greeter_or_unlock(service: &str) -> bool {
             | "gdm-smartcard"
             | "sddm"
             | "sddm-greeter"
+            | "plasmalogin"
+            | "plasmalogin-greeter"
+            | "plasmalogin-autologin"
             | "lightdm"
             | "lightdm-greeter"
             | "lightdm-autologin"
@@ -323,6 +326,14 @@ mod tests {
         assert_eq!(classify("gdm-password", false), OperationClass::Login);
         assert_eq!(classify("sudo", true), OperationClass::Elevation);
         assert_eq!(classify("polkit-1", false), OperationClass::Elevation);
+        // Plasma 6.4 renamed SDDM; its greeter PAM service is `plasmalogin`.
+        assert_eq!(classify("plasmalogin", false), OperationClass::Login);
+        assert_eq!(classify("plasmalogin", true), OperationClass::ScreenUnlock);
+        // The greeter/autologin variants classify the same way as the base name.
+        assert_eq!(classify("plasmalogin-greeter", false), OperationClass::Login);
+        assert_eq!(classify("plasmalogin-greeter", true), OperationClass::ScreenUnlock);
+        assert_eq!(classify("plasmalogin-autologin", false), OperationClass::Login);
+        assert_eq!(classify("plasmalogin-autologin", true), OperationClass::ScreenUnlock);
         assert_eq!(classify("sshd", true), OperationClass::Remote);
         assert_eq!(classify("some-random-service", true), OperationClass::Unknown);
     }

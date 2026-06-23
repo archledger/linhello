@@ -1,6 +1,6 @@
 # Maintainer: wisbendji fimerlus <archledger236@gmail.com>
 pkgname=linhello
-pkgver=0.4.3
+pkgver=0.4.4
 pkgrel=1
 pkgdesc="TPM-backed facial authentication and PAM keyring unlock for Linux"
 arch=('x86_64')
@@ -43,6 +43,7 @@ package() {
         PREFIX=/usr \
         PAMDIR=/usr/lib/security \
         SYSTEMDDIR=/usr/lib/systemd/system \
+        UDEVDIR=/usr/lib/udev/rules.d \
         CARGO_TARGET_DIR="$srcdir/target"
 
     # SELinux policy sources shipped by `make install` are inert on Arch (no

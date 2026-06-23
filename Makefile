@@ -15,6 +15,7 @@ PREFIX       ?= /usr/local
 BINDIR       ?= $(PREFIX)/bin
 PAMDIR       ?= /usr/lib/security
 SYSTEMDDIR   ?= /etc/systemd/system
+UDEVDIR      ?= /etc/udev/rules.d
 CONFDIR      ?= /etc/linhello
 CARGO        ?= cargo
 CC           ?= cc
@@ -62,6 +63,12 @@ install: all
 	install -Dm755 $(PAM_SO)                $(DESTDIR)$(PAMDIR)/pam_linhello.so
 	sed 's|/usr/local/bin|$(BINDIR)|g' etc/systemd/linhellod.service \
 	    | install -Dm644 /dev/stdin $(DESTDIR)$(SYSTEMDDIR)/linhellod.service
+	# Camera/cgroup boot-race fix: a udev rule pulls in a oneshot that
+	# try-restarts linhellod once a V4L node appears (see the .rules file).
+	install -Dm644 etc/systemd/linhellod-camera-refresh.service \
+	    $(DESTDIR)$(SYSTEMDDIR)/linhellod-camera-refresh.service
+	install -Dm644 etc/udev/rules.d/72-linhello-camera.rules \
+	    $(DESTDIR)$(UDEVDIR)/72-linhello-camera.rules
 	# Declarative `linhello` system group (socket access for the unprivileged
 	# CLI). systemd-sysusers creates it from this file the same way packaging
 	# does; harmless + idempotent. DESTDIR builds (packaging) skip the immediate

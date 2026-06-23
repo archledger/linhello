@@ -140,7 +140,7 @@ pub fn status() -> Vec<ServiceStatus> {
 
 /// Files whose `pam_linhello` presence indicates active wiring, per distro.
 fn inspect_files() -> Vec<PathBuf> {
-    match platform::distro_family() {
+    let mut v: Vec<PathBuf> = match platform::distro_family() {
         DistroFamily::Debian => vec![PathBuf::from("/etc/pam.d/common-auth")]
             .into_iter()
             .filter(|p| p.exists())
@@ -153,11 +153,11 @@ fn inspect_files() -> Vec<PathBuf> {
         .filter(|p| p.exists())
         .collect(),
         DistroFamily::Arch | DistroFamily::Other => {
-            // Status shows the wiring PLAN: one lockscreen row (the service we
-            // would/do manage), not every unwirable leftover.
             let mut v: Vec<PathBuf> =
                 GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-            if let Some(plan) = lockscreen_plan() {
+            // EXPERIMENTAL plasmalogin greeter: show the /etc override we manage
+            // (present once enabled; absent vendor-only files don't show a row).
+            if let Some(plan) = plasmalogin_greeter_plan() {
                 v.push(plan.etc);
             }
             let sudo = PathBuf::from(SUDO);
@@ -166,27 +166,33 @@ fn inspect_files() -> Vec<PathBuf> {
             }
             v
         }
+    };
+    // The KDE lockscreen row is shown on every family (it's desktop-, not
+    // distro-specific): the wiring PLAN — the one service we would/do manage.
+    if let Some(plan) = lockscreen_plan() {
+        v.push(plan.etc);
     }
+    v
 }
 
 /// Enable face login. Edits the greeter (and `sudo` when `include_sudo`) on
 /// Arch-style distros; returns manual guidance on Debian/Fedora. `dry_run`
 /// computes the changes without writing.
 pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
-    match platform::distro_family() {
-        DistroFamily::Debian => debian_enable(dry_run),
-        DistroFamily::Fedora => fedora_enable(dry_run),
+    let mut changes = match platform::distro_family() {
+        DistroFamily::Debian => debian_enable(dry_run)?,
+        DistroFamily::Fedora => fedora_enable(dry_run)?,
         DistroFamily::Arch | DistroFamily::Other => {
             let mut changes = Vec::new();
             for g in GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()) {
                 changes.push(edit_in(&g, GREETER_STANZA, dry_run)?);
             }
-            if let Some(plan) = lockscreen_plan() {
-                changes.push(if plan.etc.exists() {
-                    edit_in(&plan.etc, plan.stanza, dry_run)?
-                } else {
-                    create_override_from(&plan.etc, plan.vendor, plan.stanza, dry_run)?
-                });
+            // EXPERIMENTAL: the Plasma 6 `plasmalogin` greeter is vendor-only on
+            // Arch (not in GREETERS, no /etc file to edit), so materialize it the
+            // same way as the lockscreen. Arch/Other only — Fedora/Debian cover
+            // it via the shared stack. See `plasmalogin_greeter_plan`.
+            if let Some(plan) = plasmalogin_greeter_plan() {
+                changes.push(apply_override(&plan, dry_run)?);
             }
             if include_sudo {
                 let sudo = PathBuf::from(SUDO);
@@ -194,37 +200,64 @@ pub fn enable(include_sudo: bool, dry_run: bool) -> Result<Vec<Change>> {
                     changes.push(edit_in(&sudo, SUFFICIENT_STANZA, dry_run)?);
                 }
             }
-            Ok(changes)
+            changes
         }
+    };
+    // The KDE lockscreen (kscreenlocker) is desktop-specific, not distro-specific.
+    // On Debian/Fedora the shared system-auth/password-auth stacks (wired above)
+    // drive the greeter and sudo but NOT kscreenlocker, which runs its own
+    // `kde` / `kde-fingerprint` PAM services in parallel at lock time — so
+    // lock-screen face unlock needs this wiring on EVERY family, not just Arch.
+    // (Previously this lived only in the Arch arm, so KDE-on-Fedora/Debian users
+    // got working sudo/login face auth but a dead lock screen.)
+    if let Some(plan) = lockscreen_plan() {
+        changes.push(apply_override(&plan, dry_run)?);
     }
+    Ok(changes)
 }
 
 /// Remove face-auth from the greeter and `sudo` stacks (Arch-style); manual
 /// guidance on Debian/Fedora.
 pub fn disable(dry_run: bool) -> Result<Vec<Change>> {
-    match platform::distro_family() {
-        DistroFamily::Debian => debian_disable(dry_run),
-        DistroFamily::Fedora => fedora_disable(dry_run),
+    let mut changes = match platform::distro_family() {
+        DistroFamily::Debian => debian_disable(dry_run)?,
+        DistroFamily::Fedora => fedora_disable(dry_run)?,
         // include_sudo: true — disable must clean sudo even though enable makes
         // it opt-in, otherwise `auth sufficient pam_linhello.so` is left behind
         // (a dangling reference once the module is removed).
-        DistroFamily::Arch | DistroFamily::Other => existing_targets(true)
-            .into_iter()
-            .map(|p| remove_in(&p, dry_run))
-            .collect(),
+        DistroFamily::Arch | DistroFamily::Other => {
+            let mut targets = existing_targets(true);
+            // EXPERIMENTAL plasmalogin greeter (see `plasmalogin_greeter_plan`):
+            // unwire the /etc override symmetrically with enable. `remove_in`
+            // deletes a file we materialized, or strips our line from an admin's.
+            let plasma = PathBuf::from(PLASMALOGIN_ETC);
+            if plasma.exists() {
+                targets.push(plasma);
+            }
+            targets
+                .into_iter()
+                .map(|p| remove_in(&p, dry_run))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    // Symmetric with enable(): unwire the KDE lockscreen on every family. Both
+    // services are tried (an older LinuxHello wired `kde`; current prefers
+    // `kde-fingerprint`) so disable cleans whichever carries our line.
+    for p in [KDE_FP_LOCKSCREEN, KDE_LOCKSCREEN] {
+        if Path::new(p).exists() {
+            changes.push(remove_in(Path::new(p), dry_run)?);
+        }
     }
+    Ok(changes)
 }
 
 /// Targets for disable/uninstall: every file we might have wired, including
 /// BOTH lockscreen services (an older LinuxHello wired `kde`; current prefers
 /// `kde-fingerprint` — unwiring must clean whichever exists).
 fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
+    // Greeter + sudo only. The KDE lockscreen services are unwired separately in
+    // `disable()` (on every family), so they are intentionally not listed here.
     let mut v: Vec<PathBuf> = GREETERS.iter().map(PathBuf::from).filter(|p| p.exists()).collect();
-    for p in [KDE_FP_LOCKSCREEN, KDE_LOCKSCREEN] {
-        if Path::new(p).exists() {
-            v.push(PathBuf::from(p));
-        }
-    }
     if include_sudo {
         let sudo = PathBuf::from(SUDO);
         if sudo.exists() {
@@ -234,9 +267,10 @@ fn existing_targets(include_sudo: bool) -> Vec<PathBuf> {
     v
 }
 
-/// How we wire the KDE lockscreen on this host: which /etc override to manage,
-/// the vendor file it is materialized from, and the stanza it gets.
-struct LockscreenPlan {
+/// How we wire a vendor-shipped PAM service on this host: which /etc override to
+/// manage, the PAM vendor file it is materialized from, and the stanza it gets.
+/// Used for both the KDE lockscreen and the Plasma `plasmalogin` greeter.
+struct OverridePlan {
     etc: PathBuf,
     vendor: &'static str,
     stanza: &'static str,
@@ -246,17 +280,57 @@ struct LockscreenPlan {
 /// with no key press, no pam_unix/faillock contact); fall back to the
 /// interactive `kde` service on Plasma builds without it. Present only when
 /// this host actually has kscreenlocker (an /etc or vendor file exists).
-fn lockscreen_plan() -> Option<LockscreenPlan> {
+fn lockscreen_plan() -> Option<OverridePlan> {
     for (etc, vendor, stanza) in [
         (KDE_FP_LOCKSCREEN, KDE_FP_VENDOR, WAIT_STANZA),
         (KDE_LOCKSCREEN, KDE_VENDOR, SUFFICIENT_STANZA),
     ] {
         let etc_path = PathBuf::from(etc);
         if etc_path.exists() || Path::new(vendor).exists() {
-            return Some(LockscreenPlan { etc: etc_path, vendor, stanza });
+            return Some(OverridePlan { etc: etc_path, vendor, stanza });
         }
     }
     None
+}
+
+/// EXPERIMENTAL (Arch/Plasma 6): wiring for the renamed SDDM greeter,
+/// `plasmalogin`. Plasma 6 ships it under the PAM *vendor* dir on Arch
+/// (`/usr/lib/pam.d/plasmalogin`), so — unlike the legacy `GREETERS` — it has no
+/// `/etc/pam.d` file to edit; we materialize an /etc override from the vendor
+/// copy, exactly as the lockscreen does. Only consulted in the Arch/Other arm:
+/// Fedora/Debian wire the shared `system-auth`/`common-auth` stack that the
+/// greeter `include`s, so plasmalogin is already covered there (verified against
+/// KDE's per-distro data/pam/{fedora,debian}/plasmalogin).
+///
+/// Stanza is `sufficient`, NOT the keyring-preserving `[success=1]` used for the
+/// legacy greeters: the Arch vendor stack pulls the password in via
+/// `auth include system-login`, and a fixed `success=1` skips only the first
+/// rule *inside* an `include` (it cleanly skips a whole `substack`, not an
+/// `include`) — so the jump is layout-dependent and unsafe to assume. With
+/// `sufficient`, face success logs in and failure falls through to the password;
+/// the trade-off is that the keyring is not auto-unlocked by face here. Unwired
+/// symmetrically in `disable()`. Unvalidated on real Arch hardware.
+const PLASMALOGIN_ETC: &str = "/etc/pam.d/plasmalogin";
+const PLASMALOGIN_VENDOR: &str = "/usr/lib/pam.d/plasmalogin";
+
+fn plasmalogin_greeter_plan() -> Option<OverridePlan> {
+    let etc = PathBuf::from(PLASMALOGIN_ETC);
+    if etc.exists() || Path::new(PLASMALOGIN_VENDOR).exists() {
+        Some(OverridePlan { etc, vendor: PLASMALOGIN_VENDOR, stanza: SUFFICIENT_STANZA })
+    } else {
+        None
+    }
+}
+
+/// Apply an [`OverridePlan`]: edit the /etc file in place if it exists, else
+/// materialize it from the vendor copy. Shared by the lockscreen and the
+/// plasmalogin greeter.
+fn apply_override(plan: &OverridePlan, dry_run: bool) -> Result<Change> {
+    if plan.etc.exists() {
+        edit_in(&plan.etc, plan.stanza, dry_run)
+    } else {
+        create_override_from(&plan.etc, plan.vendor, plan.stanza, dry_run)
+    }
 }
 
 /// The /etc override content for a vendor-shipped lockscreen service: marker
@@ -744,6 +818,56 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[2], WAIT_STANZA);
         assert!(lines[3].contains("pam_fprintd"));
+    }
+
+    // The real Arch `plasmalogin` vendor file (KDE data/pam/arch/plasmalogin):
+    // the password comes in via `auth include system-login`, NOT a substack.
+    const ARCH_PLASMALOGIN: &str = "#%PAM-1.0\n\n# SPDX-License-Identifier: CC0-1.0\n\nauth        include     system-login\n-auth       optional    pam_gnome_keyring.so\n-auth       optional    pam_kwallet5.so\n\naccount     include     system-login\n\npassword    include     system-login\n\nsession     optional    pam_keyinit.so          force revoke\nsession     include     system-login\n";
+
+    #[test]
+    fn plasmalogin_greeter_materializes_sufficient_before_include() {
+        // On Arch the greeter is vendor-only; we materialize an /etc override.
+        // It MUST use `sufficient` (not the keyring `[success=1]` jump): a fixed
+        // success=N can't cleanly skip an `include` (only a substack), so on this
+        // include-based stack the jump would be wrong. `sufficient` is correct on
+        // every layout — face success logs in, failure falls to the password.
+        let out = build_override(PLASMALOGIN_VENDOR, ARCH_PLASMALOGIN, SUFFICIENT_STANZA);
+        assert!(is_created_override(&out));
+        assert!(content_has_module(&out));
+        // The wired stanza must be `sufficient`, and the dangerous `[success=N]`
+        // jump must NOT be applied to this include-based greeter.
+        assert!(out.contains(SUFFICIENT_STANZA));
+        assert!(!out.contains("success=1"));
+        // Our line precedes the password-bearing `include system-login`, so face
+        // success short-circuits before the password is demanded.
+        let body: Vec<&str> = out.lines().filter(|l| l.trim_start().starts_with("auth")).collect();
+        assert_eq!(body[0], SUFFICIENT_STANZA);
+        assert!(body[1].contains("include") && body[1].contains("system-login"));
+    }
+
+    #[test]
+    fn plasmalogin_override_round_trips() {
+        let wired = build_override(PLASMALOGIN_VENDOR, ARCH_PLASMALOGIN, SUFFICIENT_STANZA);
+        // A materialized override is deleted wholesale on unwire (it has no
+        // distro original in /etc), so disable() removes the file via the
+        // is_created_override path rather than editing it.
+        assert!(is_created_override(&wired));
+        // Re-applying is idempotent (already wired → no second line).
+        let (again, changed) = insert_first_auth(&wired, SUFFICIENT_STANZA);
+        assert!(!changed);
+        assert_eq!(again, wired);
+    }
+
+    #[test]
+    fn plasmalogin_plan_uses_sufficient_not_jump() {
+        // Guard the policy decision itself, independent of file presence.
+        let plan = OverridePlan {
+            etc: PathBuf::from(PLASMALOGIN_ETC),
+            vendor: PLASMALOGIN_VENDOR,
+            stanza: SUFFICIENT_STANZA,
+        };
+        assert_eq!(plan.stanza, SUFFICIENT_STANZA);
+        assert_ne!(plan.stanza, GREETER_STANZA);
     }
 
     #[test]

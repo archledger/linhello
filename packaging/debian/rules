@@ -25,6 +25,7 @@ override_dh_auto_install:
 	    PREFIX=/usr \
 	    PAMDIR=/usr/lib/$(DEB_HOST_MULTIARCH)/security \
 	    SYSTEMDDIR=/usr/lib/systemd/system \
+	    UDEVDIR=/usr/lib/udev/rules.d \
 	    CONFDIR=/etc/linhello
 	# SELinux policy sources shipped by `make install` are inert on Debian
 	# (which uses AppArmor); drop them to keep the .deb clean.

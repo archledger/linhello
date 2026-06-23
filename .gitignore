@@ -12,6 +12,11 @@ Cargo.lock.bak
 
 # Build artifacts
 /pam/pam_linhello.so
+# SELinux policy module build outputs (`make -C etc/selinux`; the spec rebuilds
+# these at RPM-build time — they must never be committed).
+*.pp
+*.mod
+/etc/selinux/tmp/
 
 # Arch packaging artifacts
 /packaging/arch/src/

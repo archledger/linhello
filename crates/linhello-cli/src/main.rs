@@ -667,7 +667,7 @@ fn enroll_named_finger(user: &str, name: Option<String>) -> Result<bool> {
 
 /// Prompt for a recovery passphrase (with confirmation) and ask the daemon to
 /// wrap `user`'s template key under it. Shared by `set-recovery` and `setup`.
-fn set_recovery_interactive(user: &str) -> Result<()> {
+pub(crate) fn set_recovery_interactive(user: &str) -> Result<()> {
     use zeroize::Zeroize;
     let mut pw = rpassword::prompt_password("Recovery passphrase: ")
         .context("reading passphrase from TTY")?
@@ -1797,6 +1797,16 @@ fn pam_enable_cmd(sudo: bool, dry_run: bool) -> Result<()> {
         println!("  {}", c.describe());
     }
     if !dry_run {
+        // Wiring alone isn't enough for the KDE/Plasma lock screen: kscreenlocker
+        // runs PAM as the *user*, not root, so `pam_linhello` can only reach the
+        // 0660 root:linhello socket if the user is in the `linhello` group. sudo
+        // and the display-manager greeter run PAM as root and don't need this, so
+        // the missing membership silently breaks only the lock screen. `pam enable`
+        // already runs as root, so fix it here too (not just in `setup`).
+        println!();
+        println!("Socket group (lock-screen access):");
+        group_membership_setup_step();
+
         println!();
         println!("Escape hatch preserved: face-auth is a fallback — if the camera or TPM");
         println!("is unavailable you can still type your password, and the TTY login");
@@ -2146,15 +2156,23 @@ fn deps_cmd(only: Option<&str>) {
     }
 }
 
-/// `setup` step: add the current login user to the `linhello` group so they can
-/// run the unprivileged CLI without sudo. The group itself is created
-/// declaratively (sysusers.d, via `make install` / packaging); this only adds
-/// membership, which takes effect at the user's next login. Uniform across
-/// distros (systemd everywhere), so not gated.
-fn group_membership_setup_step() {
+/// Add the current login user to the `linhello` group and report what happened,
+/// as a list of human-readable lines (so callers can print them, or feed them to
+/// the TUI activity log). The group itself is created declaratively (sysusers.d,
+/// via `make install` / packaging); this only adds membership, which takes effect
+/// at the user's next login.
+///
+/// This matters beyond the unprivileged CLI: the KDE/Plasma **lock screen**
+/// (kscreenlocker) runs its PAM stack as the user, so `pam_linhello` can only
+/// reach the `0660 root:linhello` socket — and therefore unlock by face — if the
+/// user is in this group. sudo and the display-manager greeter run PAM as root
+/// and don't need it, which is why a missing membership breaks *only* the lock
+/// screen. Uniform across distros (usermod/getent/id exist everywhere), so not
+/// gated by family. Requires root to perform the `usermod`.
+pub(crate) fn ensure_socket_group_membership() -> Vec<String> {
     let user = current_user().unwrap_or_default();
     if user.is_empty() || user == "root" {
-        return;
+        return Vec::new();
     }
     let group_exists = Command::new("getent")
         .args(["group", SOCKET_GROUP])
@@ -2162,11 +2180,10 @@ fn group_membership_setup_step() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !group_exists {
-        println!(
-            "  '{SOCKET_GROUP}' group missing — create it with: \
+        return vec![format!(
+            "'{SOCKET_GROUP}' group missing — create it with: \
              sudo systemd-sysusers (or sudo groupadd -r {SOCKET_GROUP})"
-        );
-        return;
+        )];
     }
     let already = Command::new("id")
         .args(["-nG", &user])
@@ -2178,25 +2195,32 @@ fn group_membership_setup_step() {
         })
         .unwrap_or(false);
     if already {
-        println!("  '{user}' is already in the {SOCKET_GROUP} group.");
-        return;
+        return vec![format!("'{user}' is already in the {SOCKET_GROUP} group.")];
     }
     match Command::new("usermod").args(["-aG", SOCKET_GROUP, &user]).status() {
-        Ok(s) if s.success() => println!(
-            "  added '{user}' to the {SOCKET_GROUP} group — log out and back in for the \
-             unprivileged CLI (sudo works now)."
-        ),
-        _ => println!(
-            "  could not add '{user}' to the {SOCKET_GROUP} group — run: \
+        Ok(s) if s.success() => vec![format!(
+            "added '{user}' to the {SOCKET_GROUP} group — log out and back in so the \
+             lock screen (and the unprivileged CLI) can reach the daemon."
+        )],
+        _ => vec![format!(
+            "could not add '{user}' to the {SOCKET_GROUP} group — run: \
              sudo usermod -aG {SOCKET_GROUP} {user}"
-        ),
+        )],
+    }
+}
+
+/// `setup`/`pam enable` step: ensure socket-group membership and print the
+/// result with the wizard's two-space indent.
+fn group_membership_setup_step() {
+    for line in ensure_socket_group_membership() {
+        println!("  {line}");
     }
 }
 
 /// `setup` step: install the post-update reseal trigger for this distro, gated
 /// via `reseal_hook_plan()`. Silent skip when the distro has no known mechanism;
 /// never fails setup.
-fn reseal_hook_setup_step() -> Result<()> {
+pub(crate) fn reseal_hook_setup_step() -> Result<()> {
     use linhello_common::platform;
     let Some(plan) = platform::reseal_hook_plan() else {
         println!("  no known kernel-update trigger for this distro — reseal manually after updates.");
@@ -2223,7 +2247,7 @@ fn reseal_hook_setup_step() -> Result<()> {
 /// isn't already loaded. Gated via `selinux_policy_plan()` — a silent no-op on
 /// Arch / AppArmor. Never fails setup over a missing source; it points the user
 /// at the manual command instead.
-fn selinux_setup_step() -> Result<()> {
+pub(crate) fn selinux_setup_step() -> Result<()> {
     use linhello_common::platform;
     let Some(plan) = platform::selinux_policy_plan() else {
         println!("  SELinux not in use on this system — no policy needed.");

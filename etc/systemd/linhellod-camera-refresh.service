@@ -1,0 +1,15 @@
+[Unit]
+Description=Re-apply linhellod device access after a camera appears
+Documentation=https://github.com/archledger/linhello
+# Pulled in by 72-linhello-camera.rules (ENV{SYSTEMD_WANTS}) when a V4L capture
+# node shows up. linhellod starts before the camera's V4L major is registered, so
+# its cgroup DeviceAllow=char-video4linux resolves to nothing and the camera open
+# is denied with EPERM. try-restart makes systemd re-resolve the rule against the
+# now-populated /proc/devices. See 72-linhello-camera.rules for the full story.
+After=linhellod.service
+
+[Service]
+Type=oneshot
+# try-restart is a no-op if linhellod is not running, so this never starts the
+# daemon out of order — it only refreshes an already-running one.
+ExecStart=/usr/bin/systemctl try-restart linhellod.service

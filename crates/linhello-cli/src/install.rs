@@ -1077,9 +1077,17 @@ fn installed_cli() -> Option<PathBuf> {
 }
 
 const PAM_LIBS: [&str; 2] = ["pam_linhello.so", "liblinhello_pam.so"];
-const UNIT_PATHS: [&str; 2] = [
+const UNIT_PATHS: [&str; 4] = [
     "/etc/systemd/system/linhellod.service",
     "/usr/lib/systemd/system/linhellod.service",
+    // Camera/cgroup boot-race refresh oneshot (see 72-linhello-camera.rules).
+    "/etc/systemd/system/linhellod-camera-refresh.service",
+    "/usr/lib/systemd/system/linhellod-camera-refresh.service",
+];
+// udev rule that pulls in the refresh oneshot when a V4L node appears.
+const UDEV_RULE_PATHS: [&str; 2] = [
+    "/etc/udev/rules.d/72-linhello-camera.rules",
+    "/usr/lib/udev/rules.d/72-linhello-camera.rules",
 ];
 const PACMAN_HOOK: &str = "/etc/pacman.d/hooks/linhello-reseal.hook";
 
@@ -1139,6 +1147,9 @@ pub fn uninstall(remove_models: bool) -> Result<Vec<String>, String> {
         }
     }
     for p in UNIT_PATHS {
+        remove_if(Path::new(p), &mut log);
+    }
+    for p in UDEV_RULE_PATHS {
         remove_if(Path::new(p), &mut log);
     }
     remove_if(Path::new(PACMAN_HOOK), &mut log);
