@@ -84,6 +84,7 @@ cargo test --release -p linhello-common -p linhello-core
     BINDIR=%{_bindir} \
     PAMDIR=%{_libdir}/security \
     SYSTEMDDIR=%{_unitdir} \
+    UDEVDIR=%{_udevrulesdir} \
     CONFDIR=%{_sysconfdir}/%{name}
 
 # Ship the built SELinux policy module for the scriptlets to load.
@@ -108,6 +109,8 @@ fi
 %{_libdir}/security/pam_linhello.so
 %{_libdir}/security/liblinhello_pam.so
 %{_unitdir}/linhellod.service
+%{_unitdir}/linhellod-camera-refresh.service
+%{_udevrulesdir}/72-linhello-camera.rules
 %{_sysusersdir}/linhello.conf
 %{_datadir}/%{name}/
 %dir %{_sysconfdir}/%{name}

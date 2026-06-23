@@ -1,0 +1,17 @@
+# LinuxHello — close the cgroup/camera boot-ordering race.
+#
+# linhellod starts very early (After=systemd-tmpfiles-setup/systemd-sysusers) so
+# the IPC socket is up before the first greeter. systemd turns the unit's
+# `DeviceAllow=char-video4linux` into a cgroup (BPF) device rule by resolving
+# "video4linux" -> major 81 from /proc/devices AT THE MOMENT THE SERVICE STARTS.
+# On many machines the camera's V4L major is not registered that early (USB
+# webcams enumerate late and often re-enumerate after boot), so the rule resolves
+# to nothing and the daemon's cgroup denies every open("/dev/video*") with EPERM
+# — invisible to SELinux auditing (cgroup device denials raise no AVC). Face auth
+# then fails everywhere (login, lock screen, sudo) until the daemon is restarted.
+#
+# Fix: when a V4L capture device appears, pull in a oneshot that try-restarts
+# linhellod, so systemd re-resolves char-video4linux against a now-populated
+# /proc/devices and the cgroup gains the camera rule. Idempotent and cheap; the
+# restart is a no-op when the daemon is not running.
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linhellod-camera-refresh.service"

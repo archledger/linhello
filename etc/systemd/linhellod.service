@@ -57,6 +57,12 @@ SystemCallFilter=~@privileged
 SystemCallFilter=@chown
 
 # Devices: TPM resource manager + V4L cameras.
+# NOTE: char-video4linux is resolved to a cgroup rule (major 81) from
+# /proc/devices when this unit STARTS. The daemon starts early — often before the
+# camera's V4L major is registered (USB webcams enumerate late / re-enumerate) —
+# in which case the rule is empty and camera opens are denied with EPERM (no AVC).
+# 72-linhello-camera.rules + linhellod-camera-refresh.service close that race by
+# try-restarting the daemon once a V4L node appears.
 DeviceAllow=/dev/tpmrm0 rw
 DeviceAllow=char-video4linux rw
 PrivateDevices=no
