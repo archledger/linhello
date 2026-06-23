@@ -1,3 +1,14 @@
+linhello (0.4.5-1) unstable; urgency=medium
+
+  * `linhello update`: build the Arch native package as an unprivileged user
+    instead of as root (makepkg refuses to run as root). When updating from the
+    root-owned managed clone the native build failed and the updater silently
+    fell back to a from-source install; it now builds as the checkout owner (or
+    the sudo invoker) in a user-owned build dir, and surfaces native-build
+    failures rather than degrading to source. Arch-only path; rpm/deb unchanged.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Tue, 23 Jun 2026 14:00:00 -0400
+
 linhello (0.4.4-1) unstable; urgency=medium
 
   * Plasma 6 / KDE lock screen + login fixes: the daemon classifies the

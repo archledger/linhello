@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.4
+Version:        0.4.5
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -159,6 +159,17 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.5-1
+- `linhello update`: build the Arch native package as an unprivileged user.
+  When updating from the root-owned managed clone (/var/lib/linhello/src),
+  makepkg was invoked as root and hard-refuses to run, so the native build
+  failed and the updater silently fell back to a from-source `make install` —
+  leaving binaries in /usr/local/bin and a unit in /etc/systemd/system while the
+  package manager still tracked the older build. The package is now built as the
+  checkout owner (or the sudo invoker) in a dedicated user-owned build dir, and a
+  native-build failure is surfaced instead of degrading to a source install.
+  (Arch-only path; rpm/deb builds are unchanged.)
+
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.4-1
 - Fedora KDE / Plasma 6 lock screen + login fixes. Three independent bugs:
   (1) the daemon now classifies the Plasma 6.4 `plasmalogin` greeter (and its
