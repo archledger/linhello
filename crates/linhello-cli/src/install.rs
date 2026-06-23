@@ -1153,6 +1153,9 @@ const UDEV_RULE_PATHS: [&str; 2] = [
     "/etc/udev/rules.d/72-linhello-camera.rules",
     "/usr/lib/udev/rules.d/72-linhello-camera.rules",
 ];
+// system-sleep hook that try-restarts the daemon on resume (recovers a UVC
+// camera wedged across suspend). systemd only scans the /usr/lib location.
+const SLEEP_HOOK_PATHS: [&str; 1] = ["/usr/lib/systemd/system-sleep/linhello-resume"];
 const PACMAN_HOOK: &str = "/etc/pacman.d/hooks/linhello-reseal.hook";
 
 /// Human-readable preview of what an uninstall will do, for the confirm screen.
@@ -1214,6 +1217,9 @@ pub fn uninstall(remove_models: bool) -> Result<Vec<String>, String> {
         remove_if(Path::new(p), &mut log);
     }
     for p in UDEV_RULE_PATHS {
+        remove_if(Path::new(p), &mut log);
+    }
+    for p in SLEEP_HOOK_PATHS {
         remove_if(Path::new(p), &mut log);
     }
     remove_if(Path::new(PACMAN_HOOK), &mut log);

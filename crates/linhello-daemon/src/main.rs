@@ -718,16 +718,33 @@ fn embedding_to_bytes(vec: &[f32]) -> Vec<u8> {
 }
 
 fn do_verify(user: &str) -> Response {
+    // The screen-unlock (Verify) path was previously silent on every outcome —
+    // success, mismatch, AND capture/resolve errors — so a wedged camera after
+    // resume looked identical in the journal to a normal retry, leaving the most
+    // common failure undiagnosable. Log the outcome with elapsed time (mirrors
+    // do_unseal_password): a stall now shows as a logged capture/resolve error
+    // (the camera deadlines fire) or as an unusually long elapsed, not silence.
+    let started = std::time::Instant::now();
     // Try encrypted path first; fall back to legacy unencrypted.
     let samples = match load_user_samples(user) {
         Ok(s) => s,
-        Err(e) => return Response::Error { message: e.to_string() },
+        Err(e) => {
+            tracing::warn!("Verify: load/binding failed for '{user}' after {:?}: {e}", started.elapsed());
+            return Response::Error { message: e.to_string() };
+        }
     };
     let live = match linhello_biometrics::capture_and_embed() {
         Ok(v) => v,
-        Err(e) => return Response::Error { message: e.to_string() },
+        Err(e) => {
+            tracing::warn!("Verify: capture/liveness failed for '{user}' after {:?}: {e}", started.elapsed());
+            return Response::Error { message: e.to_string() };
+        }
     };
     let r = linhello_biometrics::match_against(&live, &samples);
+    tracing::info!(
+        "Verify: user='{user}' matched={} score={:.4} in {:?}",
+        r.matched, r.score, started.elapsed()
+    );
     Response::Verified {
         matched: r.matched,
         score: r.score,

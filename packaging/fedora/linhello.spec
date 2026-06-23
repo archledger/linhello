@@ -120,6 +120,7 @@ fi
 %{_unitdir}/linhellod.service
 %{_unitdir}/linhellod-camera-refresh.service
 %{_udevrulesdir}/72-linhello-camera.rules
+%attr(0755,root,root) %{_systemd_util_dir}/system-sleep/linhello-resume
 %{_sysusersdir}/linhello.conf
 %{_datadir}/%{name}/
 %dir %{_sysconfdir}/%{name}

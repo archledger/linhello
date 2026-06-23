@@ -113,10 +113,38 @@ pub struct CameraInfo {
     pub trusted: bool,
 }
 
+/// Hard deadline for one full enumeration pass. Enumeration opens every
+/// `/dev/video*` node and issues `ENUM_FMT`/`QUERYCAP` ioctls (`classify_device`)
+/// — USB transfers that, on a UVC camera wedged across suspend/resume, can block
+/// in *uninterruptible* kernel sleep with no timeout of their own. This path runs
+/// *before* the timed capture (resolution + camera-binding snapshot), so without
+/// a bound it hangs `do_verify`/`do_authenticate` indefinitely and the greeter
+/// sits on "Looking for your face…" forever instead of falling back to the
+/// password. Bounding it keeps the daemon's invariant: a frozen camera must never
+/// hang the PAM stack. Normal enumeration is well under 100ms; 3s only ever trips
+/// on a genuinely stuck device.
+const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Enumerate all V4L capture nodes with their classification. Nodes that
 /// can't be opened or offer no formats are reported as `Unknown` rather than
-/// dropped, so `linhello doctor` can show them.
+/// dropped, so `linhello doctor` can show them. Bounded by [`ENUMERATE_TIMEOUT`]
+/// so a wedged USB camera can't block the (untimed) device-resolution path that
+/// precedes capture; on timeout we return an empty list — resolution then falls
+/// back to the default device and the *capture* deadline takes over from there.
 pub fn enumerate() -> Vec<CameraInfo> {
+    match run_with_deadline(ENUMERATE_TIMEOUT, enumerate_blocking) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                "camera enumeration did not finish within {}s (a video node is wedged — likely a USB camera that did not resume from suspend); treating as no cameras so PAM falls back to the password",
+                ENUMERATE_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn enumerate_blocking() -> Vec<CameraInfo> {
     v4l::context::enum_devices()
         .into_iter()
         .filter_map(|node| {
@@ -277,6 +305,24 @@ pub fn write_cameras_conf(rgb: &str, ir: Option<&str>) -> Result<()> {
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const IR_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Run `f` on a detached worker thread, returning `None` if it does not finish
+/// within `timeout`. On timeout the worker is abandoned — it may be parked in an
+/// uninterruptible V4L ioctl on a wedged device, holding one fd, which the kernel
+/// reclaims when the device resets — but the *caller* is freed regardless. That
+/// is the whole point: neither a stalled capture nor a stalled enumeration may
+/// ever hang the PAM stack (login / lock screen / sudo). Shared by the capture
+/// deadline and the enumeration deadline so both honour the same invariant.
+fn run_with_deadline<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Run a capture closure on a worker thread with a deadline.
 fn capture_with_timeout<T: Send + 'static>(
     what: &str,
@@ -284,14 +330,10 @@ fn capture_with_timeout<T: Send + 'static>(
     timeout: std::time::Duration,
     f: fn(&str) -> Result<T>,
 ) -> Result<T> {
-    let (tx, rx) = std::sync::mpsc::channel();
     let label = path.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send(f(&path));
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(r) => r,
-        Err(_) => Err(bio_err(format!(
+    match run_with_deadline(timeout, move || f(&path)) {
+        Some(r) => r,
+        None => Err(bio_err(format!(
             "{what} camera {label} produced no frame within {}s (device hung or held by another app)",
             timeout.as_secs()
         ))),
@@ -535,6 +577,26 @@ mod tests {
     fn no_capture_formats_is_unknown() {
         assert_eq!(classify_fourccs(&s(&[])), CameraKind::Unknown);
         assert_eq!(classify_fourccs(&s(&["META"])), CameraKind::Unknown);
+    }
+
+    #[test]
+    fn deadline_returns_value_when_fast() {
+        let got = run_with_deadline(Duration::from_secs(5), || 42);
+        assert_eq!(got, Some(42));
+    }
+
+    #[test]
+    fn deadline_trips_on_a_stuck_worker() {
+        // A worker that outlives the deadline (stands in for a wedged V4L ioctl)
+        // must not block the caller: the wrapper returns None promptly so the
+        // auth path can fall back to the password instead of hanging PAM.
+        let start = Instant::now();
+        let got = run_with_deadline(Duration::from_millis(150), || {
+            std::thread::sleep(Duration::from_secs(30));
+            42
+        });
+        assert_eq!(got, None);
+        assert!(start.elapsed() < Duration::from_secs(5), "deadline did not free the caller");
     }
 
     #[test]
