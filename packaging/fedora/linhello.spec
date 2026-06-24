@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.5.1
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,7 +169,7 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
-* Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.1-1
+* Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.0-1
 - Profiles: create named profiles to enroll into. `linhello enroll --user NAME`
   makes a SEPARATE profile, and a new `--name "Label"` sets its friendly display
   name in one step; in the setup TUI, the Profiles screen's `a` key now types a
@@ -178,6 +178,19 @@ fi
   fixed footer (long messages clipped against the border); they now appear in the
   scrollable Activity panel, and any long footer status is ellipsis-clipped to one
   line.
+- Camera auto-brightness: after AE warmup the capture path measures the face's
+  brightness and drives the camera BRIGHTNESS control toward mid-scale, correcting
+  chronically dark exposure (~44 -> ~110 luma) that fed the recognizer a too-dark
+  face. Camera-agnostic; disable with LINHELLO_AUTO_BRIGHTNESS=0.
+- TUI: vertical scroll sliders on the Activity and Host-check boxes, plus mouse
+  support -- the wheel scrolls the box under the cursor and the slider thumb is
+  drag-to-scroll (keyboard scrolling unchanged).
+- New `linhello update-check`: reports whether a newer release is available (Copr
+  /dnf on Fedora, signed git tags elsewhere); the setup TUI surfaces an
+  update-available notice with the upgrade command matching how it was installed.
+- Framing guidance: lower the too-dark floor (a well-lit face is no longer told
+  "More light on your face"); only flag backlighting when the face itself is dim;
+  and fix the inverted chin/pitch advice (chin up now says "Lower your chin").
 
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.0-1
 - Recover face auth after suspend/resume. UVC webcams commonly fail to resume

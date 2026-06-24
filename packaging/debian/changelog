@@ -1,4 +1,4 @@
-linhello (0.5.1-1) unstable; urgency=medium
+linhello (0.6.0-1) unstable; urgency=medium
 
   * Profiles: create named profiles to enroll into — `linhello enroll --user NAME`
     makes a separate profile and a new `--name "Label"` sets its display name; the
@@ -6,8 +6,19 @@ linhello (0.5.1-1) unstable; urgency=medium
   * TUI fix: the Profiles-screen delete prompt/result no longer overflow the fixed
     footer — they go to the scrollable Activity panel, and long footer status is
     ellipsis-clipped to one line.
+  * Camera auto-brightness: after AE warmup the capture path drives the camera
+    brightness control so the face lands near mid-scale, fixing chronically dark
+    exposure (e.g. ~44 → ~110 luma) that fed the recognizer a too-dark face.
+  * TUI: vertical scroll sliders on the Activity and Host-check boxes, plus mouse
+    support (wheel scrolls the box under the cursor; drag the slider thumb).
+  * New `linhello update-check`: reports whether a newer release is available
+    (Copr/dnf on Fedora, signed git tags elsewhere); the setup TUI shows an
+    update-available notice with the right upgrade command for how it was installed.
+  * Framing guidance fixes: lower the too-dark floor so a well-lit face is no longer
+    told "More light"; only flag backlighting when the face itself is dim; and
+    correct the inverted chin/pitch advice (chin-up now says "Lower your chin").
 
- -- wisbendji fimerlus <archledger236@gmail.com>  Wed, 24 Jun 2026 02:00:00 -0400
+ -- wisbendji fimerlus <archledger236@gmail.com>  Wed, 24 Jun 2026 11:00:00 -0400
 
 linhello (0.5.0-1) unstable; urgency=medium
 
