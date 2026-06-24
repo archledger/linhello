@@ -257,6 +257,9 @@ struct App {
     /// When `Some(user)`, the Profiles screen is awaiting y/N confirmation to
     /// permanently delete that profile.
     delete_confirm: Option<String>,
+    /// When `Some`, the Profiles screen is typing the name of a NEW profile to
+    /// create + set as the enroll target.
+    new_profile_input: Option<String>,
     identify: IdentifyState,
     password: PasswordStep,
     uninstall: UninstallState,
@@ -344,6 +347,7 @@ impl App {
             active_profile,
             name_input: None,
             delete_confirm: None,
+            new_profile_input: None,
             identify: IdentifyState::Idle,
             password: PasswordStep::Entry {
                 input: String::new(),
@@ -377,10 +381,17 @@ impl App {
     fn log_activity(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.status = msg.clone();
+        self.push_activity(msg);
+    }
+
+    /// Append to the scrollable Activity panel WITHOUT mirroring into the
+    /// one-line footer status (which clips long text against the border). Use for
+    /// detailed/long messages that belong in the Activity panel, not the footer.
+    fn push_activity(&mut self, msg: impl Into<String>) {
         // A new action snaps the log back to the newest line, so whatever just
         // happened is always visible (the user can Shift+↑ to review history).
         self.activity_scroll_up = 0;
-        self.activity.push(msg);
+        self.activity.push(msg.into());
         if self.activity.len() > ACTIVITY_MAX {
             let drop = self.activity.len() - ACTIVITY_MAX;
             self.activity.drain(0..drop);
@@ -446,9 +457,10 @@ impl App {
     }
 
     fn next(&mut self) {
-        // The footer shows the lock + reason live, so a blocked step just stays
-        // put — no transient status stamp needed.
-        if self.gate().is_err() {
+        // The footer is a static legend, so surface "why can't I continue?" in the
+        // Activity panel (via the live status line) when a blocked step won't move.
+        if let Err(reason) = self.gate() {
+            self.status = format!("can't continue yet — {reason}");
             return;
         }
         let mut i = self.step_index();
@@ -733,6 +745,10 @@ impl App {
             self.name_edit_key(code);
             return;
         }
+        if self.screen == Screen::Profiles && self.new_profile_input.is_some() {
+            self.new_profile_edit_key(code);
+            return;
+        }
         if self.screen == Screen::Install && matches!(self.install_step, InstallStep::ModelPath { .. })
         {
             self.install_key(code);
@@ -941,14 +957,13 @@ impl App {
                     self.status = format!("enroll target: {}", p.user);
                 }
             }
-            // New profile: enroll under a typed name on the next step. Here we
-            // just set the active profile to a fresh login-user name via input.
+            // Create a NEW named profile and make it the enroll target: type a
+            // name, then go to Enroll to capture faces into it.
             KeyCode::Char('a') => {
-                self.active_profile = self.user.clone();
-                self.status = format!(
-                    "enroll target set to your login '{}' — go to Enroll (Tab)",
-                    self.user
-                );
+                self.new_profile_input = Some(String::new());
+                self.status =
+                    "new profile: type a name, Enter to set as enroll target, Esc to cancel"
+                        .to_string();
             }
             // Rename the highlighted profile.
             KeyCode::Char('n') => {
@@ -960,10 +975,17 @@ impl App {
             // Delete the highlighted profile (asks y/N — see delete_confirm_key).
             KeyCode::Char('d') => {
                 if let Some(p) = self.profiles.get(self.profile_cursor) {
-                    self.delete_confirm = Some(p.user.clone());
+                    let (user, samples, has_pw) = (p.user.clone(), p.samples, p.has_password);
+                    self.delete_confirm = Some(user.clone());
+                    // Shows as the live status line in the Activity panel (it wraps);
+                    // persists until y/n because the modal captures every key.
+                    let pw_note = if has_pw {
+                        " — also erases the sealed password (face login/sudo needs re-sealing after)"
+                    } else {
+                        ""
+                    };
                     self.status = format!(
-                        "DELETE profile '{}' ({} samples)? press y to confirm, any other key to cancel",
-                        p.user, p.samples
+                        "delete profile '{user}' ({samples} samples){pw_note}? press y to confirm, any other key to cancel"
                     );
                 }
             }
@@ -1010,6 +1032,43 @@ impl App {
         }
     }
 
+    /// Typing the name of a NEW profile to create + target (`new_profile_input`).
+    /// Enter sets it as the enroll target; the profile is created when you enroll.
+    fn new_profile_edit_key(&mut self, code: KeyCode) {
+        let Some(buf) = self.new_profile_input.as_mut() else { return };
+        match code {
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Esc => {
+                self.new_profile_input = None;
+                self.status = "new profile cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let name = self.new_profile_input.as_deref().unwrap_or("").trim().to_string();
+                // The name becomes a directory under /etc/linhello, so reject
+                // empties / traversal / separators (mirrors the daemon's check).
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    self.status = "invalid name — avoid empty, '/', '\\', '.' and '..'".to_string();
+                    return; // keep editing; buffer unchanged
+                }
+                self.new_profile_input = None;
+                self.active_profile = name.clone();
+                self.push_activity(format!(
+                    "new profile '{name}' set as the enroll target — go to Enroll (Tab) to capture faces into it"
+                ));
+                self.status = format!("enroll target: {name} — Tab to Enroll");
+            }
+            _ => {}
+        }
+    }
+
     /// Awaiting y/N to permanently delete the profile in `delete_confirm`.
     /// Only `y`/`Y` deletes; every other key cancels.
     fn delete_confirm_key(&mut self, code: KeyCode) {
@@ -1020,9 +1079,11 @@ impl App {
         }
         match crate::send(Request::DeleteProfile { user: user.clone() }) {
             Ok(Response::ProfileDeleted { user, samples }) => {
-                self.log_activity(format!(
+                // Logged as a completed action (→); clear the transient prompt line.
+                self.push_activity(format!(
                     "deleted profile '{user}' ({samples} samples erased) — removed /etc/linhello/{user}/"
                 ));
+                self.status.clear();
                 // If the enroll target was just deleted, fall back to the login user.
                 if self.active_profile == user {
                     self.active_profile = self.user.clone();
@@ -1592,8 +1653,8 @@ impl App {
         let chunks = Layout::vertical([
             Constraint::Length(3), // header
             Constraint::Min(0),    // body
-            Constraint::Length(6), // activity bar
-            Constraint::Length(5), // footer (nav + actions + status legend)
+            Constraint::Length(7), // activity bar (live messages live here)
+            Constraint::Length(4), // footer — static legend: nav + per-step keys
         ])
         .split(area);
 
@@ -1703,32 +1764,12 @@ impl App {
             Line::from(spans)
         };
 
-        // Row 3 — live "can I move on?" feedback. The gate reason names the exact
-        // key to press, so a blocked user is never stuck.
-        let status = match self.gate() {
-            Err(reason) => Line::from(vec![
-                Span::styled("🔒 ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    reason,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Ok(()) if !self.status.is_empty() => Line::from(vec![
-                dim("• "),
-                Span::styled(self.status.clone(), Style::default().fg(Color::Gray)),
-            ]),
-            Ok(()) => Line::from(vec![
-                Span::styled("✓ ", Style::default().fg(Color::Green)),
-                dim("ready — press "),
-                key("→"),
-                dim(" or "),
-                key("Tab"),
-                dim(" to continue"),
-            ]),
-        };
-
+        // The footer is a STATIC key legend (two rows): universal nav + the keys
+        // for this step. All live messages — prompts, results, errors, the "why
+        // can't I continue?" gate reason — go to the scrollable Activity panel
+        // above, never here, so the footer never moves or overflows.
         let p =
-            Paragraph::new(vec![nav, actions, status]).block(surface().padding(Padding::horizontal(2)));
+            Paragraph::new(vec![nav, actions]).block(surface().padding(Padding::horizontal(2)));
         frame.render_widget(p, area);
     }
 
@@ -1749,6 +1790,7 @@ impl App {
             Screen::Profiles => vec![
                 ("↑↓", "highlight"),
                 ("s", "set enroll target"),
+                ("a", "new profile"),
                 ("n", "rename"),
                 ("d", "delete"),
                 ("r", "refresh"),
@@ -1775,7 +1817,7 @@ impl App {
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
         // Build the full log as wrapped lines, then scroll within it so the user
         // can Shift+↑/↓ back through prior actions (default follows the newest).
-        let lines: Vec<Line> = if self.activity.is_empty() {
+        let mut lines: Vec<Line> = if self.activity.is_empty() {
             vec![Line::from(
                 "Nothing changed yet. Any file the software touches will be listed here."
                     .dim()
@@ -1792,6 +1834,18 @@ impl App {
                 })
                 .collect()
         };
+
+        // The current live status (prompts like "press y to confirm", results,
+        // errors, the "why can't I continue?" gate reason) shows as the NEWEST
+        // line here — the footer is a static legend now, so this scrollable,
+        // wrapping panel is where every message lands. Skip when it would just
+        // duplicate the last logged action.
+        if !self.status.is_empty() && self.activity.last() != Some(&self.status) {
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+                Span::styled(self.status.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
 
         let inner_w = area.width.saturating_sub(2 + 4); // borders + horizontal(2)
         let view_rows = area.height.saturating_sub(2); // borders only
@@ -2111,6 +2165,28 @@ impl App {
     }
 
     fn body_profiles(&self, frame: &mut Frame, area: Rect) {
+        if let Some(buf) = &self.new_profile_input {
+            // Create-new-profile overlay.
+            self.body_paragraph(
+                frame,
+                area,
+                vec![
+                    Line::from("Create a new profile".bold()),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw("New profile name: "),
+                        Span::styled(buf.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("▏", Style::default().fg(Color::Gray)),
+                    ]),
+                    Line::from(""),
+                    Line::from(
+                        "Enter sets it as the enroll target (then Tab to Enroll); Esc cancels."
+                            .italic(),
+                    ),
+                ],
+            );
+            return;
+        }
         if let Some(buf) = &self.name_input {
             // Name-edit overlay.
             let target = self

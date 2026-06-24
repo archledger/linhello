@@ -722,7 +722,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linhello-biometrics"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "image",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-common"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-daemon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -810,11 +810,11 @@ dependencies = [
 
 [[package]]
 name = "linhello-fingerprint"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "linhello-liveness"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "image",
  "linhello-common",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-pam"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "linhello-common",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "linhello-secureboot"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "linhello-common",
  "tracing",

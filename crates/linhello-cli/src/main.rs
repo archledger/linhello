@@ -45,10 +45,12 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
-    /// Permanently delete an enrolled profile: erase its face template, sealed
-    /// password/recovery envelopes, camera binding, and IR calibration. Your
-    /// login wiring and password are untouched — face auth just stops for this
-    /// profile until you re-enroll. Root-only. Prompts to confirm unless `--yes`.
+    /// Permanently delete an enrolled profile: erase its face template, IR
+    /// liveness calibration, camera binding, and the TPM-sealed copies of the
+    /// password + recovery key. Your PAM login wiring and your actual system
+    /// password are untouched, but face login/sudo falls back to your typed
+    /// password until you re-enroll AND re-seal (`linhello seal-password`).
+    /// Root-only. Prompts to confirm unless `--yes`.
     ForgetProfile {
         #[arg(long)]
         user: String,
@@ -84,6 +86,8 @@ enum Cmd {
     /// samples (enroll glasses-on / glasses-off / varied lighting; auth takes
     /// the best match). `--reset` wipes prior samples first.
     Enroll {
+        /// Profile to enroll into (defaults to your login user). Use a distinct
+        /// value to create a SEPARATE profile (e.g. `--user ben-glasses`).
         #[arg(long)]
         user: Option<String>,
         #[arg(long)]
@@ -91,6 +95,11 @@ enum Cmd {
         /// How many face samples to capture this run.
         #[arg(long, default_value = "5")]
         samples: u32,
+        /// Friendly display name for the profile (e.g. "Ben — glasses"). Set on
+        /// the profile after a successful capture; handy when creating a new
+        /// `--user` profile so it's labelled in `linhello profiles`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Safe recognition self-test: captures one frame and tells you whether
     /// LinuxHello recognizes you. It does NOT drive any login prompt and
@@ -850,21 +859,28 @@ fn identify_cmd() -> Result<()> {
 fn forget_profile_cmd(user: &str, yes: bool) -> Result<()> {
     use std::io::Write;
     // Look it up first so we can show what's being erased and reject a typo'd name.
-    let samples = match send(Request::ListProfiles)? {
-        Response::Profiles { profiles } => {
-            profiles.into_iter().find(|p| p.user == user).map(|p| p.samples)
-        }
+    let prof = match send(Request::ListProfiles)? {
+        Response::Profiles { profiles } => profiles.into_iter().find(|p| p.user == user),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {other:?}"),
     };
-    let Some(samples) = samples else {
+    let Some(prof) = prof else {
         bail!("no enrolled profile '{user}' — run `linhello profiles` to list them");
     };
     if !yes {
         print!(
-            "Permanently delete profile '{user}' ({samples} face sample(s) + its TPM \
-             envelopes)? This cannot be undone. [y/N] "
+            "Permanently delete profile '{user}' ({} face sample(s))? This erases the face \
+             template, IR liveness calibration, and the TPM-sealed copies of your password and \
+             recovery key. ",
+            prof.samples
         );
+        if prof.has_password {
+            print!(
+                "Face login/sudo will fall back to your typed password until you re-enroll AND \
+                 re-seal (`linhello seal-password`). "
+            );
+        }
+        print!("Your actual system password is unchanged. This cannot be undone. [y/N] ");
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).ok();
@@ -1443,9 +1459,12 @@ fn main() -> Result<()> {
             }
             other => bail!("unexpected response: {other:?}"),
         },
-        Cmd::Enroll { user, reset, samples } => {
+        Cmd::Enroll { user, reset, samples, name } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
             enroll_guided(&user, reset, samples.max(1))?;
+            if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+                profile_name_cmd(&user, &name)?;
+            }
         }
         Cmd::Verify { user } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
