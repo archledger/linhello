@@ -14,6 +14,7 @@ use std::time::Duration;
 mod install;
 mod pamwire;
 mod tui;
+mod update;
 
 #[derive(Parser)]
 #[command(name = "linhello", version, about = "LinuxHello control CLI")]
@@ -154,6 +155,10 @@ enum Cmd {
     /// Full-screen setup wizard (TUI). Same steps as `setup`, but interactive.
     /// Requires a terminal; falls back to `linhello setup` when piped.
     Tui,
+    /// Check whether a newer LinuxHello release is available. Compares this build
+    /// against the Copr repo on Fedora (what `dnf upgrade` would install), or the
+    /// signed git release tags on other distros. One network call; no install.
+    UpdateCheck,
     /// Wire face login into the system PAM stacks (per distro), or report/remove
     /// it. Edits /etc/pam.d on Arch (with backups); prints the pam-auth-update /
     /// authselect steps on Debian/Fedora. The password + TTY escape always stay.
@@ -1823,6 +1828,24 @@ fn main() -> Result<()> {
             require_root("tui")?;
             let user = current_user().unwrap_or_default();
             tui::run(user)?;
+        }
+        Cmd::UpdateCheck => {
+            let st = update::live_status();
+            match &st.latest {
+                Some(latest) if st.newer_available() => {
+                    println!("update available: v{} → v{latest}", st.current);
+                    println!("  update with:  {}", update::update_hint());
+                }
+                Some(latest) => {
+                    println!("up to date: v{} (newest released: v{latest}).", st.current);
+                }
+                None => {
+                    println!(
+                        "could not reach the update source (offline?). This build is v{}.",
+                        st.current
+                    );
+                }
+            }
         }
         Cmd::Pam { action } => match action {
             PamAction::Status => pam_status_cmd(),

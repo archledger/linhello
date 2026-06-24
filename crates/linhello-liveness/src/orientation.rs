@@ -7,7 +7,9 @@
 //! adequate for a ±15° frontal-face gate.
 //!
 //! Convention: positive yaw = face turned to the CAMERA'S right (user's
-//! left). Positive pitch = face tilted up.
+//! left). Positive pitch = face tilted DOWN (chin tucked, looking down);
+//! negative pitch = face tilted UP (chin raised, looking up). See the
+//! `shifted_nose_gives_pitch` test, which pins the sign.
 
 /// Maximum angular deviation from frontal for a valid authentication
 /// frame. WBF specifies ±15°; we use ±18° because natural desk posture

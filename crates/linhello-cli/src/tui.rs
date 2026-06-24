@@ -24,11 +24,17 @@ use linhello_common::ipc::{
 use zeroize::Zeroize;
 use linhello_common::platform;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Flex, Layout, Rect},
+    crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
+    layout::{Constraint, Flex, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, List, ListItem, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, List, ListItem, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Frame,
 };
 
@@ -51,6 +57,58 @@ fn wrapped_rows(w: u16, inner: u16) -> u16 {
     } else {
         (w.max(1) + inner - 1) / inner
     }
+}
+
+/// One of the two scrollable boxes, used to route a mouse wheel / thumb-drag to
+/// the box the cursor is actually over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Activity,
+    Doctor,
+}
+
+/// Map a cursor `row` over a box's right-edge slider to a top-of-viewport scroll
+/// position in `0..=max`. The track is the box `area` inset by one row top and
+/// bottom (matching [`render_scrollbar`]), so the thumb lines up with the click.
+fn pos_from_row(area: Rect, row: u16, max: u16) -> u16 {
+    let top = area.y.saturating_add(1);
+    let track = area.height.saturating_sub(2);
+    if track <= 1 || max == 0 {
+        return 0;
+    }
+    let rel = row.saturating_sub(top).min(track - 1) as u32;
+    ((rel * max as u32) / (track as u32 - 1)) as u16
+}
+
+/// Draw a vertical scroll slider in the right border of a framed, scrollable box
+/// so the user can see at a glance that the box scrolls, where they are within
+/// it, and — crucially — which box their keys are moving. `content`/`view` are in
+/// wrapped rows and `pos` is the top-of-viewport offset (0 = top), matching the
+/// geometry the body renderers already record. No-op when everything fits.
+fn render_scrollbar(frame: &mut Frame, area: Rect, content: u16, view: u16, pos: u16) {
+    if content <= view {
+        return;
+    }
+    let mut state = ScrollbarState::new(content as usize)
+        .viewport_content_length(view as usize)
+        .position(pos as usize);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("░"))
+        .thumb_symbol("█")
+        .thumb_style(Style::default().fg(Color::Blue))
+        .track_style(Style::default().fg(HAIRLINE));
+    // Inset by one row top/bottom so the rounded corners of the border survive;
+    // the bar then rides the right edge, in line with the box's content.
+    frame.render_stateful_widget(
+        bar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
 }
 
 /// A rounded, hairline-bordered block — the base for every framed surface.
@@ -235,6 +293,19 @@ struct App {
     /// clamp `activity_scroll_up` to the real content height.
     activity_content_rows: std::cell::Cell<u16>,
     activity_view_rows: std::cell::Cell<u16>,
+    /// Last-rendered screen rectangles of the two scrollable boxes, so a mouse
+    /// wheel or scroll-thumb drag can be routed to whichever box the cursor is
+    /// over rather than to "the focused box" the user can't see. Zero-sized until
+    /// first render; `doctor_area` is only live while on the Host-check screen.
+    activity_area: std::cell::Cell<Rect>,
+    doctor_area: std::cell::Cell<Rect>,
+    /// Which box's scroll thumb the user is currently dragging with the mouse, if
+    /// any. `None` between drags.
+    dragging: Option<ScrollTarget>,
+    /// Background "is a newer release available?" check. The receiver is drained
+    /// once on `tick`; `update` then holds the result for the header notice.
+    update_rx: Option<std::sync::mpsc::Receiver<crate::update::UpdateStatus>>,
+    update: Option<crate::update::UpdateStatus>,
     cameras: Vec<CameraInfo>,
     cam_cursor: usize,
     sel_rgb: Option<String>,
@@ -321,6 +392,12 @@ impl App {
         // the Cameras step is satisfied without forcing a re-save.
         let cameras_saved = config::config_path("cameras.conf").exists();
         let active_profile = user.clone();
+        // Kick off the "newer release?" check off-thread so it never delays the
+        // first frame; `tick` picks up the result when it lands.
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = update_tx.send(crate::update::cached_status());
+        });
         App {
             screen: Screen::Welcome,
             policy: None,
@@ -330,6 +407,11 @@ impl App {
             activity_scroll_up: 0,
             activity_content_rows: std::cell::Cell::new(0),
             activity_view_rows: std::cell::Cell::new(0),
+            activity_area: std::cell::Cell::new(Rect::ZERO),
+            doctor_area: std::cell::Cell::new(Rect::ZERO),
+            dragging: None,
+            update_rx: Some(update_rx),
+            update: None,
             user,
             install: crate::install::InstallState::detect(),
             report: None,
@@ -679,6 +761,104 @@ impl App {
         // Let the daemon re-bind the socket and warm the ONNX models.
         std::thread::sleep(Duration::from_secs(2));
         Ok(())
+    }
+
+    /// Which scrollable box (if any) the cursor is over, considering only boxes
+    /// that currently have off-screen content. Lets the wheel scroll exactly the
+    /// box under the pointer instead of guessing at a hidden "focus".
+    fn box_at(&self, col: u16, row: u16) -> Option<ScrollTarget> {
+        let p = Position { x: col, y: row };
+        if self.screen == Screen::Doctor
+            && self.doctor_max_scroll() > 0
+            && self.doctor_area.get().contains(p)
+        {
+            return Some(ScrollTarget::Doctor);
+        }
+        if self.activity_max_scroll() > 0 && self.activity_area.get().contains(p) {
+            return Some(ScrollTarget::Activity);
+        }
+        None
+    }
+
+    /// True when `(col, row)` lands on a box's right-edge scroll slider (the last
+    /// column, between the rounded corners) and that box can scroll — i.e. the
+    /// user is grabbing the thumb.
+    fn on_slider(&self, area: Rect, max: u16, col: u16, row: u16) -> bool {
+        max > 0
+            && area.width > 0
+            && col == area.x + area.width - 1
+            && row > area.y
+            && row + 1 < area.y + area.height
+    }
+
+    /// Jump a box's scroll to the cursor `row` while dragging its thumb.
+    fn drag_to(&mut self, target: ScrollTarget, row: u16) {
+        match target {
+            ScrollTarget::Activity => {
+                let max = self.activity_max_scroll();
+                // The Activity panel follows the newest line, so its scroll state
+                // is "rows scrolled UP from the bottom"; invert the top-anchored
+                // slider position to match.
+                self.activity_scroll_up = max - pos_from_row(self.activity_area.get(), row, max);
+            }
+            ScrollTarget::Doctor => {
+                let max = self.doctor_max_scroll();
+                self.doctor_scroll = pos_from_row(self.doctor_area.get(), row, max);
+            }
+        }
+    }
+
+    /// Mouse input: wheel scrolls whichever box the pointer is over, and the
+    /// left button can grab a box's right-edge slider to drag the view. A no-op
+    /// on a bare TTY that doesn't report mouse events — keyboard scrolling (↑/↓
+    /// and Shift+↑/↓) covers that case.
+    fn on_mouse(&mut self, me: MouseEvent) {
+        let (col, row) = (me.column, me.row);
+        match me.kind {
+            MouseEventKind::ScrollUp => match self.box_at(col, row) {
+                Some(ScrollTarget::Activity) => {
+                    self.activity_scroll_up =
+                        (self.activity_scroll_up + 3).min(self.activity_max_scroll());
+                }
+                Some(ScrollTarget::Doctor) => {
+                    self.doctor_scroll = self.doctor_scroll.saturating_sub(3);
+                }
+                None => {}
+            },
+            MouseEventKind::ScrollDown => match self.box_at(col, row) {
+                Some(ScrollTarget::Activity) => {
+                    self.activity_scroll_up = self.activity_scroll_up.saturating_sub(3);
+                }
+                Some(ScrollTarget::Doctor) => {
+                    self.doctor_scroll = (self.doctor_scroll + 3).min(self.doctor_max_scroll());
+                }
+                None => {}
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.dragging = None;
+                if self.screen == Screen::Doctor
+                    && self.on_slider(self.doctor_area.get(), self.doctor_max_scroll(), col, row)
+                {
+                    self.dragging = Some(ScrollTarget::Doctor);
+                    self.drag_to(ScrollTarget::Doctor, row);
+                } else if self.on_slider(
+                    self.activity_area.get(),
+                    self.activity_max_scroll(),
+                    col,
+                    row,
+                ) {
+                    self.dragging = Some(ScrollTarget::Activity);
+                    self.drag_to(ScrollTarget::Activity, row);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(target) = self.dragging {
+                    self.drag_to(target, row);
+                }
+            }
+            MouseEventKind::Up(_) => self.dragging = None,
+            _ => {}
+        }
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -1516,7 +1696,55 @@ impl App {
         }
     }
 
+    /// The newer version string to advertise in the header, or `None` when the
+    /// check hasn't landed yet or this build is already current.
+    fn update_available_version(&self) -> Option<String> {
+        let st = self.update.as_ref()?;
+        st.newer_available().then(|| st.latest.clone()).flatten()
+    }
+
+    /// The update line for the Install step: states the real check result and —
+    /// crucially — the command that matches how THIS install was done (dnf for a
+    /// Copr/rpm install, the signed-tag source updater otherwise).
+    fn install_update_line(&self) -> Line<'static> {
+        let hint = crate::update::update_hint();
+        match self.update.as_ref() {
+            // A newer release exists — name it and the right command.
+            Some(st) if st.newer_available() => {
+                let latest = st.latest.clone().unwrap_or_default();
+                Line::from(Span::styled(
+                    format!("Newer LinuxHello available: v{latest} — quit and run: {hint}"),
+                    Style::default().fg(Color::Yellow),
+                ))
+            }
+            // Checked and current.
+            Some(st) if st.latest.is_some() => {
+                Line::from(format!("✓ Up to date (v{}).", st.current).dark_gray())
+            }
+            // Check still pending or couldn't reach the source: don't claim
+            // anything, just show how to update when they want to.
+            _ => Line::from(format!("To update later: {hint}").dark_gray()),
+        }
+    }
+
     fn tick(&mut self) {
+        // The background update check resolves at most once; surface it the
+        // moment it lands (a one-time Activity note, then the header badge).
+        if let Some(rx) = &self.update_rx {
+            if let Ok(status) = rx.try_recv() {
+                if status.newer_available() {
+                    if let Some(latest) = &status.latest {
+                        self.push_activity(format!(
+                            "update available: v{latest} (you have v{}). Update: {}",
+                            status.current,
+                            crate::update::update_hint()
+                        ));
+                    }
+                }
+                self.update = Some(status);
+                self.update_rx = None;
+            }
+        }
         if self.last_poll.elapsed() >= Duration::from_secs(1) {
             self.poll_live();
             self.last_poll = Instant::now();
@@ -1658,7 +1886,7 @@ impl App {
         ])
         .split(area);
 
-        let header_line = if self.screen == Screen::Uninstall {
+        let mut header_line = if self.screen == Screen::Uninstall {
             Line::from(vec![Span::styled(
                 " Uninstall LinuxHello ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1678,6 +1906,14 @@ impl App {
                 ),
             ])
         };
+        // Persistent badge once the background check finds a newer release.
+        if let Some(latest) = self.update_available_version() {
+            header_line.push_span(Span::raw("   "));
+            header_line.push_span(Span::styled(
+                format!("● update available → v{latest}"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
         let header = Paragraph::new(header_line).block(
             surface()
                 .title(" LinuxHello setup ")
@@ -1855,6 +2091,7 @@ impl App {
             .sum();
         self.activity_content_rows.set(content_rows);
         self.activity_view_rows.set(view_rows);
+        self.activity_area.set(area);
 
         let max_scroll = content_rows.saturating_sub(view_rows);
         let up = self.activity_scroll_up.min(max_scroll);
@@ -1876,6 +2113,7 @@ impl App {
             .wrap(Wrap { trim: false })
             .scroll((offset, 0));
         frame.render_widget(p, area);
+        render_scrollbar(frame, area, content_rows, view_rows, offset);
     }
 
     fn render_body(&self, frame: &mut Frame, area: Rect) {
@@ -2055,9 +2293,7 @@ impl App {
                     ));
                     v.push(Line::from("Tab to continue to setup, or press i to redeploy."));
                     v.push(Line::from(""));
-                    v.push(Line::from(
-                        "Newer LinuxHello on GitHub? Quit and run: sudo linhello update".dark_gray(),
-                    ));
+                    v.push(self.install_update_line());
                 } else {
                     v.push(Line::from("This deploys the programs + daemon, then the face models:"));
                     v.push(Line::from(""));
@@ -2519,6 +2755,7 @@ impl App {
                     .sum();
                 self.doctor_content_rows.set(content_rows);
                 self.doctor_view_rows.set(view_rows);
+                self.doctor_area.set(area);
                 let para = Paragraph::new(lines)
                     .wrap(Wrap { trim: false })
                     .scroll((self.doctor_scroll, 0))
@@ -2528,6 +2765,7 @@ impl App {
                             .padding(Padding::symmetric(4, 1)),
                     );
                 frame.render_widget(para, area);
+                render_scrollbar(frame, area, content_rows, view_rows, self.doctor_scroll);
             }
         }
     }
@@ -3038,10 +3276,28 @@ pub fn run(user: String) -> anyhow::Result<()> {
             "the TUI needs an interactive terminal; use `linhello setup` for the headless wizard"
         );
     }
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
     let result = event_loop(&mut terminal, user);
-    ratatui::restore();
+    restore_terminal();
     result
+}
+
+/// Enter the alternate screen and additionally turn on mouse reporting, so the
+/// wheel and scroll-thumb drags work in a real terminal emulator. Mouse capture
+/// is best-effort: a bare Linux VT that doesn't support it simply won't send
+/// mouse events, and keyboard scrolling still works.
+fn init_terminal() -> ratatui::DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    terminal
+}
+
+/// Tear down mouse reporting before leaving the alternate screen, so the host
+/// terminal's own click-to-select returns and no stray escape sequences leak
+/// into the cooked terminal the suspended sub-flows use.
+fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::Result<()> {
@@ -3050,10 +3306,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::
     while !app.should_quit {
         terminal.draw(|frame| app.render(frame))?;
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.on_key(key.code, key.modifiers);
                 }
+                Event::Mouse(me) => app.on_mouse(me),
+                _ => {}
             }
         }
         if app.pending_fp_enable {
@@ -3081,7 +3339,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, user: String) -> anyhow::
 /// needs a cooked terminal), then re-enter the alternate screen.
 fn run_fingerprint_enable_suspended(terminal: &mut ratatui::DefaultTerminal, user: &str) {
     use std::io::Write;
-    ratatui::restore();
+    restore_terminal();
     println!("\n— LinuxHello: set up fingerprint —\n");
     match crate::fingerprint_enable(user) {
         Ok(()) => println!("\nFingerprint set up."),
@@ -3091,7 +3349,7 @@ fn run_fingerprint_enable_suspended(terminal: &mut ratatui::DefaultTerminal, use
     let _ = std::io::stdout().flush();
     let mut s = String::new();
     let _ = std::io::stdin().read_line(&mut s);
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
 }
 
 /// Suspend the TUI to run the platform-integration steps that `setup` runs:
@@ -3101,7 +3359,7 @@ fn run_fingerprint_enable_suspended(terminal: &mut ratatui::DefaultTerminal, use
 /// don't apply.
 fn run_platform_setup_suspended(terminal: &mut ratatui::DefaultTerminal) {
     use std::io::Write;
-    ratatui::restore();
+    restore_terminal();
     println!("\n— LinuxHello: platform integration (SELinux, reseal hook) —\n");
     if let Err(e) = crate::selinux_setup_step() {
         println!("  SELinux step did not finish: {e}");
@@ -3113,14 +3371,14 @@ fn run_platform_setup_suspended(terminal: &mut ratatui::DefaultTerminal) {
     let _ = std::io::stdout().flush();
     let mut s = String::new();
     let _ = std::io::stdin().read_line(&mut s);
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
 }
 
 /// Suspend the TUI to set a recovery passphrase (typed twice, masked). The
 /// prompt reads from the TTY, so the full-screen UI is torn down for it.
 fn run_recovery_suspended(terminal: &mut ratatui::DefaultTerminal, user: &str) {
     use std::io::Write;
-    ratatui::restore();
+    restore_terminal();
     println!("\n— LinuxHello: recovery passphrase —\n");
     println!(
         "A backstop SEPARATE from your login password, for when the automatic\n\
@@ -3134,5 +3392,5 @@ fn run_recovery_suspended(terminal: &mut ratatui::DefaultTerminal, user: &str) {
     let _ = std::io::stdout().flush();
     let mut s = String::new();
     let _ = std::io::stdin().read_line(&mut s);
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
 }

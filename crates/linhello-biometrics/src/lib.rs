@@ -339,9 +339,16 @@ fn framing_guidance(input: FramingInput) -> linhello_common::ipc::PositionReport
     const MIN_FRAC: f32 = linhello_liveness::ir::MIN_FACE_FRAC; // 0.15
     const MAX_FRAC: f32 = 0.60; // beyond this the face fills the frame — too close
     const CENTER_TOL: f32 = 0.18; // allowed bbox-center offset, fraction of frame
-    const DIM_GATE: f32 = 55.0; // below this the face is too dark to enroll well
+    const DIM_GATE: f32 = 40.0; // below this the face is too dark to enroll well;
+                                // matches the light-score floor (see `light_score`)
+                                // so the gate is never stricter than the quality model.
     const BRIGHT_GATE: f32 = 230.0; // above this it's blown out
-    const BACKLIT_DELTA: f32 = 55.0; // frame brighter than face by this → backlit
+    const BACKLIT_DELTA: f32 = 55.0; // frame brighter than face by this → backlit…
+    // …but only flag it when the FACE itself is under-lit. A bright background
+    // (a window behind the user) is harmless if the face is adequately exposed —
+    // it's only a problem when it leaves the face a dark silhouette. 65 ≈ the
+    // light-score midpoint (the lerp 40→90), i.e. "at least half-decently lit".
+    const BACKLIT_FACE_FLOOR: f32 = 65.0;
 
     let FramingInput {
         face_count,
@@ -385,7 +392,10 @@ fn framing_guidance(input: FramingInput) -> linhello_common::ipc::PositionReport
     let off_y = (y1 + y2) / 2.0 - frame_h as f32 / 2.0;
     let centered =
         off_x.abs() <= CENTER_TOL * frame_w as f32 && off_y.abs() <= CENTER_TOL * frame_h as f32;
-    let lit = (DIM_GATE..=BRIGHT_GATE).contains(&face_lum) && (frame_lum - face_lum) < BACKLIT_DELTA;
+    // Backlit only counts against framing when the face is genuinely dim — a
+    // bright surround over a well-exposed face is cosmetic, not a blocker.
+    let backlit = (frame_lum - face_lum) >= BACKLIT_DELTA && face_lum < BACKLIT_FACE_FLOOR;
+    let lit = (DIM_GATE..=BRIGHT_GATE).contains(&face_lum) && !backlit;
 
     // IR-only (low-light) path: the IR camera sees the face but RGB is too dark
     // to embed. Guide the user to add light rather than auto-capturing.
@@ -434,10 +444,12 @@ fn framing_guidance(input: FramingInput) -> linhello_common::ipc::PositionReport
     } else if yaw < -MAX_ANGLE_DEG {
         "Turn your head slightly right"
     } else if pitch > MAX_ANGLE_DEG {
-        "Lower your chin a little"
-    } else if pitch < -MAX_ANGLE_DEG {
+        // Positive pitch = chin tucked DOWN (looking down) → raise it to frontal.
         "Lift your chin a little"
-    } else if frame_lum - face_lum >= BACKLIT_DELTA {
+    } else if pitch < -MAX_ANGLE_DEG {
+        // Negative pitch = chin UP (looking up) → bring it down to frontal.
+        "Lower your chin a little"
+    } else if backlit {
         "Reduce backlighting — face a light source"
     } else if face_lum < DIM_GATE {
         "More light on your face"
@@ -589,10 +601,12 @@ mod position_tests {
 
     #[test]
     fn pitch_chin_directions() {
+        // +pitch = chin DOWN (looking down) → corrective advice is to LIFT it.
         let down = framing_guidance(fi(1, good(centered_bbox(0.30), 0.0, 30.0)));
-        assert_eq!(down.guidance, "Lower your chin a little");
+        assert_eq!(down.guidance, "Lift your chin a little");
+        // -pitch = chin UP (looking up) → corrective advice is to LOWER it.
         let up = framing_guidance(fi(1, good(centered_bbox(0.30), 0.0, -30.0)));
-        assert_eq!(up.guidance, "Lift your chin a little");
+        assert_eq!(up.guidance, "Lower your chin a little");
     }
 
     #[test]
@@ -619,14 +633,22 @@ mod position_tests {
 
     #[test]
     fn lighting_guidance_and_gate() {
-        // Too dim: blocks well_framed even with perfect framing.
-        let dim = Some((centered_bbox(0.30), 0.0, 0.0, 40.0, 40.0, 20.0));
+        // Too dim: blocks well_framed even with perfect framing. (Use a luma
+        // clearly below DIM_GATE so the test tracks the gate, not the boundary.)
+        let dim = Some((centered_bbox(0.30), 0.0, 0.0, 30.0, 30.0, 20.0));
         let r = framing_guidance(fi(1, dim));
         assert_eq!(r.guidance, "More light on your face");
         assert!(!r.well_framed);
-        // Backlit: bright surround, darker face.
-        let backlit = Some((centered_bbox(0.30), 0.0, 0.0, 120.0, 200.0, 20.0));
+        // Backlit: bright surround over a genuinely DIM face (only then is it a
+        // problem — a bright background over a well-exposed face is cosmetic).
+        let backlit = Some((centered_bbox(0.30), 0.0, 0.0, 50.0, 130.0, 20.0));
         assert!(framing_guidance(fi(1, backlit)).guidance.contains("backlight"));
+        // Bright surround but a well-exposed face must NOT be flagged backlit.
+        let bright_bg_ok = Some((centered_bbox(0.30), 0.0, 0.0, 120.0, 200.0, 20.0));
+        assert_eq!(
+            framing_guidance(fi(1, bright_bg_ok)).guidance,
+            "Hold still — ready to capture"
+        );
         // Blown out.
         let bright = Some((centered_bbox(0.30), 0.0, 0.0, 240.0, 240.0, 20.0));
         assert!(framing_guidance(fi(1, bright)).guidance.contains("Too bright"));
