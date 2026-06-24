@@ -141,6 +141,11 @@ pub enum Request {
     /// Set (or clear, with an empty name) a profile's friendly display name.
     /// Root-only.
     SetProfileName { user: String, name: String },
+    /// Permanently delete an enrolled profile: erase its face template, sealed
+    /// password/recovery envelopes, camera binding, IR liveness calibration, and
+    /// display name (the whole `/etc/linhello/<user>/` dir). Does NOT touch PAM
+    /// wiring or the login password itself. Root-only.
+    DeleteProfile { user: String },
     /// Wrap the user's current template key under a dedicated recovery
     /// passphrase (separate from the login password) and persist the recovery
     /// envelope. Requires the template key to be unsealable now. Root-only.
@@ -362,6 +367,9 @@ pub enum Response {
         candidates: Vec<IdentifyCandidate>,
     },
     ProfileNameSet,
+    /// A profile was deleted; `samples` is how many face samples it held (for the
+    /// confirmation message). Result of [`Request::DeleteProfile`].
+    ProfileDeleted { user: String, samples: usize },
     /// A recovery passphrase was set (the template key was wrapped under it).
     RecoverySaved,
     /// The template key was restored from the recovery passphrase and re-sealed.

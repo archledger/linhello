@@ -313,6 +313,17 @@ async fn dispatch(req: Request, peer_uid: Option<u32>) -> Response {
                 .await
                 .unwrap_or_else(err)
         }
+        Request::DeleteProfile { user } => {
+            if !is_root(peer_uid) {
+                return forbidden("delete_profile");
+            }
+            if let Some(r) = validate_user(&user) {
+                return r;
+            }
+            task::spawn_blocking(move || do_delete_profile(&user))
+                .await
+                .unwrap_or_else(err)
+        }
         Request::SaveRecovery { user, passphrase } => {
             if !is_root(peer_uid) {
                 return forbidden("save_recovery");
@@ -1022,6 +1033,46 @@ fn do_set_profile_name(user: &str, name: &str) -> Response {
         Err(e) => Response::Error {
             message: format!("set profile name: {e}"),
         },
+    }
+}
+
+/// Drop a user's cached template key (after their profile is deleted) so a later
+/// re-enrollment derives/seals a fresh key instead of reusing the stale one.
+fn evict_template_key(user: &str) {
+    let mut map = get_template_key_cache().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(user);
+}
+
+/// Permanently delete an enrolled profile by removing its whole per-user
+/// directory under `CONFIG_ROOT` (face template, sealed password/recovery
+/// envelopes, camera binding, IR calibration, display name). Does NOT touch PAM
+/// wiring or the login password — face auth simply stops working for this user
+/// until they re-enroll.
+fn do_delete_profile(user: &str) -> Response {
+    // Confirm it's a real enrolled profile (a CONFIG_ROOT subdir holding a
+    // template). With `user` already validated (no '/', '..', etc.), this scopes
+    // the removal to that profile's own directory — never a shared file (models,
+    // cameras.conf, selinux/) or another profile.
+    if !enrolled_profiles().iter().any(|u| u == user) {
+        return Response::Error {
+            message: format!("no enrolled profile '{user}'"),
+        };
+    }
+    let samples = profile_sample_count(user);
+    let dir = std::path::PathBuf::from(linhello_common::CONFIG_ROOT).join(user);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return Response::Error {
+            message: format!("delete profile '{user}': {e}"),
+        };
+    }
+    evict_template_key(user);
+    tracing::info!(
+        "DeleteProfile: erased profile '{user}' ({samples} samples) at {}",
+        dir.display()
+    );
+    Response::ProfileDeleted {
+        user: user.to_string(),
+        samples,
     }
 }
 

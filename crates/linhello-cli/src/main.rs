@@ -45,6 +45,17 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
+    /// Permanently delete an enrolled profile: erase its face template, sealed
+    /// password/recovery envelopes, camera binding, and IR calibration. Your
+    /// login wiring and password are untouched — face auth just stops for this
+    /// profile until you re-enroll. Root-only. Prompts to confirm unless `--yes`.
+    ForgetProfile {
+        #[arg(long)]
+        user: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove LinuxHello from this host: unwire PAM (password login stays), stop
     /// + disable the daemon, delete the programs/PAM module/unit/hook, and erase
     /// enrolled faces + config in /etc/linhello. The big face models are removed
@@ -836,6 +847,42 @@ fn identify_cmd() -> Result<()> {
 }
 
 /// `linhello profile-name --user U --name N` — set/clear a friendly name.
+fn forget_profile_cmd(user: &str, yes: bool) -> Result<()> {
+    use std::io::Write;
+    // Look it up first so we can show what's being erased and reject a typo'd name.
+    let samples = match send(Request::ListProfiles)? {
+        Response::Profiles { profiles } => {
+            profiles.into_iter().find(|p| p.user == user).map(|p| p.samples)
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let Some(samples) = samples else {
+        bail!("no enrolled profile '{user}' — run `linhello profiles` to list them");
+    };
+    if !yes {
+        print!(
+            "Permanently delete profile '{user}' ({samples} face sample(s) + its TPM \
+             envelopes)? This cannot be undone. [y/N] "
+        );
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled — nothing deleted.");
+            return Ok(());
+        }
+    }
+    match send(Request::DeleteProfile { user: user.to_string() })? {
+        Response::ProfileDeleted { user, samples } => {
+            println!("deleted profile '{user}' ({samples} face sample(s) erased).");
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
 fn profile_name_cmd(user: &str, name: &str) -> Result<()> {
     match send(Request::SetProfileName {
         user: user.to_string(),
@@ -1379,6 +1426,7 @@ fn main() -> Result<()> {
         Cmd::Profiles => profiles_cmd()?,
         Cmd::Identify => identify_cmd()?,
         Cmd::ProfileName { user, name } => profile_name_cmd(&user, &name)?,
+        Cmd::ForgetProfile { user, yes } => forget_profile_cmd(&user, yes)?,
         Cmd::Status => match send(Request::Status)? {
             Response::Status {
                 security_level,
