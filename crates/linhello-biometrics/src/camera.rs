@@ -340,7 +340,20 @@ fn capture_with_timeout<T: Send + 'static>(
     }
 }
 
+/// Serialises all camera I/O across the process. KDE's lock screen runs TWO PAM
+/// stacks at once (`kde` + `kde-fingerprint`), so two Verify operations would
+/// otherwise open and STREAMON the same V4L node simultaneously — the loser gets
+/// EBUSY ("Device or resource busy") and the unlock fails (seen post-resume,
+/// where slower warm-up makes the captures overlap). Serialising also stops a
+/// Windows-Hello module's shared-USB IR and RGB nodes from contending (a
+/// persistent IR stream has been observed to starve RGB capture). The lock is
+/// held only for one *bounded* capture, so the longest a waiter blocks is a
+/// single capture deadline; an abandoned (timed-out) worker holds the device,
+/// not this lock, so it can never deadlock the PAM stack.
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     capture_with_timeout("IR", path.to_string(), IR_CAPTURE_TIMEOUT, capture_ir_from_blocking)
 }
 
@@ -414,6 +427,7 @@ fn decodable(fourcc: &FourCC) -> bool {
 }
 
 pub fn capture_from(path: &str) -> Result<Frame> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     capture_with_timeout("RGB", path.to_string(), CAPTURE_TIMEOUT, capture_from_blocking)
 }
 
