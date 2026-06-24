@@ -475,6 +475,85 @@ pub fn capture_from(path: &str) -> Result<Frame> {
     capture_with_timeout("RGB", path.to_string(), CAPTURE_TIMEOUT, capture_from_blocking)
 }
 
+/// Frames grabbed for the temporal (eye-motion) liveness probe — enough to catch
+/// natural eye micro-motion (microsaccades / a blink) within a fraction of a second.
+pub const TEMPORAL_BURST: usize = 7;
+
+/// Capture a short burst of consecutive RGB frames from a SINGLE open stream (one
+/// open + AE warmup, then N grabs) — far cheaper than N separate opens, and the
+/// frames land close enough in time for the temporal liveness check to see eye
+/// micro-motion. Serialised + privacy-checked + deadline-bounded like `capture_from`.
+pub fn capture_burst(path: &str, n: usize) -> Result<Vec<Frame>> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = path.to_string();
+    match run_with_deadline(CAPTURE_TIMEOUT, move || capture_burst_blocking(&p, n)) {
+        Some(r) => r,
+        None => Err(bio_err(format!(
+            "RGB burst from {path} produced no frames within {}s",
+            CAPTURE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+fn capture_burst_blocking(path: &str, n: usize) -> Result<Vec<Frame>> {
+    let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
+    let mut last_err: Option<crate::LinuxHelloError> = None;
+    for pref in RGB_FOURCC_PREFS {
+        let mut fmt = match dev.format() {
+            Ok(f) => f,
+            Err(e) => return Err(bio_err(format!("get format: {e}"))),
+        };
+        fmt.width = CAPTURE_WIDTH;
+        fmt.height = CAPTURE_HEIGHT;
+        fmt.fourcc = FourCC::new(pref);
+        let fmt = match dev.set_format(&fmt) {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = Some(bio_err(format!("set format {:?}: {e}", fourcc_str(pref))));
+                continue;
+            }
+        };
+        if !decodable(&fmt.fourcc) {
+            last_err = Some(bio_err(format!(
+                "driver chose unsupported pixel format {:?}",
+                fourcc_str(&fmt.fourcc.repr)
+            )));
+            continue;
+        }
+        let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+            .map_err(|e| bio_err(format!("stream init: {e}")))?;
+        for _ in 0..AE_WARMUP_RGB {
+            stream.next().map_err(|e| bio_err(format!("warmup: {e}")))?;
+        }
+        let mut out: Vec<Frame> = Vec::with_capacity(n);
+        let max_attempts = n * 3 + 4;
+        let mut attempts = 0;
+        while out.len() < n && attempts < max_attempts {
+            attempts += 1;
+            let (buf, _meta) = match stream.next() {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(bio_err(format!("stream next: {e}")));
+                    break;
+                }
+            };
+            if &fmt.fourcc.repr == b"MJPG" && !is_complete_jpeg(buf) {
+                continue;
+            }
+            if let Ok(frame) = decode(&fmt.fourcc, buf, fmt.width, fmt.height) {
+                out.push(frame);
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    Err(last_err.unwrap_or_else(|| bio_err("no usable pixel format (camera offers neither MJPG nor YUYV)")))
+}
+
 fn capture_from_blocking(path: &str) -> Result<Frame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
     if privacy_engaged(&dev) == Some(true) {

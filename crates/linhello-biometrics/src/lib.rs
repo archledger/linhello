@@ -43,30 +43,54 @@ pub struct AuthResult {
     pub score: f32,
 }
 
-/// Capture one frame, detect the primary face, and run the liveness gate.
-/// Returns the frame + face on success; errors (with a human-readable reason)
+/// Capture a short RGB burst (one open, several frames — see `camera::capture_burst`),
+/// detect a face in each, and return the largest-face frame for recognition plus
+/// the temporal eye-motion score across the sequence (`None` if <2 frames had a
+/// face). Shared by the auth path and the `linhello test` liveness diagnostic.
+///
+/// RGB+detect runs FIRST, then IR (never concurrently): on shared-USB Windows-Hello
+/// modules a simultaneous IR grab starves the RGB stream (observed ~17s latency on
+/// the N930W). The lost overlap is a fair price for reliable capture there.
+fn capture_burst_detect() -> Result<(String, camera::Frame, detect::Face, Option<f32>)> {
+    let path = camera::rgb_device();
+    // Only pay for a multi-frame burst when the (experimental, opt-in) temporal
+    // gate is enabled; otherwise a single frame keeps the default path cheap and
+    // its behaviour unchanged. A 1-frame sequence yields `None` motion (no gate).
+    let n = if linhello_liveness::temporal_gate_enabled() {
+        camera::TEMPORAL_BURST
+    } else {
+        1
+    };
+    let frames = camera::capture_burst(&path, n)?;
+    let detector = detect::Detector::cached()?;
+    let mut eye_seq: Vec<linhello_liveness::temporal::EyeFrame> = Vec::new();
+    let mut best: Option<(usize, detect::Face, f32)> = None;
+    for (i, f) in frames.iter().enumerate() {
+        if let Some(face) = detector.detect(f).ok().and_then(|v| v.into_iter().next()) {
+            eye_seq.push(linhello_liveness::temporal::eye_frame(f, &face.landmarks));
+            let area =
+                (face.bbox[2] - face.bbox[0]).max(0.0) * (face.bbox[3] - face.bbox[1]).max(0.0);
+            if best.as_ref().map(|(_, _, a)| area > *a).unwrap_or(true) {
+                best = Some((i, face, area));
+            }
+        }
+    }
+    let (bi, face, _) = best.ok_or_else(|| bio_err("no face detected"))?;
+    let temporal_score = linhello_liveness::temporal::motion_score(&eye_seq);
+    Ok((path, frames[bi].clone(), face, temporal_score))
+}
+
+/// Capture, detect the primary face, and run the liveness gate. Returns the
+/// frame, face, and signals on success; errors (with a human-readable reason)
 /// when no face is visible or liveness rejects.
 fn capture_detect_live() -> Result<(camera::Frame, detect::Face, linhello_liveness::LivenessSignals)> {
-    // Capture RGB + detect FIRST, then IR — never concurrently. On shared-USB
-    // Windows-Hello modules (e.g. NexiGo N930W: RGB + IR are one USB device) a
-    // simultaneous IR grab starves the RGB stream, producing slow/torn frames
-    // and multi-second auth latency (observed ~17s on the N930W). The enrollment
-    // position guide (`capture_position_sample`) serialises for the same reason;
-    // the auth path must too. The lost overlap (~500ms IR warmup) is a fair price
-    // on dedicated-bus cameras for reliable, fast capture on shared-USB ones.
-    let frame = camera::capture_frame()?;
-    let detector = detect::Detector::cached()?;
-    let faces = detector.detect(&frame)?;
-    let face = faces
-        .into_iter()
-        .next()
-        .ok_or_else(|| bio_err("no face detected"))?;
+    let (path, frame, face, temporal_score) = capture_burst_detect()?;
 
     let ir = camera::capture_ir_frame().ok().flatten();
 
     let evaluator = linhello_liveness::LivenessEvaluator::cached()?;
     let report = evaluator.evaluate(
-        &frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref(),
+        &frame, face.bbox, &face.landmarks, &path, ir.as_ref(), temporal_score,
     )?;
     if matches!(report.decision, linhello_liveness::LivenessDecision::Spoof) {
         return Err(bio_err(format!(
@@ -601,17 +625,10 @@ mod position_tests {
 /// runs detection + liveness, and returns the raw report. Never touches
 /// enrollment data or embeddings.
 pub fn run_liveness_test() -> Result<linhello_liveness::LivenessReport> {
-    let ir_handle = std::thread::spawn(|| camera::capture_ir_frame().ok().flatten());
-    let frame = camera::capture_frame()?;
-    let detector = detect::Detector::cached()?;
-    let faces = detector.detect(&frame)?;
-    let face = faces
-        .into_iter()
-        .next()
-        .ok_or_else(|| bio_err("no face detected"))?;
-    let ir = ir_handle.join().unwrap_or(None);
+    let (path, frame, face, temporal_score) = capture_burst_detect()?;
+    let ir = camera::capture_ir_frame().ok().flatten();
     let evaluator = linhello_liveness::LivenessEvaluator::cached()?;
-    evaluator.evaluate(&frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref())
+    evaluator.evaluate(&frame, face.bbox, &face.landmarks, &path, ir.as_ref(), temporal_score)
 }
 
 // NOTE: the former `authenticate_user` helper (which matched against the
