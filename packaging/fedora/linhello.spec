@@ -181,6 +181,16 @@ fi
   that try-restarts linhellod on resume to re-open the camera and re-resolve its
   cgroup device access (the camera-refresh udev rule only fires on a re-enumerate,
   which a resume often skips).
+- Fix face unlock failing with "Device or resource busy": the KDE lock screen runs
+  two PAM stacks at once (`kde` + `kde-fingerprint`), so two captures opened the
+  camera simultaneously and the loser got EBUSY. Camera I/O is now serialised
+  process-wide so concurrent verifies queue instead of colliding.
+- Detect a hardware camera privacy switch (`V4L2_CID_PRIVACY`). When the camera
+  is blocked by the privacy key/shutter the sensor returns blank frames, which
+  previously surfaced as a baffling "no face detected" that no reboot could fix.
+  Capture now fails fast with a clear "camera privacy switch is ON — toggle the
+  camera-privacy key (e.g. Fn+F10)" message, and `doctor` flags it on the RGB/IR
+  rows (plus a hint when a kill-switch/eShutter removes the camera entirely).
 
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.5-1
 - `linhello update`: build the Arch native package as an unprivileged user.

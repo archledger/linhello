@@ -111,6 +111,45 @@ pub struct CameraInfo {
     pub fourccs: Vec<String>,
     /// `false` for virtual cameras (v4l2loopback/OBS) — never auto-selected.
     pub trusted: bool,
+    /// Hardware privacy switch state from `V4L2_CID_PRIVACY`: `Some(true)` when the
+    /// camera-privacy key/shutter is engaged (sensor blocked), `Some(false)` when
+    /// the control exists and is off, `None` when the device has no such control.
+    pub privacy: Option<bool>,
+}
+
+/// `V4L2_CID_PRIVACY` (UVC `CT_PRIVACY_CONTROL`): a read-only bool that a camera
+/// with a hardware privacy switch/shutter exposes to report it is engaged. On
+/// this class of ASUS laptop the camera-privacy key flips it to 1 on BOTH the RGB
+/// and IR nodes at once; the USB device stays present and streaming still
+/// succeeds, but every frame is blank — which the pipeline would otherwise report
+/// as a baffling "no face detected" that a reboot can't fix (a hardware switch
+/// survives reboots). We read it and surface an explicit, actionable error.
+const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
+
+/// Read `V4L2_CID_PRIVACY` from an open device. `Some(true)` if the hardware
+/// privacy switch is engaged, `Some(false)` if the control exists and is off,
+/// `None` if the device has no such control (most external webcams don't).
+fn privacy_engaged(dev: &Device) -> Option<bool> {
+    match dev.control(V4L2_CID_PRIVACY).ok()?.value {
+        v4l::control::Value::Boolean(b) => Some(b),
+        v4l::control::Value::Integer(i) => Some(i != 0),
+        _ => None,
+    }
+}
+
+/// Read the hardware privacy-switch state for the camera at `path` (opens the
+/// device). `Some(true)` = blocked, `Some(false)` = present and off, `None` = no
+/// such control / can't open. Exposed for diagnostics (`doctor`, probes).
+pub fn privacy_state(path: &str) -> Option<bool> {
+    Device::with_path(path).ok().and_then(|d| privacy_engaged(&d))
+}
+
+/// The error returned when capture is attempted against a privacy-blocked camera.
+fn privacy_blocked_err(path: &str) -> crate::LinuxHelloError {
+    bio_err(format!(
+        "camera privacy switch is ON — the sensor is blocked in hardware ({path}); \
+         toggle the camera-privacy key (e.g. Fn+F10) to use face unlock"
+    ))
 }
 
 /// Hard deadline for one full enumeration pass. Enumeration opens every
@@ -149,7 +188,7 @@ fn enumerate_blocking() -> Vec<CameraInfo> {
         .into_iter()
         .filter_map(|node| {
             let path = node.path().to_str()?.to_string();
-            let (kind, fourccs) = classify_device(&path);
+            let (kind, fourccs, privacy) = classify_device(&path);
             let trusted = linhello_liveness::device::validate_camera_device(&path).score > 0.0;
             Some(CameraInfo {
                 name: node.name(),
@@ -157,23 +196,25 @@ fn enumerate_blocking() -> Vec<CameraInfo> {
                 kind,
                 fourccs,
                 trusted,
+                privacy,
             })
         })
         .collect()
 }
 
-fn classify_device(path: &str) -> (CameraKind, Vec<String>) {
+fn classify_device(path: &str) -> (CameraKind, Vec<String>, Option<bool>) {
     use v4l::video::Capture;
     let dev = match Device::with_path(path) {
         Ok(d) => d,
-        Err(_) => return (CameraKind::Unknown, Vec::new()),
+        Err(_) => return (CameraKind::Unknown, Vec::new(), None),
     };
+    let privacy = privacy_engaged(&dev);
     let formats = match dev.enum_formats() {
         Ok(f) => f,
-        Err(_) => return (CameraKind::Unknown, Vec::new()),
+        Err(_) => return (CameraKind::Unknown, Vec::new(), privacy),
     };
     let fourccs: Vec<String> = formats.iter().map(|d| fourcc_str(&d.fourcc.repr)).collect();
-    (classify_fourccs(&fourccs), fourccs)
+    (classify_fourccs(&fourccs), fourccs, privacy)
 }
 
 fn fourcc_str(repr: &[u8; 4]) -> String {
@@ -359,6 +400,9 @@ pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
 
 fn capture_ir_from_blocking(path: &str) -> Result<IrFrame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
 
     let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
     fmt.width = IR_CAPTURE_WIDTH;
@@ -433,6 +477,9 @@ pub fn capture_from(path: &str) -> Result<Frame> {
 
 fn capture_from_blocking(path: &str) -> Result<Frame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
 
     let mut last_err: Option<crate::LinuxHelloError> = None;
     for pref in RGB_FOURCC_PREFS {
