@@ -528,6 +528,7 @@ fn capture_burst_blocking(path: &str, n: usize) -> Result<Vec<Frame>> {
         for _ in 0..AE_WARMUP_RGB {
             stream.next().map_err(|e| bio_err(format!("warmup: {e}")))?;
         }
+        auto_brighten_rgb(&dev, &mut stream, &fmt.fourcc, fmt.width, fmt.height);
         let mut out: Vec<Frame> = Vec::with_capacity(n);
         let max_attempts = n * 3 + 4;
         let mut attempts = 0;
@@ -595,6 +596,7 @@ fn capture_from_blocking(path: &str) -> Result<Frame> {
                 .next()
                 .map_err(|e| bio_err(format!("warmup: {e}")))?;
         }
+        auto_brighten_rgb(&dev, &mut stream, &fmt.fourcc, fmt.width, fmt.height);
         // Some UVC modules (e.g. the NexiGo N930W) intermittently deliver torn /
         // incomplete MJPG frames — a single grab then fails the whole capture
         // ("illegal start bytes", truncated DHT). Grab a few and return the first
@@ -635,6 +637,145 @@ fn is_complete_jpeg(buf: &[u8]) -> bool {
         && buf[1] == 0xD8
         && buf[buf.len() - 2] == 0xFF
         && buf[buf.len() - 1] == 0xD9
+}
+
+/// `V4L2_CID_BRIGHTNESS` (UVC PU_BRIGHTNESS): a per-camera digital luma offset.
+const V4L2_CID_BRIGHTNESS: u32 = 0x0098_0900;
+/// Target centre-region mean luma for the RGB face. Mid-scale (≈ half of 8-bit) —
+/// the image-normalization midpoint. Because this mean spans the whole face
+/// region (hair/brows/shadows included), the *skin* lands brighter, in the
+/// 160–205 band the recognition literature calls optimal, while the brightest
+/// skin stays clear of the ISO over-exposure clip (>246). Pairs with `DIM_GATE`
+/// (the too-dark floor) in `linhello-biometrics`'s framing logic.
+const RGB_TARGET_LUMA: f32 = 128.0;
+/// No-touch band around the target, so steady-state captures don't chase sensor
+/// noise or oscillate against auto-exposure.
+const RGB_LUMA_LO: f32 = 110.0;
+const RGB_LUMA_HI: f32 = 150.0;
+/// A small probe step (in control units) used to learn the brightness control's
+/// luma sensitivity. From a typical mid-range default it stays in range; the
+/// driver clamps it otherwise and we read back the value actually applied.
+const BRIGHTNESS_PROBE: i64 = 16;
+
+/// After AE warmup, nudge the camera's BRIGHTNESS control so the centre-region
+/// mean luma lands near mid-scale, correcting the systematic underexposure that
+/// otherwise feeds the recognizer a too-dark face (≈44 vs a ≈128 target on a
+/// typical laptop UVC module).
+///
+/// Camera-agnostic by *measurement*, not by querying the control's metadata:
+/// `v4l`'s `query_controls()` panics on cameras that expose control types it
+/// can't map (e.g. region-of-interest rect/bitmask controls), so we never
+/// enumerate. Instead we read the one control we touch, probe its luma response
+/// with a single step, then solve for the value that hits the target — letting
+/// the driver clamp out-of-range writes. Best-effort: quietly no-ops if the
+/// control is absent/unwritable or `LINHELLO_AUTO_BRIGHTNESS=0`.
+fn auto_brighten_rgb(dev: &Device, stream: &mut Stream<'_>, fourcc: &FourCC, w: u32, h: u32) {
+    if matches!(
+        std::env::var("LINHELLO_AUTO_BRIGHTNESS").ok().as_deref(),
+        Some("0") | Some("off")
+    ) {
+        return;
+    }
+    let read = |dev: &Device| -> Option<i64> {
+        match dev.control(V4L2_CID_BRIGHTNESS).map(|c| c.value) {
+            Ok(v4l::control::Value::Integer(v)) => Some(v),
+            _ => None,
+        }
+    };
+    let set = |dev: &Device, v: i64| -> bool {
+        dev.set_control(v4l::control::Control {
+            id: V4L2_CID_BRIGHTNESS,
+            value: v4l::control::Value::Integer(v),
+        })
+        .is_ok()
+    };
+    let flush = |stream: &mut Stream<'_>| {
+        // A control change takes a couple of frames to flush through the queue.
+        for _ in 0..2 {
+            let _ = stream.next();
+        }
+    };
+
+    let in_band = |l: f32| (RGB_LUMA_LO..=RGB_LUMA_HI).contains(&l);
+
+    // Where are we now?
+    let Some(l0) = grab_luma(stream, fourcc, w, h) else {
+        return;
+    };
+    if in_band(l0) {
+        return; // already mid-scale (steady state) — nothing to do
+    }
+    let Some(b0) = read(dev) else {
+        return; // no writable brightness control on this camera
+    };
+
+    // Probe luma response with one step in the direction we need to move.
+    let probe = if l0 < RGB_TARGET_LUMA {
+        BRIGHTNESS_PROBE
+    } else {
+        -BRIGHTNESS_PROBE
+    };
+    if !set(dev, b0 + probe) {
+        return;
+    }
+    flush(stream);
+    let b1 = read(dev).unwrap_or(b0); // actual value (driver may have clamped)
+    let Some(l1) = grab_luma(stream, fourcc, w, h) else {
+        return;
+    };
+    if in_band(l1) {
+        return;
+    }
+    let dv = (b1 - b0) as f32;
+    let dl = l1 - l0;
+    if dv.abs() < 0.5 || dl.abs() < 0.5 {
+        return; // control couldn't move, or has no luma effect
+    }
+    let sensitivity = dl / dv; // luma per control unit
+    // Solve for the value that lands on target from the (b1, l1) point.
+    let target = (b1 as f32 + (RGB_TARGET_LUMA - l1) / sensitivity).round() as i64;
+    if target != b1 {
+        let _ = set(dev, target); // driver clamps to its own range
+        flush(stream);
+    }
+}
+
+/// Grab the next decodable frame and return its centre-region mean luma, or
+/// `None` if nothing decodes within a few attempts (torn MJPG, etc.).
+fn grab_luma(stream: &mut Stream<'_>, fourcc: &FourCC, w: u32, h: u32) -> Option<f32> {
+    for _ in 0..RGB_DECODE_ATTEMPTS {
+        let (buf, _meta) = stream.next().ok()?;
+        if &fourcc.repr == b"MJPG" && !is_complete_jpeg(buf) {
+            continue;
+        }
+        if let Ok(frame) = decode(fourcc, buf, w, h) {
+            return Some(center_mean_luma(&frame));
+        }
+    }
+    None
+}
+
+/// Mean Rec.601 luma over the central 60%×60% of the frame — a cheap stand-in for
+/// the face's brightness (the face sits near centre while framing) that avoids
+/// running face detection inside the capture loop.
+fn center_mean_luma(frame: &Frame) -> f32 {
+    let (fw, fh) = (frame.width(), frame.height());
+    let (x0, x1) = (fw / 5, (fw * 4) / 5);
+    let (y0, y1) = (fh / 5, (fh * 4) / 5);
+    let mut sum = 0.0f64;
+    let mut n = 0u64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = frame.get_pixel(x, y).0;
+            sum += 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (sum / n as f64) as f32
+    }
 }
 
 fn decode(fourcc: &FourCC, buf: &[u8], w: u32, h: u32) -> Result<Frame> {
