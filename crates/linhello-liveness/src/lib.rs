@@ -320,11 +320,27 @@ impl LivenessEvaluator {
             .map_err(|e| LinuxHelloError::Biometrics(e.clone()))
     }
 
+    /// Median anti-spoof spoof-probability across the capture burst, or `None`
+    /// when no model is configured / no frames were given. The caller passes the
+    /// result to [`evaluate`](Self::evaluate). Denoises the one-shot reading — see
+    /// [`antispoof::AntiSpoofModel::predict_median`].
+    pub fn antispoof_median(
+        &self,
+        frames: &[(&RgbImage, [f32; 4])],
+    ) -> Result<Option<f32>> {
+        match &self.antispoof {
+            Some(m) if !frames.is_empty() => Ok(Some(m.predict_median(frames)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Evaluate liveness for `frame` with a detected face at `bbox`
     /// (x1, y1, x2, y2 in frame pixels). `camera_path` is the device that
     /// produced the frame (e.g. `/dev/video0`). `ir` is an optional
     /// grayscale frame from the companion NIR sensor; when present we
-    /// populate the `ir_*` fields of `LivenessSignals`.
+    /// populate the `ir_*` fields of `LivenessSignals`. `spoof_prob` and
+    /// `temporal_score` are precomputed by the caller across the capture burst.
+    #[allow(clippy::too_many_arguments)] // cohesive per-capture inputs; a struct would just move the noise
     pub fn evaluate(
         &self,
         frame: &RgbImage,
@@ -332,6 +348,7 @@ impl LivenessEvaluator {
         landmarks: &[[f32; 2]; 5],
         camera_path: &str,
         ir: Option<&image::GrayImage>,
+        spoof_prob: Option<f32>,
         temporal_score: Option<f32>,
     ) -> Result<LivenessReport> {
         let mut signals = LivenessSignals::empty();
@@ -438,17 +455,20 @@ impl LivenessEvaluator {
             }
         }
 
-        // ML check when available.
-        if let Some(m) = &self.antispoof {
-            let spoof_prob = m.predict(frame, bbox)?;
-            signals.spoof_prob = Some(spoof_prob);
-            signals.ml_score = Some(1.0 - spoof_prob);
-
-            if spoof_prob >= self.config.spoof_threshold {
+        // ML anti-spoof: the MEDIAN spoof probability across the capture burst,
+        // computed by the caller (see `antispoof_median` / `AntiSpoofModel::
+        // predict_median`). `None` when no model is configured. Aggregating across
+        // frames denoises MiniFASNet's jittery one-shot reading so a single bad
+        // frame can't false-reject a live user, while a real photo/screen (spoofy
+        // on every frame) still rejects.
+        if let Some(p) = spoof_prob {
+            signals.spoof_prob = Some(p);
+            signals.ml_score = Some(1.0 - p);
+            if p >= self.config.spoof_threshold {
                 return Ok(LivenessReport {
                     decision: LivenessDecision::Spoof,
                     reason: Some(format!(
-                        "anti-spoof rejected (spoof_prob={spoof_prob:.3} ≥ {:.3})",
+                        "anti-spoof rejected (median spoof_prob={p:.3} ≥ {:.3})",
                         self.config.spoof_threshold
                     )),
                     signals,
