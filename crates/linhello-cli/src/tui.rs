@@ -53,6 +53,17 @@ fn wrapped_rows(w: u16, inner: u16) -> u16 {
     }
 }
 
+/// Clip `s` to at most `cap` display columns, appending `…` when truncated, so a
+/// one-line widget (the footer status) never spills past its border.
+fn truncate_ellipsis(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(cap.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// A rounded, hairline-bordered block — the base for every framed surface.
 fn surface() -> Block<'static> {
     Block::bordered()
@@ -377,10 +388,17 @@ impl App {
     fn log_activity(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.status = msg.clone();
+        self.push_activity(msg);
+    }
+
+    /// Append to the scrollable Activity panel WITHOUT mirroring into the
+    /// one-line footer status (which clips long text against the border). Use for
+    /// detailed/long messages that belong in the Activity panel, not the footer.
+    fn push_activity(&mut self, msg: impl Into<String>) {
         // A new action snaps the log back to the newest line, so whatever just
         // happened is always visible (the user can Shift+↑ to review history).
         self.activity_scroll_up = 0;
-        self.activity.push(msg);
+        self.activity.push(msg.into());
         if self.activity.len() > ACTIVITY_MAX {
             let drop = self.activity.len() - ACTIVITY_MAX;
             self.activity.drain(0..drop);
@@ -960,11 +978,14 @@ impl App {
             // Delete the highlighted profile (asks y/N — see delete_confirm_key).
             KeyCode::Char('d') => {
                 if let Some(p) = self.profiles.get(self.profile_cursor) {
-                    self.delete_confirm = Some(p.user.clone());
-                    self.status = format!(
-                        "DELETE profile '{}' ({} samples)? press y to confirm, any other key to cancel",
-                        p.user, p.samples
-                    );
+                    let (user, samples) = (p.user.clone(), p.samples);
+                    self.delete_confirm = Some(user.clone());
+                    // Full prompt goes to the scrollable Activity panel (it wraps);
+                    // the footer keeps a short, one-line hint that can't overflow.
+                    self.push_activity(format!(
+                        "delete profile '{user}' ({samples} samples)? — press y to confirm, any other key to cancel"
+                    ));
+                    self.status = "confirm delete: press y, any other key cancels".to_string();
                 }
             }
             KeyCode::Char('r') => self.refresh_profiles(),
@@ -1020,9 +1041,11 @@ impl App {
         }
         match crate::send(Request::DeleteProfile { user: user.clone() }) {
             Ok(Response::ProfileDeleted { user, samples }) => {
-                self.log_activity(format!(
+                // Full detail in the scrollable Activity panel; footer stays short.
+                self.push_activity(format!(
                     "deleted profile '{user}' ({samples} samples erased) — removed /etc/linhello/{user}/"
                 ));
+                self.status = format!("deleted profile '{user}'");
                 // If the enroll target was just deleted, fall back to the login user.
                 if self.active_profile == user {
                     self.active_profile = self.user.clone();
@@ -1713,10 +1736,18 @@ impl App {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Ok(()) if !self.status.is_empty() => Line::from(vec![
-                dim("• "),
-                Span::styled(self.status.clone(), Style::default().fg(Color::Gray)),
-            ]),
+            Ok(()) if !self.status.is_empty() => {
+                // The footer is a single fixed line — clip long status to fit
+                // cleanly (long messages belong in the scrollable Activity panel).
+                let cap = (area.width as usize).saturating_sub(8).max(8);
+                Line::from(vec![
+                    dim("• "),
+                    Span::styled(
+                        truncate_ellipsis(&self.status, cap),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])
+            }
             Ok(()) => Line::from(vec![
                 Span::styled("✓ ", Style::default().fg(Color::Green)),
                 dim("ready — press "),
