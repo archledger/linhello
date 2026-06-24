@@ -342,11 +342,19 @@ impl IrCalibration {
         let ratio_thr = ratio_ref * env_margin("LINHELLO_IR_RATIO_MARGIN", 0.8);
         let glint_thr = glint_ref * env_margin("LINHELLO_IR_GLINT_MARGIN", 0.5);
 
-        let ratio_absent = live.face_bg_ratio < ratio_thr;
-        let glint_absent = live.eye_glint < glint_thr;
-        if ratio_absent && glint_absent {
+        // A cue is only usable when the enrolled reference is positive — a zero
+        // reference (degenerate enrollment that never saw that cue) would make
+        // `live < thr` impossible and silently disable it. Reject when EVERY usable
+        // cue is absent (and at least one cue is usable); with a normal enrollment
+        // both cues are usable, so this is the same "both weak" rule as before.
+        let ratio_usable = ratio_ref > 0.0;
+        let glint_usable = glint_ref > 0.0;
+        let usable = u8::from(ratio_usable) + u8::from(glint_usable);
+        let absent = u8::from(ratio_usable && live.face_bg_ratio < ratio_thr)
+            + u8::from(glint_usable && live.eye_glint < glint_thr);
+        if usable > 0 && absent == usable {
             IrGate::Reject(format!(
-                "active-IR liveness below your enrolled profile (face/bg {:.2} < {:.2} AND eye-glint {:.0} < {:.0}) — looks like a photo or screen, not a live face",
+                "active-IR liveness below your enrolled profile (face/bg {:.2} < {:.2}, eye-glint {:.0} < {:.0}) — looks like a photo or screen, not a live face",
                 live.face_bg_ratio, ratio_thr, live.eye_glint, glint_thr
             ))
         } else {
