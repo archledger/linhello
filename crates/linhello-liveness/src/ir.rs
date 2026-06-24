@@ -87,6 +87,12 @@ pub struct IrSignals {
     /// liveness cue — see Phase 2. Advisory until calibrated on hardware.
     pub eye_glint: f32,
     pub ir_score: f32,
+    /// Depth proxy: center (nose/forehead) ÷ edge (cheeks/jaw) IR brightness in
+    /// the face region. Under the near emitter a real 3D face is center-bright
+    /// (the nose is closer + faces the source; the edges angle away), so this sits
+    /// above 1; a FLAT photo or screen is ~uniform, so ~1. A coarse stand-in for
+    /// the true depth a structured-light sensor would give (this UVC IR cam none).
+    pub depth_ratio: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +210,30 @@ pub fn evaluate(
     let (rx, ry) = eye_px(landmarks[1]);
     let eye_glint = eye_glint_at(ir, lx, ly, glint_r).min(eye_glint_at(ir, rx, ry, glint_r));
 
+    // Depth proxy: mean IR brightness of the CENTER (inner half — nose/forehead,
+    // which face the near emitter most directly on a 3D head) vs the EDGE ring
+    // (the rest of the face box — cheeks/jaw angled away). center/edge is >1 for a
+    // curved live face, ~1 for a flat photo/screen. Reuses the face-region sum/n.
+    let (cw, ch) = ((x2 - x1) / 4, (y2 - y1) / 4);
+    let (cx1, cx2, cy1, cy2) = (x1 + cw, x2 - cw, y1 + ch, y2 - ch);
+    let mut c_sum: u64 = 0;
+    let mut c_n: u64 = 0;
+    if cx2 > cx1 && cy2 > cy1 {
+        for y in cy1..=cy2 {
+            for x in cx1..=cx2 {
+                c_sum += ir.get_pixel(x, y).0[0] as u64;
+                c_n += 1;
+            }
+        }
+    }
+    let edge_n = n.saturating_sub(c_n);
+    let edge_sum = sum.saturating_sub(c_sum);
+    let depth_ratio = if c_n > 0 && edge_n > 0 && edge_sum > 0 {
+        (c_sum as f32 / c_n as f32) / (edge_sum as f32 / edge_n as f32)
+    } else {
+        1.0
+    };
+
     IrSignals {
         mean_face: mean,
         std_face: std,
@@ -212,6 +242,7 @@ pub fn evaluate(
         face_bg_ratio,
         eye_glint,
         ir_score,
+        depth_ratio,
     }
 }
 
@@ -255,9 +286,20 @@ pub struct IrObservation {
     pub face_bg_ratio: f32,
     pub eye_glint: f32,
     pub ir_score: f32,
+    /// Center÷edge IR brightness — the depth/curvature cue. A flat photo/screen
+    /// can fake `face_bg_ratio` (overall brightness) and even a glint, but NOT
+    /// this: a 3D face is center-bright (~1.3–1.4 on hardware), a flat surface is
+    /// ~uniform (~1.0). Defaults via `#[serde(default)]` so profiles enrolled
+    /// before the depth cue still load (they just lack it; the gate skips it).
+    #[serde(default = "default_depth")]
+    pub depth_ratio: f32,
     /// Face fill at capture time — recorded for context/auditing (the gate runs
     /// only past the `MIN_FACE_FRAC` framing check, so all observations are close).
     pub face_frac: f32,
+}
+
+fn default_depth() -> f32 {
+    1.0
 }
 
 impl IrObservation {
@@ -268,6 +310,7 @@ impl IrObservation {
             face_bg_ratio: s.ir_face_bg_ratio?,
             eye_glint: s.ir_eye_glint?,
             ir_score: s.ir_score?,
+            depth_ratio: s.depth_score.unwrap_or(1.0),
             face_frac: s.face_frac?,
         })
     }
@@ -294,6 +337,12 @@ pub enum IrGate {
 /// Minimum IR observations before the gate engages. Below this we stay advisory
 /// (legacy profiles, or hardware where IR rarely captured during enroll).
 pub const MIN_CALIBRATION_OBSERVATIONS: usize = 3;
+
+/// Minimum enrolled depth-ratio reference for the depth (anti-screen) cue to
+/// gate. A real 3-D face enrolls at ~1.3–1.4; below ~1.1 there's no usable depth
+/// signature (legacy profile with the default 1.0, or a genuinely flat capture),
+/// so we skip the depth cue rather than risk false-rejecting on noise.
+pub const DEPTH_MIN_REF: f32 = 1.1;
 
 fn env_margin(var: &str, default: f32) -> f32 {
     std::env::var(var)
@@ -342,20 +391,38 @@ impl IrCalibration {
         let ratio_thr = ratio_ref * env_margin("LINHELLO_IR_RATIO_MARGIN", 0.8);
         let glint_thr = glint_ref * env_margin("LINHELLO_IR_GLINT_MARGIN", 0.5);
 
-        // A cue is only usable when the enrolled reference is positive — a zero
-        // reference (degenerate enrollment that never saw that cue) would make
-        // `live < thr` impossible and silently disable it. Reject when EVERY usable
-        // cue is absent (and at least one cue is usable); with a normal enrollment
-        // both cues are usable, so this is the same "both weak" rule as before.
+        // Brightness cues (face/bg ratio + glint). A cue is usable only when its
+        // enrolled reference is positive (a zero ref — a degenerate enrollment
+        // that never saw it — would make `live < thr` impossible and silently
+        // disable it). A MATTE photo/screen is weak on both → `brightness_spoof`.
         let ratio_usable = ratio_ref > 0.0;
         let glint_usable = glint_ref > 0.0;
-        let usable = u8::from(ratio_usable) + u8::from(glint_usable);
-        let absent = u8::from(ratio_usable && live.face_bg_ratio < ratio_thr)
+        let rg_usable = u8::from(ratio_usable) + u8::from(glint_usable);
+        let rg_absent = u8::from(ratio_usable && live.face_bg_ratio < ratio_thr)
             + u8::from(glint_usable && live.eye_glint < glint_thr);
-        if usable > 0 && absent == usable {
+        let brightness_spoof = rg_usable > 0 && rg_absent == rg_usable;
+
+        // Depth/curvature cue — the anti-SCREEN defense. A glossy screen can fake
+        // overall brightness (face/bg ratio) and even a glint, but it is FLAT, so
+        // its center÷edge IR brightness (~1.0) falls below a live 3D face's (~1.3+).
+        // Gated only when the enrolled envelope shows a real 3D signature
+        // (depth_ref > DEPTH_MIN_REF) — i.e. the profile was enrolled WITH the
+        // depth cue; legacy/flat profiles skip it. Per-user threshold, margin via
+        // LINHELLO_IR_DEPTH_MARGIN.
+        let depth_ref =
+            Self::robust_low(self.observations.iter().map(|o| o.depth_ratio).collect());
+        let depth_thr = depth_ref * env_margin("LINHELLO_IR_DEPTH_MARGIN", 0.85);
+        let depth_spoof = depth_ref > DEPTH_MIN_REF && live.depth_ratio < depth_thr;
+
+        if brightness_spoof {
             IrGate::Reject(format!(
-                "active-IR liveness below your enrolled profile (face/bg {:.2} < {:.2}, eye-glint {:.0} < {:.0}) — looks like a photo or screen, not a live face",
+                "active-IR liveness below your enrolled profile (face/bg {:.2} < {:.2}, eye-glint {:.0} < {:.0}) — looks like a flat photo, not a live face",
                 live.face_bg_ratio, ratio_thr, live.eye_glint, glint_thr
+            ))
+        } else if depth_spoof {
+            IrGate::Reject(format!(
+                "no facial depth under the IR emitter (center/edge {:.2} < {:.2}) — looks like a flat photo or screen, not a 3-D face",
+                live.depth_ratio, depth_thr
             ))
         } else {
             IrGate::Pass
@@ -372,6 +439,7 @@ fn empty_signals() -> IrSignals {
         face_bg_ratio: 0.0,
         eye_glint: 0.0,
         ir_score: 0.0,
+        depth_ratio: 1.0,
     }
 }
 
@@ -388,6 +456,7 @@ mod tests {
             face_bg_ratio,
             eye_glint: 0.0,
             ir_score: 0.0,
+            depth_ratio: 1.0,
         }
     }
 
@@ -430,7 +499,39 @@ mod tests {
     }
 
     fn obs(face_bg_ratio: f32, eye_glint: f32) -> IrObservation {
-        IrObservation { face_bg_ratio, eye_glint, ir_score: 0.8, face_frac: 0.3 }
+        // depth 1.0 → below DEPTH_MIN_REF, so the depth cue stays inactive and
+        // these brightness-cue tests are unaffected.
+        IrObservation { face_bg_ratio, eye_glint, ir_score: 0.8, depth_ratio: 1.0, face_frac: 0.3 }
+    }
+
+    fn obs_d(face_bg_ratio: f32, eye_glint: f32, depth_ratio: f32) -> IrObservation {
+        IrObservation { face_bg_ratio, eye_glint, ir_score: 0.8, depth_ratio, face_frac: 0.3 }
+    }
+
+    #[test]
+    fn depth_cue_catches_a_glossy_screen_that_fakes_brightness() {
+        // Enrolled with a real 3-D depth signature (~1.35) + healthy brightness.
+        let cal = IrCalibration {
+            observations: vec![
+                obs_d(1.4, 40.0, 1.36), obs_d(1.5, 38.0, 1.40),
+                obs_d(1.6, 45.0, 1.34), obs_d(1.55, 41.0, 1.38),
+            ],
+        };
+        // Live 3-D face: depth present → pass.
+        assert_eq!(cal.gate(&obs_d(1.4, 40.0, 1.37)), IrGate::Pass);
+        // Glossy screen: FAKES face/bg (2.0, higher than live) and a glint, but is
+        // FLAT (depth ~1.0) → caught by the depth cue.
+        assert!(matches!(cal.gate(&obs_d(2.0, 30.0, 1.0)), IrGate::Reject(_)));
+    }
+
+    #[test]
+    fn depth_cue_dormant_without_a_3d_enrollment() {
+        // Legacy/flat enrollment (depth 1.0) → depth cue inactive; a flat live
+        // reading is NOT rejected on depth alone (brightness cues still apply).
+        let cal = IrCalibration {
+            observations: vec![obs(1.6, 45.0), obs(1.5, 38.0), obs(1.7, 52.0)],
+        };
+        assert_eq!(cal.gate(&obs_d(1.6, 45.0, 1.0)), IrGate::Pass);
     }
 
     fn live_cal() -> IrCalibration {

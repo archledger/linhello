@@ -426,6 +426,11 @@ impl LivenessEvaluator {
             signals.ir_highlight_frac = Some(s.highlight_frac);
             signals.ir_face_bg_ratio = Some(s.face_bg_ratio);
             signals.ir_eye_glint = Some(s.eye_glint);
+            signals.depth_score = Some(s.depth_ratio);
+            tracing::debug!(
+                "liveness: IR cues face/bg={:.2} glint={:.0} depth(center/edge)={:.2}",
+                s.face_bg_ratio, s.eye_glint, s.depth_ratio
+            );
 
             match ir::classify(&s, face_frac) {
                 ir::IrVerdict::Real => { /* IR passes; fall through to ML */ }
