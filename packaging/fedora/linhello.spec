@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.6
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,7 +169,7 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
-* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.6-1
+* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.0-1
 - Recover face auth after suspend/resume. UVC webcams commonly fail to resume
   from USB suspend, leaving the camera present but wedged — the greeter hung on
   "Looking for your face…" with no camera engaging and survived reboots until the
@@ -191,6 +191,27 @@ fi
   Capture now fails fast with a clear "camera privacy switch is ON — toggle the
   camera-privacy key (e.g. Fn+F10)" message, and `doctor` flags it on the RGB/IR
   rows (plus a hint when a kill-switch/eShutter removes the camera entirely).
+- Tell the user at the greeter/lock screen WHY face unlock didn't run (camera
+  privacy switch on, or no camera detected) instead of a silent password
+  fall-through; and auto re-engage once the camera is unblocked (the kde-fingerprint
+  retry stack re-attempts and the daemon re-reads camera state each try).
+- Stronger anti-spoofing / liveness:
+  * ML anti-spoof is now median-aggregated across a short capture burst, so a
+    single noisy frame no longer false-rejects a live user (observed spoof_prob
+    spiking to ~1.0 on one frame); a real photo/screen, spoofy on every frame,
+    still rejects. Tunable via LINHELLO_ANTISPOOF_FRAMES (1 = legacy single-frame).
+  * New enrollment-calibrated active-IR liveness gate. Enrollment records the live
+    user's own IR signature — face/background brightness ratio, corneal eye-glint,
+    and a depth/curvature cue (center-vs-edge IR brightness: a 3-D face is
+    center-bright, a flat photo/screen is uniform) — into a per-profile envelope.
+    Auth then requires the live IR to stay within it, which catches printed photos
+    AND glossy screens (the depth cue rejects a flat screen even when it fakes the
+    brightness ratio) without the absolute thresholds that false-rejected live
+    users before. Additive to the ML gate (both must pass); fail-closed; opt-in via
+    re-enrollment; escape hatch LINHELLO_IR_GATE=0. Legacy profiles are unaffected
+    until re-enrolled.
+- A doctor/`linhello test` now surfaces the median spoof score, the IR cues, and
+  the camera privacy state.
 
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.5-1
 - `linhello update`: build the Arch native package as an unprivileged user.
