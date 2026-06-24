@@ -1,3 +1,14 @@
+linhello (0.5.1-1) unstable; urgency=medium
+
+  * Profiles: create named profiles to enroll into — `linhello enroll --user NAME`
+    makes a separate profile and a new `--name "Label"` sets its display name; the
+    setup TUI Profiles screen's `a` key types a new profile name and targets it.
+  * TUI fix: the Profiles-screen delete prompt/result no longer overflow the fixed
+    footer — they go to the scrollable Activity panel, and long footer status is
+    ellipsis-clipped to one line.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Wed, 24 Jun 2026 02:00:00 -0400
+
 linhello (0.5.0-1) unstable; urgency=medium
 
   * Recover face auth after suspend/resume. UVC webcams commonly fail to resume

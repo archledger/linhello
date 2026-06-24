@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.5.0
+Version:        0.5.1
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,6 +169,16 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.1-1
+- Profiles: create named profiles to enroll into. `linhello enroll --user NAME`
+  makes a SEPARATE profile, and a new `--name "Label"` sets its friendly display
+  name in one step; in the setup TUI, the Profiles screen's `a` key now types a
+  new profile name and targets it for enrollment (Tab → Enroll captures into it).
+- TUI fix: the Profiles-screen delete prompt and result no longer overflow the
+  fixed footer (long messages clipped against the border); they now appear in the
+  scrollable Activity panel, and any long footer status is ellipsis-clipped to one
+  line.
+
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.0-1
 - Recover face auth after suspend/resume. UVC webcams commonly fail to resume
   from USB suspend, leaving the camera present but wedged — the greeter hung on
