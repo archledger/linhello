@@ -71,11 +71,13 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Update LinuxHello from GitHub: pull the latest source (managing its own
-    /// clone under /var/lib/linhello/src when this install didn't come from a
-    /// git checkout), rebuild, reinstall the programs + daemon, and re-apply
-    /// your existing login wiring. Enrolled faces, config, models, and PAM
-    /// backups are never touched. Root-only.
+    /// Update LinuxHello. On Fedora this tracks the Copr repository via dnf
+    /// (auto-enabling it if needed) — equivalent to `dnf upgrade --refresh
+    /// linhello`, so it never shadows the rpm with a side-built binary. On other
+    /// distros it pulls the latest signed-tag source (managing its own clone
+    /// under /var/lib/linhello/src when this install didn't come from a git
+    /// checkout), rebuilds, reinstalls, and re-applies your login wiring.
+    /// Enrolled faces, config, models, and PAM backups are never touched. Root-only.
     Update,
     /// First-run wizard: pick your webcam, calibrate the match threshold against
     /// your own live scores, and (optionally) enroll. Writes

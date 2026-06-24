@@ -380,12 +380,84 @@ const TRUSTED_SIGNER_FINGERPRINT: &str = "54C989C55B1FB5F26FDC55F7CC46D5CD5E601D
 /// whatever happens to live in root's ambient GnuPG keyring.
 const TRUSTED_SIGNER_KEY_PATH: &str = "/etc/linhello/trusted-signer.asc";
 
+/// Copr project that ships the Fedora packages.
+const COPR_PROJECT: &str = "archledger/linhello";
+/// Canonical repo file `dnf copr enable archledger/linhello` writes.
+const COPR_REPO_FILE: &str =
+    "/etc/yum.repos.d/_copr:copr.fedorainfracloud.org:archledger:linhello.repo";
+/// Contents of that repo file — written verbatim when the repo isn't configured
+/// yet, so we don't depend on the interactive `dnf copr enable` plugin.
+const COPR_REPO_CONTENT: &str = "\
+[copr:copr.fedorainfracloud.org:archledger:linhello]
+name=Copr repo for linhello owned by archledger
+baseurl=https://download.copr.fedorainfracloud.org/results/archledger/linhello/fedora-$releasever-$basearch/
+type=rpm-md
+skip_if_unavailable=True
+gpgcheck=1
+gpgkey=https://download.copr.fedorainfracloud.org/results/archledger/linhello/pubkey.gpg
+repo_gpgcheck=0
+enabled=1
+enabled_metadata=1
+";
+
+/// Fedora update path: ensure the Copr repo is configured (auto-enable it if
+/// not), then `dnf upgrade --refresh` the package. Equivalent to running
+/// `sudo dnf upgrade --refresh linhello` by hand — idempotent and safe to run
+/// repeatedly. Root-only (the caller already enforces this).
+fn update_via_copr() -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+    log.push(format!(
+        "Fedora family: tracking the Copr repo ({COPR_PROJECT}) via dnf — no source rebuild."
+    ));
+
+    if copr_repo_configured() {
+        log.push("Copr repo already configured.".to_string());
+    } else {
+        log.push(format!("Copr repo not configured — enabling it ({COPR_REPO_FILE})."));
+        std::fs::write(COPR_REPO_FILE, COPR_REPO_CONTENT)
+            .map_err(|e| format!("writing {COPR_REPO_FILE}: {e}"))?;
+    }
+
+    // `install` covers both first install and upgrade; `--refresh` forces fresh
+    // Copr metadata, and `-y` auto-imports the repo's signing key.
+    log.push("Running: dnf install --refresh -y linhello".to_string());
+    run_streamed(None, Path::new("/"), "dnf", &["install", "--refresh", "-y", "linhello"])?;
+
+    // Make the running daemon the freshly-installed binary (no-op if not active).
+    let _ = run_streamed(None, Path::new("/"), "systemctl", &["try-restart", "linhellod"]);
+    log.push("Done. linhellod restarted if it was running.".to_string());
+    Ok(log)
+}
+
+/// True when any Copr repo file for this project is already present.
+fn copr_repo_configured() -> bool {
+    if Path::new(COPR_REPO_FILE).exists() {
+        return true;
+    }
+    std::fs::read_dir("/etc/yum.repos.d")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            n.contains("copr") && n.contains("archledger") && n.contains("linhello")
+        })
+}
+
 /// Update from GitHub: pull the latest source (reusing the git checkout we're
 /// running from when there is one, else a managed clone), rebuild, reinstall
 /// via `deploy_from`, and re-apply the existing PAM wiring so newly supported
 /// services get wired. Enrollment, config, models, and PAM backups are never
 /// touched. Root-only; build/git output streams to the caller's terminal.
 pub fn update(user: &str) -> Result<Vec<String>, String> {
+    // Fedora family ships through Copr: track it with dnf rather than rebuilding
+    // from a signed tag, so `sudo linhello update` is equivalent to
+    // `sudo dnf upgrade --refresh linhello` and a stray run can never shadow the
+    // rpm-managed install with a side-built /usr/local binary.
+    if platform::distro_family() == platform::DistroFamily::Fedora {
+        return update_via_copr();
+    }
+
     let mut log = Vec::new();
 
     let (root, _fresh_clone) = match source_root().filter(|r| r.join(".git").exists()) {
