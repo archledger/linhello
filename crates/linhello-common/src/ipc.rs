@@ -288,6 +288,10 @@ pub struct LivenessSummary {
     pub ir_face_bg_ratio: Option<f32>,
     /// Specular IR eye-glint strength (Phase 2 active-IR liveness probe).
     pub ir_eye_glint: Option<f32>,
+    /// Center÷edge IR brightness — the depth/curvature cue (>1.3 for a live 3-D
+    /// face, ~1 for a flat photo/screen). `#[serde(default)]` for older daemons.
+    #[serde(default)]
+    pub ir_depth_ratio: Option<f32>,
     pub face_frac: Option<f32>,
     pub yaw_deg: Option<f32>,
     pub pitch_deg: Option<f32>,

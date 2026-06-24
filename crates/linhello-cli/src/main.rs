@@ -998,6 +998,15 @@ fn enroll_guided(user: &str, reset: bool, samples: u32) -> Result<()> {
         bail!("no samples captured — is your face in view and well lit? try again");
     }
     println!("Done — {total} sample(s) stored for {user}.");
+    // ≥3 = linhello_liveness::ir::MIN_CALIBRATION_OBSERVATIONS (the daemon records
+    // an active-IR observation per IR-equipped capture; on IR hardware this many
+    // samples builds the per-user liveness envelope).
+    if total >= 3 {
+        println!(
+            "On IR hardware, active-IR liveness is now calibrated from your samples —\n\
+             face unlock rejects photos/screens that don't match your live IR signature."
+        );
+    }
     println!("Next: run `linhello test` to confirm recognition.");
     Ok(())
 }
@@ -1534,7 +1543,7 @@ fn main() -> Result<()> {
                     v.map(|x| format!("{x:.*}", prec))
                         .unwrap_or_else(|| "n/a".into())
                 };
-                println!("ML spoof_prob  : {}", fmt_opt(summary.spoof_prob));
+                println!("ML spoof_prob  : {}  (median across the capture burst)", fmt_opt(summary.spoof_prob));
                 println!("ML real_score  : {}", fmt_opt(summary.ml_score));
                 println!(
                     "device trust   : {:.2}  ({}, driver={})",
@@ -1551,6 +1560,10 @@ fn main() -> Result<()> {
                     fmt_opt_n(summary.ir_highlight_frac, 3),
                 );
                 println!("IR eye-glint   : {}", fmt_opt_n(summary.ir_eye_glint, 1));
+                println!(
+                    "IR depth       : {}  (center/edge brightness; >1.3 = 3-D face, ~1 = flat photo/screen)",
+                    fmt_opt_n(summary.ir_depth_ratio, 2),
+                );
                 println!(
                     "face coverage  : {}",
                     summary

@@ -1801,6 +1801,14 @@ impl App {
                     lines.push(Line::from(
                         "Run `linhello test` any time to confirm recognition.",
                     ));
+                    lines.push(Line::from(
+                        "On IR hardware, active-IR liveness is calibrated from your samples — face"
+                            .dim(),
+                    ));
+                    lines.push(Line::from(
+                        "unlock rejects photos/screens that don't match your live IR signature."
+                            .dim(),
+                    ));
                 } else {
                     lines.push(Line::from(
                         "No face enrolled yet — go back a step to enroll, or run `linhello enroll`."
