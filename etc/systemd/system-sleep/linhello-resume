@@ -1,0 +1,23 @@
+#!/bin/sh
+# LinuxHello — recover face auth after resume from suspend.
+#
+# UVC webcams very commonly fail to resume cleanly from USB suspend: the device
+# is present but wedged (stream init / VIDIOC_STREAMON hangs, or it needs a USB
+# reset before it delivers frames again). When that happens linhellod is left
+# holding a stale device-path cache / a wedged fd, so the next unlock sits on
+# "Looking for your face…" until the box is rebooted.
+#
+# The boot-race refresh (72-linhello-camera.rules + linhellod-camera-refresh)
+# only fires when a V4L node RE-ENUMERATES (udev "add"). A resume frequently does
+# NOT re-enumerate the camera (no add event), so that path never triggers. This
+# system-sleep hook closes that gap: on resume it try-restarts the daemon, which
+# re-opens the camera fresh and re-resolves its cgroup device access — so face
+# auth recovers on the next attempt without a reboot. (try-restart is a no-op if
+# the daemon is not running; --no-block keeps the resume transaction moving.)
+#
+# $1 = pre|post, $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate.
+case "$1" in
+    post)
+        systemctl --no-block try-restart linhellod.service 2>/dev/null || true
+        ;;
+esac

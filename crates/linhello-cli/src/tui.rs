@@ -254,6 +254,9 @@ struct App {
     active_profile: String,
     /// When `Some`, the Profiles screen is editing the highlighted profile's name.
     name_input: Option<String>,
+    /// When `Some(user)`, the Profiles screen is awaiting y/N confirmation to
+    /// permanently delete that profile.
+    delete_confirm: Option<String>,
     identify: IdentifyState,
     password: PasswordStep,
     uninstall: UninstallState,
@@ -340,6 +343,7 @@ impl App {
             profile_cursor: 0,
             active_profile,
             name_input: None,
+            delete_confirm: None,
             identify: IdentifyState::Idle,
             password: PasswordStep::Entry {
                 input: String::new(),
@@ -700,6 +704,14 @@ impl App {
             return;
         }
 
+        // Modal delete-confirmation on the Profiles screen captures EVERY key
+        // until resolved (y = delete, anything else = cancel) — no accidental
+        // navigation can leave a destructive action half-done.
+        if self.screen == Screen::Profiles && self.delete_confirm.is_some() {
+            self.delete_confirm_key(code);
+            return;
+        }
+
         // Universal step navigation — arrows OR Tab, on EVERY step (including
         // text-entry ones; arrows/Tab are never valid text input). This is the
         // single consistent way to move, and it's what the footer advertises.
@@ -945,6 +957,16 @@ impl App {
                     self.status = format!("naming '{}' — type, Enter to save, Esc to cancel", p.user);
                 }
             }
+            // Delete the highlighted profile (asks y/N — see delete_confirm_key).
+            KeyCode::Char('d') => {
+                if let Some(p) = self.profiles.get(self.profile_cursor) {
+                    self.delete_confirm = Some(p.user.clone());
+                    self.status = format!(
+                        "DELETE profile '{}' ({} samples)? press y to confirm, any other key to cancel",
+                        p.user, p.samples
+                    );
+                }
+            }
             KeyCode::Char('r') => self.refresh_profiles(),
             KeyCode::Right => self.next(),
             KeyCode::Left => self.prev(),
@@ -985,6 +1007,32 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Awaiting y/N to permanently delete the profile in `delete_confirm`.
+    /// Only `y`/`Y` deletes; every other key cancels.
+    fn delete_confirm_key(&mut self, code: KeyCode) {
+        let Some(user) = self.delete_confirm.take() else { return };
+        if !matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            self.status = "delete cancelled — nothing erased".to_string();
+            return;
+        }
+        match crate::send(Request::DeleteProfile { user: user.clone() }) {
+            Ok(Response::ProfileDeleted { user, samples }) => {
+                self.log_activity(format!(
+                    "deleted profile '{user}' ({samples} samples erased) — removed /etc/linhello/{user}/"
+                ));
+                // If the enroll target was just deleted, fall back to the login user.
+                if self.active_profile == user {
+                    self.active_profile = self.user.clone();
+                }
+                self.profile_cursor = 0;
+                self.refresh_profiles();
+            }
+            Ok(Response::Error { message }) => self.status = format!("error: {message}"),
+            Ok(other) => self.status = format!("unexpected: {other:?}"),
+            Err(e) => self.status = format!("error: {e}"),
         }
     }
 
@@ -1702,6 +1750,7 @@ impl App {
                 ("↑↓", "highlight"),
                 ("s", "set enroll target"),
                 ("n", "rename"),
+                ("d", "delete"),
                 ("r", "refresh"),
             ],
             Screen::Enroll => vec![("Enter", "start enrolling")],
@@ -1800,6 +1849,14 @@ impl App {
                 if enrolled {
                     lines.push(Line::from(
                         "Run `linhello test` any time to confirm recognition.",
+                    ));
+                    lines.push(Line::from(
+                        "On IR hardware, active-IR liveness is calibrated from your samples — face"
+                            .dim(),
+                    ));
+                    lines.push(Line::from(
+                        "unlock rejects photos/screens that don't match your live IR signature."
+                            .dim(),
                     ));
                 } else {
                     lines.push(Line::from(

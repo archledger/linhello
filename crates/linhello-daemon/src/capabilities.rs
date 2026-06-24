@@ -159,6 +159,16 @@ fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
     let rgb_path = rgb_device();
     let rgb_node = canon(&rgb_path);
     let rgb_check = match cams.iter().find(|c| canon(&c.path) == rgb_node) {
+        Some(c) if c.kind == CameraKind::Rgb && c.trusted && c.privacy == Some(true) => check(
+            "RGB camera",
+            CapabilityStatus::Warn,
+            true,
+            format!(
+                "{} ({}) — PRIVACY SWITCH IS ON; the camera is blocked in hardware. Toggle the camera-privacy key (e.g. Fn+F10) to use face unlock",
+                c.name.as_deref().unwrap_or("camera"),
+                rgb_node
+            ),
+        ),
         Some(c) if c.kind == CameraKind::Rgb && c.trusted => check(
             "RGB camera",
             CapabilityStatus::Ok,
@@ -182,7 +192,7 @@ fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
             CapabilityStatus::Warn,
             true,
             format!(
-                "resolved {rgb_path} not found among capture nodes — check cameras.conf / its SELinux label"
+                "resolved {rgb_path} not found among capture nodes — the camera may be unplugged or a hardware privacy kill-switch/eShutter is engaged (the OS then sees no camera at all); otherwise check cameras.conf / its SELinux label"
             ),
         ),
     };
@@ -191,6 +201,16 @@ fn camera_checks() -> (CapabilityCheck, CapabilityCheck) {
         Some(ir_path) => {
             let ir_node = canon(&ir_path);
             match cams.iter().find(|c| canon(&c.path) == ir_node) {
+                Some(c) if c.privacy == Some(true) => check(
+                    "IR camera",
+                    CapabilityStatus::Warn,
+                    false,
+                    format!(
+                        "{} ({}) — PRIVACY SWITCH IS ON; the IR sensor is blocked. Toggle the camera-privacy key (e.g. Fn+F10) to restore IR liveness",
+                        c.name.as_deref().unwrap_or("IR sensor"),
+                        ir_node
+                    ),
+                ),
                 Some(c) => check(
                     "IR camera",
                     CapabilityStatus::Ok,

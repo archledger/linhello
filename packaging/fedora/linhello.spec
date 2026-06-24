@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.4.5
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -120,6 +120,7 @@ fi
 %{_unitdir}/linhellod.service
 %{_unitdir}/linhellod-camera-refresh.service
 %{_udevrulesdir}/72-linhello-camera.rules
+%attr(0755,root,root) %{_systemd_util_dir}/system-sleep/linhello-resume
 %{_sysusersdir}/linhello.conf
 %{_datadir}/%{name}/
 %dir %{_sysconfdir}/%{name}
@@ -168,6 +169,50 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.5.0-1
+- Recover face auth after suspend/resume. UVC webcams commonly fail to resume
+  from USB suspend, leaving the camera present but wedged — the greeter hung on
+  "Looking for your face…" with no camera engaging and survived reboots until the
+  camera power-cycled. Fixed three ways: (1) bound the previously-unbounded camera
+  enumeration/resolution with a deadline (shared with the capture deadline) so a
+  frozen camera can never hang the PAM stack — it degrades to the password within
+  seconds; (2) log the screen-unlock Verify outcome + elapsed time, which was
+  silent and made the failure undiagnosable; (3) add a systemd system-sleep hook
+  that try-restarts linhellod on resume to re-open the camera and re-resolve its
+  cgroup device access (the camera-refresh udev rule only fires on a re-enumerate,
+  which a resume often skips).
+- Fix face unlock failing with "Device or resource busy": the KDE lock screen runs
+  two PAM stacks at once (`kde` + `kde-fingerprint`), so two captures opened the
+  camera simultaneously and the loser got EBUSY. Camera I/O is now serialised
+  process-wide so concurrent verifies queue instead of colliding.
+- Detect a hardware camera privacy switch (`V4L2_CID_PRIVACY`). When the camera
+  is blocked by the privacy key/shutter the sensor returns blank frames, which
+  previously surfaced as a baffling "no face detected" that no reboot could fix.
+  Capture now fails fast with a clear "camera privacy switch is ON — toggle the
+  camera-privacy key (e.g. Fn+F10)" message, and `doctor` flags it on the RGB/IR
+  rows (plus a hint when a kill-switch/eShutter removes the camera entirely).
+- Tell the user at the greeter/lock screen WHY face unlock didn't run (camera
+  privacy switch on, or no camera detected) instead of a silent password
+  fall-through; and auto re-engage once the camera is unblocked (the kde-fingerprint
+  retry stack re-attempts and the daemon re-reads camera state each try).
+- Stronger anti-spoofing / liveness:
+  * ML anti-spoof is now median-aggregated across a short capture burst, so a
+    single noisy frame no longer false-rejects a live user (observed spoof_prob
+    spiking to ~1.0 on one frame); a real photo/screen, spoofy on every frame,
+    still rejects. Tunable via LINHELLO_ANTISPOOF_FRAMES (1 = legacy single-frame).
+  * New enrollment-calibrated active-IR liveness gate. Enrollment records the live
+    user's own IR signature — face/background brightness ratio, corneal eye-glint,
+    and a depth/curvature cue (center-vs-edge IR brightness: a 3-D face is
+    center-bright, a flat photo/screen is uniform) — into a per-profile envelope.
+    Auth then requires the live IR to stay within it, which catches printed photos
+    AND glossy screens (the depth cue rejects a flat screen even when it fakes the
+    brightness ratio) without the absolute thresholds that false-rejected live
+    users before. Additive to the ML gate (both must pass); fail-closed; opt-in via
+    re-enrollment; escape hatch LINHELLO_IR_GATE=0. Legacy profiles are unaffected
+    until re-enrolled.
+- A doctor/`linhello test` now surfaces the median spoof score, the IR cues, and
+  the camera privacy state.
+
 * Tue Jun 23 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.4.5-1
 - `linhello update`: build the Arch native package as an unprivileged user.
   When updating from the root-owned managed clone (/var/lib/linhello/src),

@@ -111,17 +111,84 @@ pub struct CameraInfo {
     pub fourccs: Vec<String>,
     /// `false` for virtual cameras (v4l2loopback/OBS) — never auto-selected.
     pub trusted: bool,
+    /// Hardware privacy switch state from `V4L2_CID_PRIVACY`: `Some(true)` when the
+    /// camera-privacy key/shutter is engaged (sensor blocked), `Some(false)` when
+    /// the control exists and is off, `None` when the device has no such control.
+    pub privacy: Option<bool>,
 }
+
+/// `V4L2_CID_PRIVACY` (UVC `CT_PRIVACY_CONTROL`): a read-only bool that a camera
+/// with a hardware privacy switch/shutter exposes to report it is engaged. On
+/// this class of ASUS laptop the camera-privacy key flips it to 1 on BOTH the RGB
+/// and IR nodes at once; the USB device stays present and streaming still
+/// succeeds, but every frame is blank — which the pipeline would otherwise report
+/// as a baffling "no face detected" that a reboot can't fix (a hardware switch
+/// survives reboots). We read it and surface an explicit, actionable error.
+const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
+
+/// Read `V4L2_CID_PRIVACY` from an open device. `Some(true)` if the hardware
+/// privacy switch is engaged, `Some(false)` if the control exists and is off,
+/// `None` if the device has no such control (most external webcams don't).
+fn privacy_engaged(dev: &Device) -> Option<bool> {
+    match dev.control(V4L2_CID_PRIVACY).ok()?.value {
+        v4l::control::Value::Boolean(b) => Some(b),
+        v4l::control::Value::Integer(i) => Some(i != 0),
+        _ => None,
+    }
+}
+
+/// Read the hardware privacy-switch state for the camera at `path` (opens the
+/// device). `Some(true)` = blocked, `Some(false)` = present and off, `None` = no
+/// such control / can't open. Exposed for diagnostics (`doctor`, probes).
+pub fn privacy_state(path: &str) -> Option<bool> {
+    Device::with_path(path).ok().and_then(|d| privacy_engaged(&d))
+}
+
+/// The error returned when capture is attempted against a privacy-blocked camera.
+fn privacy_blocked_err(path: &str) -> crate::LinuxHelloError {
+    bio_err(format!(
+        "camera privacy switch is ON — the sensor is blocked in hardware ({path}); \
+         toggle the camera-privacy key (e.g. Fn+F10) to use face unlock"
+    ))
+}
+
+/// Hard deadline for one full enumeration pass. Enumeration opens every
+/// `/dev/video*` node and issues `ENUM_FMT`/`QUERYCAP` ioctls (`classify_device`)
+/// — USB transfers that, on a UVC camera wedged across suspend/resume, can block
+/// in *uninterruptible* kernel sleep with no timeout of their own. This path runs
+/// *before* the timed capture (resolution + camera-binding snapshot), so without
+/// a bound it hangs `do_verify`/`do_authenticate` indefinitely and the greeter
+/// sits on "Looking for your face…" forever instead of falling back to the
+/// password. Bounding it keeps the daemon's invariant: a frozen camera must never
+/// hang the PAM stack. Normal enumeration is well under 100ms; 3s only ever trips
+/// on a genuinely stuck device.
+const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Enumerate all V4L capture nodes with their classification. Nodes that
 /// can't be opened or offer no formats are reported as `Unknown` rather than
-/// dropped, so `linhello doctor` can show them.
+/// dropped, so `linhello doctor` can show them. Bounded by [`ENUMERATE_TIMEOUT`]
+/// so a wedged USB camera can't block the (untimed) device-resolution path that
+/// precedes capture; on timeout we return an empty list — resolution then falls
+/// back to the default device and the *capture* deadline takes over from there.
 pub fn enumerate() -> Vec<CameraInfo> {
+    match run_with_deadline(ENUMERATE_TIMEOUT, enumerate_blocking) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                "camera enumeration did not finish within {}s (a video node is wedged — likely a USB camera that did not resume from suspend); treating as no cameras so PAM falls back to the password",
+                ENUMERATE_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn enumerate_blocking() -> Vec<CameraInfo> {
     v4l::context::enum_devices()
         .into_iter()
         .filter_map(|node| {
             let path = node.path().to_str()?.to_string();
-            let (kind, fourccs) = classify_device(&path);
+            let (kind, fourccs, privacy) = classify_device(&path);
             let trusted = linhello_liveness::device::validate_camera_device(&path).score > 0.0;
             Some(CameraInfo {
                 name: node.name(),
@@ -129,23 +196,25 @@ pub fn enumerate() -> Vec<CameraInfo> {
                 kind,
                 fourccs,
                 trusted,
+                privacy,
             })
         })
         .collect()
 }
 
-fn classify_device(path: &str) -> (CameraKind, Vec<String>) {
+fn classify_device(path: &str) -> (CameraKind, Vec<String>, Option<bool>) {
     use v4l::video::Capture;
     let dev = match Device::with_path(path) {
         Ok(d) => d,
-        Err(_) => return (CameraKind::Unknown, Vec::new()),
+        Err(_) => return (CameraKind::Unknown, Vec::new(), None),
     };
+    let privacy = privacy_engaged(&dev);
     let formats = match dev.enum_formats() {
         Ok(f) => f,
-        Err(_) => return (CameraKind::Unknown, Vec::new()),
+        Err(_) => return (CameraKind::Unknown, Vec::new(), privacy),
     };
     let fourccs: Vec<String> = formats.iter().map(|d| fourcc_str(&d.fourcc.repr)).collect();
-    (classify_fourccs(&fourccs), fourccs)
+    (classify_fourccs(&fourccs), fourccs, privacy)
 }
 
 fn fourcc_str(repr: &[u8; 4]) -> String {
@@ -277,6 +346,24 @@ pub fn write_cameras_conf(rgb: &str, ir: Option<&str>) -> Result<()> {
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const IR_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Run `f` on a detached worker thread, returning `None` if it does not finish
+/// within `timeout`. On timeout the worker is abandoned — it may be parked in an
+/// uninterruptible V4L ioctl on a wedged device, holding one fd, which the kernel
+/// reclaims when the device resets — but the *caller* is freed regardless. That
+/// is the whole point: neither a stalled capture nor a stalled enumeration may
+/// ever hang the PAM stack (login / lock screen / sudo). Shared by the capture
+/// deadline and the enumeration deadline so both honour the same invariant.
+fn run_with_deadline<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Run a capture closure on a worker thread with a deadline.
 fn capture_with_timeout<T: Send + 'static>(
     what: &str,
@@ -284,26 +371,38 @@ fn capture_with_timeout<T: Send + 'static>(
     timeout: std::time::Duration,
     f: fn(&str) -> Result<T>,
 ) -> Result<T> {
-    let (tx, rx) = std::sync::mpsc::channel();
     let label = path.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send(f(&path));
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(r) => r,
-        Err(_) => Err(bio_err(format!(
+    match run_with_deadline(timeout, move || f(&path)) {
+        Some(r) => r,
+        None => Err(bio_err(format!(
             "{what} camera {label} produced no frame within {}s (device hung or held by another app)",
             timeout.as_secs()
         ))),
     }
 }
 
+/// Serialises all camera I/O across the process. KDE's lock screen runs TWO PAM
+/// stacks at once (`kde` + `kde-fingerprint`), so two Verify operations would
+/// otherwise open and STREAMON the same V4L node simultaneously — the loser gets
+/// EBUSY ("Device or resource busy") and the unlock fails (seen post-resume,
+/// where slower warm-up makes the captures overlap). Serialising also stops a
+/// Windows-Hello module's shared-USB IR and RGB nodes from contending (a
+/// persistent IR stream has been observed to starve RGB capture). The lock is
+/// held only for one *bounded* capture, so the longest a waiter blocks is a
+/// single capture deadline; an abandoned (timed-out) worker holds the device,
+/// not this lock, so it can never deadlock the PAM stack.
+static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn capture_ir_from(path: &str) -> Result<IrFrame> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     capture_with_timeout("IR", path.to_string(), IR_CAPTURE_TIMEOUT, capture_ir_from_blocking)
 }
 
 fn capture_ir_from_blocking(path: &str) -> Result<IrFrame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
 
     let mut fmt = dev.format().map_err(|e| bio_err(format!("get format: {e}")))?;
     fmt.width = IR_CAPTURE_WIDTH;
@@ -372,11 +471,94 @@ fn decodable(fourcc: &FourCC) -> bool {
 }
 
 pub fn capture_from(path: &str) -> Result<Frame> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     capture_with_timeout("RGB", path.to_string(), CAPTURE_TIMEOUT, capture_from_blocking)
+}
+
+/// Frames grabbed for the temporal (eye-motion) liveness probe — enough to catch
+/// natural eye micro-motion (microsaccades / a blink) within a fraction of a second.
+pub const TEMPORAL_BURST: usize = 7;
+
+/// Capture a short burst of consecutive RGB frames from a SINGLE open stream (one
+/// open + AE warmup, then N grabs) — far cheaper than N separate opens, and the
+/// frames land close enough in time for the temporal liveness check to see eye
+/// micro-motion. Serialised + privacy-checked + deadline-bounded like `capture_from`.
+pub fn capture_burst(path: &str, n: usize) -> Result<Vec<Frame>> {
+    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = path.to_string();
+    match run_with_deadline(CAPTURE_TIMEOUT, move || capture_burst_blocking(&p, n)) {
+        Some(r) => r,
+        None => Err(bio_err(format!(
+            "RGB burst from {path} produced no frames within {}s",
+            CAPTURE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+fn capture_burst_blocking(path: &str, n: usize) -> Result<Vec<Frame>> {
+    let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
+    let mut last_err: Option<crate::LinuxHelloError> = None;
+    for pref in RGB_FOURCC_PREFS {
+        let mut fmt = match dev.format() {
+            Ok(f) => f,
+            Err(e) => return Err(bio_err(format!("get format: {e}"))),
+        };
+        fmt.width = CAPTURE_WIDTH;
+        fmt.height = CAPTURE_HEIGHT;
+        fmt.fourcc = FourCC::new(pref);
+        let fmt = match dev.set_format(&fmt) {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = Some(bio_err(format!("set format {:?}: {e}", fourcc_str(pref))));
+                continue;
+            }
+        };
+        if !decodable(&fmt.fourcc) {
+            last_err = Some(bio_err(format!(
+                "driver chose unsupported pixel format {:?}",
+                fourcc_str(&fmt.fourcc.repr)
+            )));
+            continue;
+        }
+        let mut stream = Stream::with_buffers(&dev, Type::VideoCapture, 4)
+            .map_err(|e| bio_err(format!("stream init: {e}")))?;
+        for _ in 0..AE_WARMUP_RGB {
+            stream.next().map_err(|e| bio_err(format!("warmup: {e}")))?;
+        }
+        let mut out: Vec<Frame> = Vec::with_capacity(n);
+        let max_attempts = n * 3 + 4;
+        let mut attempts = 0;
+        while out.len() < n && attempts < max_attempts {
+            attempts += 1;
+            let (buf, _meta) = match stream.next() {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(bio_err(format!("stream next: {e}")));
+                    break;
+                }
+            };
+            if &fmt.fourcc.repr == b"MJPG" && !is_complete_jpeg(buf) {
+                continue;
+            }
+            if let Ok(frame) = decode(&fmt.fourcc, buf, fmt.width, fmt.height) {
+                out.push(frame);
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    Err(last_err.unwrap_or_else(|| bio_err("no usable pixel format (camera offers neither MJPG nor YUYV)")))
 }
 
 fn capture_from_blocking(path: &str) -> Result<Frame> {
     let dev = Device::with_path(path).map_err(|e| bio_err(format!("open {path}: {e}")))?;
+    if privacy_engaged(&dev) == Some(true) {
+        return Err(privacy_blocked_err(path));
+    }
 
     let mut last_err: Option<crate::LinuxHelloError> = None;
     for pref in RGB_FOURCC_PREFS {
@@ -535,6 +717,26 @@ mod tests {
     fn no_capture_formats_is_unknown() {
         assert_eq!(classify_fourccs(&s(&[])), CameraKind::Unknown);
         assert_eq!(classify_fourccs(&s(&["META"])), CameraKind::Unknown);
+    }
+
+    #[test]
+    fn deadline_returns_value_when_fast() {
+        let got = run_with_deadline(Duration::from_secs(5), || 42);
+        assert_eq!(got, Some(42));
+    }
+
+    #[test]
+    fn deadline_trips_on_a_stuck_worker() {
+        // A worker that outlives the deadline (stands in for a wedged V4L ioctl)
+        // must not block the caller: the wrapper returns None promptly so the
+        // auth path can fall back to the password instead of hanging PAM.
+        let start = Instant::now();
+        let got = run_with_deadline(Duration::from_millis(150), || {
+            std::thread::sleep(Duration::from_secs(30));
+            42
+        });
+        assert_eq!(got, None);
+        assert!(start.elapsed() < Duration::from_secs(5), "deadline did not free the caller");
     }
 
     #[test]

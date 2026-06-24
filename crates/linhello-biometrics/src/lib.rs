@@ -43,30 +43,78 @@ pub struct AuthResult {
     pub score: f32,
 }
 
-/// Capture one frame, detect the primary face, and run the liveness gate.
-/// Returns the frame + face on success; errors (with a human-readable reason)
-/// when no face is visible or liveness rejects.
-fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
-    // Capture RGB + detect FIRST, then IR — never concurrently. On shared-USB
-    // Windows-Hello modules (e.g. NexiGo N930W: RGB + IR are one USB device) a
-    // simultaneous IR grab starves the RGB stream, producing slow/torn frames
-    // and multi-second auth latency (observed ~17s on the N930W). The enrollment
-    // position guide (`capture_position_sample`) serialises for the same reason;
-    // the auth path must too. The lost overlap (~500ms IR warmup) is a fair price
-    // on dedicated-bus cameras for reliable, fast capture on shared-USB ones.
-    let frame = camera::capture_frame()?;
+/// Capture a short RGB burst (one open, several frames — see `camera::capture_burst`),
+/// detect a face in each, and return the largest-face frame for recognition plus
+/// the temporal eye-motion score across the sequence (`None` if <2 frames had a
+/// face). Shared by the auth path and the `linhello test` liveness diagnostic.
+///
+/// RGB+detect runs FIRST, then IR (never concurrently): on shared-USB Windows-Hello
+/// modules a simultaneous IR grab starves the RGB stream (observed ~17s latency on
+/// the N930W). The lost overlap is a fair price for reliable capture there.
+/// Frames the ML anti-spoof scores per auth; their MEDIAN is the gate value
+/// (denoises MiniFASNet's jittery one-shot reading — a single blurred/mid-blink
+/// frame can read ~1.0 and false-reject a live user). Override with
+/// `LINHELLO_ANTISPOOF_FRAMES` (1 restores legacy single-frame behaviour).
+const DEFAULT_ANTISPOOF_FRAMES: usize = 5;
+
+fn antispoof_frames() -> usize {
+    std::env::var("LINHELLO_ANTISPOOF_FRAMES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=15).contains(&n))
+        .unwrap_or(DEFAULT_ANTISPOOF_FRAMES)
+}
+
+/// `(camera path, best frame, best face, median spoof_prob, temporal motion score)`.
+type BurstCapture = (String, camera::Frame, detect::Face, Option<f32>, Option<f32>);
+
+fn capture_burst_detect() -> Result<BurstCapture> {
+    let path = camera::rgb_device();
+    // Multi-frame so the ML anti-spoof can be median-aggregated (denoised) across
+    // the burst; widen to the temporal burst when that experimental gate is on.
+    let n = antispoof_frames()
+        .max(if linhello_liveness::temporal_gate_enabled() {
+            camera::TEMPORAL_BURST
+        } else {
+            0
+        })
+        .max(1);
+    let frames = camera::capture_burst(&path, n)?;
     let detector = detect::Detector::cached()?;
-    let faces = detector.detect(&frame)?;
-    let face = faces
-        .into_iter()
-        .next()
-        .ok_or_else(|| bio_err("no face detected"))?;
+    let mut eye_seq: Vec<linhello_liveness::temporal::EyeFrame> = Vec::new();
+    let mut detected: Vec<(usize, [f32; 4])> = Vec::new();
+    let mut best: Option<(usize, detect::Face, f32)> = None;
+    for (i, f) in frames.iter().enumerate() {
+        if let Some(face) = detector.detect(f).ok().and_then(|v| v.into_iter().next()) {
+            eye_seq.push(linhello_liveness::temporal::eye_frame(f, &face.landmarks));
+            detected.push((i, face.bbox));
+            let area =
+                (face.bbox[2] - face.bbox[0]).max(0.0) * (face.bbox[3] - face.bbox[1]).max(0.0);
+            if best.as_ref().map(|(_, _, a)| area > *a).unwrap_or(true) {
+                best = Some((i, face, area));
+            }
+        }
+    }
+    let (bi, face, _) = best.ok_or_else(|| bio_err("no face detected"))?;
+    let temporal_score = linhello_liveness::temporal::motion_score(&eye_seq);
+    // Median anti-spoof across every detected frame — the denoised gate value.
+    let ml_frames: Vec<(&camera::Frame, [f32; 4])> =
+        detected.iter().map(|(i, b)| (&frames[*i], *b)).collect();
+    let spoof_prob = linhello_liveness::LivenessEvaluator::cached()?.antispoof_median(&ml_frames)?;
+    Ok((path, frames[bi].clone(), face, spoof_prob, temporal_score))
+}
+
+/// Capture, detect the primary face, and run the liveness gate. Returns the
+/// frame, face, and signals on success; errors (with a human-readable reason)
+/// when no face is visible or liveness rejects.
+fn capture_detect_live() -> Result<(camera::Frame, detect::Face, linhello_liveness::LivenessSignals)> {
+    let (path, frame, face, spoof_prob, temporal_score) = capture_burst_detect()?;
 
     let ir = camera::capture_ir_frame().ok().flatten();
 
     let evaluator = linhello_liveness::LivenessEvaluator::cached()?;
     let report = evaluator.evaluate(
-        &frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref(),
+        &frame, face.bbox, &face.landmarks, &path, ir.as_ref(), spoof_prob, temporal_score,
     )?;
     if matches!(report.decision, linhello_liveness::LivenessDecision::Spoof) {
         return Err(bio_err(format!(
@@ -80,14 +128,23 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
             report.reason.as_deref().unwrap_or("try again")
         )));
     }
-    Ok((frame, face))
+    Ok((frame, face, report.signals))
 }
 
 pub fn capture_and_embed() -> Result<Vec<f32>> {
-    let (frame, face) = capture_detect_live()?;
+    capture_and_embed_signals().map(|(v, _)| v)
+}
+
+/// Like [`capture_and_embed`] but also returns the liveness signals from the same
+/// capture, so the caller can apply a per-user calibrated IR liveness gate (the
+/// signals carry the active-IR cues) or record an enrollment observation.
+pub fn capture_and_embed_signals(
+) -> Result<(Vec<f32>, linhello_liveness::LivenessSignals)> {
+    let (frame, face, signals) = capture_detect_live()?;
     let aligned = align::align(&frame, &face)?;
     let embedder = embed::Embedder::cached()?;
-    embedder.embed(&aligned)
+    let emb = embedder.embed(&aligned)?;
+    Ok((emb, signals))
 }
 
 /// Capture one RGB frame and return live framing geometry for the enrollment
@@ -592,17 +649,12 @@ mod position_tests {
 /// runs detection + liveness, and returns the raw report. Never touches
 /// enrollment data or embeddings.
 pub fn run_liveness_test() -> Result<linhello_liveness::LivenessReport> {
-    let ir_handle = std::thread::spawn(|| camera::capture_ir_frame().ok().flatten());
-    let frame = camera::capture_frame()?;
-    let detector = detect::Detector::cached()?;
-    let faces = detector.detect(&frame)?;
-    let face = faces
-        .into_iter()
-        .next()
-        .ok_or_else(|| bio_err("no face detected"))?;
-    let ir = ir_handle.join().unwrap_or(None);
+    let (path, frame, face, spoof_prob, temporal_score) = capture_burst_detect()?;
+    let ir = camera::capture_ir_frame().ok().flatten();
     let evaluator = linhello_liveness::LivenessEvaluator::cached()?;
-    evaluator.evaluate(&frame, face.bbox, &face.landmarks, &camera::rgb_device(), ir.as_ref())
+    evaluator.evaluate(
+        &frame, face.bbox, &face.landmarks, &path, ir.as_ref(), spoof_prob, temporal_score,
+    )
 }
 
 // NOTE: the former `authenticate_user` helper (which matched against the

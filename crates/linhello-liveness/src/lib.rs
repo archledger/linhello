@@ -17,6 +17,7 @@ pub mod device;
 pub mod device_binding;
 pub mod ir;
 pub mod orientation;
+pub mod temporal;
 
 use linhello_common::{LinuxHelloError, Result};
 use image::RgbImage;
@@ -34,6 +35,37 @@ pub const DEFAULT_ANTISPOOF_MODEL_4: &str = "/etc/linhello/antispoof_4.onnx";
 
 /// Reject if `spoof_prob >= this`. 0.5 is the MiniFASNet default.
 pub const DEFAULT_SPOOF_THRESHOLD: f32 = 0.5;
+
+/// Default minimum temporal eye-motion score (mean-subtracted L1, 0–255 scale)
+/// for a live face. Tunable via `LINHELLO_TEMPORAL_MIN`.
+///
+/// EXPERIMENTAL and OFF by default — see [`temporal_gate_enabled`]. On-hardware
+/// validation (2026-06-23) showed passive eye-motion *magnitude* over a ~0.4s
+/// burst does NOT separate a live face from a hand-held photo: a jittered photo's
+/// motion blur scored 11–21 while a live face scored 10–14 (overlapping). Only a
+/// *blink* (the eye-closure pattern) is qualitatively distinct from jitter, which
+/// needs a longer window or an active "blink" challenge. The capture/scoring
+/// infrastructure is kept for that follow-up; the magnitude gate stays opt-in so
+/// it can never false-reject a live user or pass a jittered photo by default.
+pub const DEFAULT_TEMPORAL_MIN: f32 = 8.0;
+
+/// Whether the (experimental) temporal eye-motion gate is enabled. OFF by default
+/// — opt in with `LINHELLO_TEMPORAL_GATE=1` (see [`DEFAULT_TEMPORAL_MIN`] for why).
+pub fn temporal_gate_enabled() -> bool {
+    std::env::var("LINHELLO_TEMPORAL_GATE")
+        .ok()
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn temporal_min() -> f32 {
+    std::env::var("LINHELLO_TEMPORAL_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_TEMPORAL_MIN)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LivenessConfig {
@@ -183,7 +215,7 @@ pub struct LivenessSignals {
 }
 
 impl LivenessSignals {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         LivenessSignals {
             spoof_prob: None,
             ml_score: None,
@@ -288,11 +320,27 @@ impl LivenessEvaluator {
             .map_err(|e| LinuxHelloError::Biometrics(e.clone()))
     }
 
+    /// Median anti-spoof spoof-probability across the capture burst, or `None`
+    /// when no model is configured / no frames were given. The caller passes the
+    /// result to [`evaluate`](Self::evaluate). Denoises the one-shot reading — see
+    /// [`antispoof::AntiSpoofModel::predict_median`].
+    pub fn antispoof_median(
+        &self,
+        frames: &[(&RgbImage, [f32; 4])],
+    ) -> Result<Option<f32>> {
+        match &self.antispoof {
+            Some(m) if !frames.is_empty() => Ok(Some(m.predict_median(frames)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Evaluate liveness for `frame` with a detected face at `bbox`
     /// (x1, y1, x2, y2 in frame pixels). `camera_path` is the device that
     /// produced the frame (e.g. `/dev/video0`). `ir` is an optional
     /// grayscale frame from the companion NIR sensor; when present we
-    /// populate the `ir_*` fields of `LivenessSignals`.
+    /// populate the `ir_*` fields of `LivenessSignals`. `spoof_prob` and
+    /// `temporal_score` are precomputed by the caller across the capture burst.
+    #[allow(clippy::too_many_arguments)] // cohesive per-capture inputs; a struct would just move the noise
     pub fn evaluate(
         &self,
         frame: &RgbImage,
@@ -300,8 +348,12 @@ impl LivenessEvaluator {
         landmarks: &[[f32; 2]; 5],
         camera_path: &str,
         ir: Option<&image::GrayImage>,
+        spoof_prob: Option<f32>,
+        temporal_score: Option<f32>,
     ) -> Result<LivenessReport> {
         let mut signals = LivenessSignals::empty();
+        signals.motion_score = temporal_score;
+        tracing::debug!("liveness: temporal eye-motion score = {temporal_score:?}");
 
         // Head-orientation gate (WBF ±15°). Reject off-axis faces early —
         // reduces FAR (side-of-face spoofs) and improves ArcFace match
@@ -374,6 +426,11 @@ impl LivenessEvaluator {
             signals.ir_highlight_frac = Some(s.highlight_frac);
             signals.ir_face_bg_ratio = Some(s.face_bg_ratio);
             signals.ir_eye_glint = Some(s.eye_glint);
+            signals.depth_score = Some(s.depth_ratio);
+            tracing::debug!(
+                "liveness: IR cues face/bg={:.2} glint={:.0} depth(center/edge)={:.2}",
+                s.face_bg_ratio, s.eye_glint, s.depth_ratio
+            );
 
             match ir::classify(&s, face_frac) {
                 ir::IrVerdict::Real => { /* IR passes; fall through to ML */ }
@@ -403,18 +460,41 @@ impl LivenessEvaluator {
             }
         }
 
-        // ML check when available.
-        if let Some(m) = &self.antispoof {
-            let spoof_prob = m.predict(frame, bbox)?;
-            signals.spoof_prob = Some(spoof_prob);
-            signals.ml_score = Some(1.0 - spoof_prob);
-
-            if spoof_prob >= self.config.spoof_threshold {
+        // ML anti-spoof: the MEDIAN spoof probability across the capture burst,
+        // computed by the caller (see `antispoof_median` / `AntiSpoofModel::
+        // predict_median`). `None` when no model is configured. Aggregating across
+        // frames denoises MiniFASNet's jittery one-shot reading so a single bad
+        // frame can't false-reject a live user, while a real photo/screen (spoofy
+        // on every frame) still rejects.
+        if let Some(p) = spoof_prob {
+            signals.spoof_prob = Some(p);
+            signals.ml_score = Some(1.0 - p);
+            if p >= self.config.spoof_threshold {
                 return Ok(LivenessReport {
                     decision: LivenessDecision::Spoof,
                     reason: Some(format!(
-                        "anti-spoof rejected (spoof_prob={spoof_prob:.3} ≥ {:.3})",
+                        "anti-spoof rejected (median spoof_prob={p:.3} ≥ {:.3})",
                         self.config.spoof_threshold
+                    )),
+                    signals,
+                });
+            }
+        }
+
+        // Passive temporal liveness: require eye micro-motion across the capture
+        // burst. A static photo / still screen image shows none (its eye region is
+        // identical frame-to-frame even when waved around, since patches are
+        // landmark-aligned). Skipped when the burst couldn't be measured
+        // (`temporal_score` None — too few detected frames) or disabled by env.
+        // Uncertain (not Spoof) so a genuine user who held unusually still simply
+        // retries / falls back to the password.
+        if let Some(score) = temporal_score {
+            if temporal_gate_enabled() && score < temporal_min() {
+                return Ok(LivenessReport {
+                    decision: LivenessDecision::Uncertain,
+                    reason: Some(format!(
+                        "no eye movement detected (motion {score:.1} < {:.1}) — look at the camera and blink; a still photo or screen reads like this",
+                        temporal_min()
                     )),
                     signals,
                 });

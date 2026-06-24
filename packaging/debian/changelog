@@ -1,3 +1,40 @@
+linhello (0.5.0-1) unstable; urgency=medium
+
+  * Recover face auth after suspend/resume. UVC webcams commonly fail to resume
+    from USB suspend, leaving the camera present but wedged; this manifested as
+    the greeter hanging on "Looking for your face…" with no camera engaging,
+    surviving reboots until the camera power-cycled. Fixed three ways: bound the
+    previously-unbounded camera enumeration/resolution with a deadline so a frozen
+    camera can never hang the PAM stack (it degrades to the password in seconds);
+    log the screen-unlock Verify outcome + timing (it was silent, making the
+    failure undiagnosable); and add a systemd system-sleep hook that try-restarts
+    the daemon on resume to re-open the camera (the camera-refresh udev rule only
+    fires on re-enumeration, which a resume often skips).
+  * Fix face unlock failing with "Device or resource busy": the KDE lock screen
+    runs two PAM stacks at once (kde + kde-fingerprint), so two captures opened
+    the camera simultaneously and the loser got EBUSY. Camera I/O is now
+    serialised process-wide so concurrent verifies queue instead of colliding.
+  * Detect a hardware camera privacy switch (V4L2_CID_PRIVACY): when blocked, the
+    sensor returns blank frames that previously surfaced as a baffling "no face
+    detected" no reboot could fix. Capture now fails fast with a clear "camera
+    privacy switch is ON — toggle the camera-privacy key (e.g. Fn+F10)" message,
+    and doctor flags it on the RGB/IR rows.
+  * Tell the user at the greeter/lock screen WHY face unlock didn't run (privacy
+    switch on / no camera) instead of a silent password fall-through; auto
+    re-engage once the camera is unblocked.
+  * Stronger liveness/anti-spoofing: (a) the ML anti-spoof is median-aggregated
+    across a short capture burst so one noisy frame no longer false-rejects a live
+    user, while a real photo/screen still rejects (LINHELLO_ANTISPOOF_FRAMES);
+    (b) a new enrollment-calibrated active-IR gate records the live user's own IR
+    signature — face/bg ratio, corneal glint, and a depth/curvature cue (center vs
+    edge IR brightness; a 3-D face is center-bright, a flat photo/screen uniform) —
+    and requires the live IR to match it, catching printed photos AND glossy
+    screens without the absolute thresholds that false-rejected live users before.
+    Additive to ML, fail-closed, opt-in via re-enrollment (LINHELLO_IR_GATE=0 to
+    disable); legacy profiles unaffected until re-enrolled.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Tue, 23 Jun 2026 20:00:00 -0400
+
 linhello (0.4.5-1) unstable; urgency=medium
 
   * `linhello update`: build the Arch native package as an unprivileged user

@@ -141,6 +141,11 @@ pub enum Request {
     /// Set (or clear, with an empty name) a profile's friendly display name.
     /// Root-only.
     SetProfileName { user: String, name: String },
+    /// Permanently delete an enrolled profile: erase its face template, sealed
+    /// password/recovery envelopes, camera binding, IR liveness calibration, and
+    /// display name (the whole `/etc/linhello/<user>/` dir). Does NOT touch PAM
+    /// wiring or the login password itself. Root-only.
+    DeleteProfile { user: String },
     /// Wrap the user's current template key under a dedicated recovery
     /// passphrase (separate from the login password) and persist the recovery
     /// envelope. Requires the template key to be unsealable now. Root-only.
@@ -288,6 +293,10 @@ pub struct LivenessSummary {
     pub ir_face_bg_ratio: Option<f32>,
     /// Specular IR eye-glint strength (Phase 2 active-IR liveness probe).
     pub ir_eye_glint: Option<f32>,
+    /// Center÷edge IR brightness — the depth/curvature cue (>1.3 for a live 3-D
+    /// face, ~1 for a flat photo/screen). `#[serde(default)]` for older daemons.
+    #[serde(default)]
+    pub ir_depth_ratio: Option<f32>,
     pub face_frac: Option<f32>,
     pub yaw_deg: Option<f32>,
     pub pitch_deg: Option<f32>,
@@ -358,6 +367,9 @@ pub enum Response {
         candidates: Vec<IdentifyCandidate>,
     },
     ProfileNameSet,
+    /// A profile was deleted; `samples` is how many face samples it held (for the
+    /// confirmation message). Result of [`Request::DeleteProfile`].
+    ProfileDeleted { user: String, samples: usize },
     /// A recovery passphrase was set (the template key was wrapped under it).
     RecoverySaved,
     /// The template key was restored from the recovery passphrase and re-sealed.
@@ -369,6 +381,13 @@ pub enum Response {
     AuthPlan {
         engage: bool,
         action: String,
+        /// When the camera *would* engage but is currently unusable, a short,
+        /// user-facing reason the PAM module shows at the greeter/lock screen
+        /// instead of "Looking for your face…" (e.g. the hardware privacy switch
+        /// is on, or no camera is detected). `None` when the camera is ready or
+        /// the operation doesn't engage it. `#[serde(default)]` for older daemons.
+        #[serde(default)]
+        camera_notice: Option<String>,
     },
     /// Result of [`Request::PolicyStatus`]: the effective tier and per-operation
     /// policy the daemon would apply right now.

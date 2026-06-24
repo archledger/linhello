@@ -135,6 +135,41 @@ impl AntiSpoofModel {
         let real_p = sum[1] / self.members.len() as f32;
         Ok((1.0 - real_p).clamp(0.0, 1.0))
     }
+
+    /// Predict spoof probability across several frames and return the MEDIAN.
+    /// MiniFASNet's one-shot reading is noisy — a single motion-blurred, mid-blink
+    /// or exposure-spiked frame can read ~1.0 and false-reject a live user (and it
+    /// IS the primary presentation-attack gate, so that both annoys the user and
+    /// can't be loosened without weakening security). The median across a burst is
+    /// robust: one bad frame is outvoted, while a real photo/screen — spoofy on
+    /// every frame — still rejects. Each `(frame, bbox)` is scored independently.
+    pub fn predict_median(&self, frames: &[(&RgbImage, [f32; 4])]) -> Result<f32> {
+        if frames.is_empty() {
+            return Err(LinuxHelloError::Biometrics(
+                "anti-spoof: no frames to score".into(),
+            ));
+        }
+        let mut probs: Vec<f32> = Vec::with_capacity(frames.len());
+        for (frame, bbox) in frames {
+            probs.push(self.predict(frame, *bbox)?);
+        }
+        let m = median(&mut probs); // sorts probs in place
+        tracing::debug!("anti-spoof: per-frame (sorted) {probs:?} -> median {m:.3}");
+        Ok(m)
+    }
+}
+
+/// Median of `v` (sorts in place). Average of the two middle values for even len.
+fn median(v: &mut [f32]) -> f32 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 /// Expand `bbox` around its center by `scale`, clip to frame bounds, and
@@ -217,6 +252,17 @@ mod tests {
         let p = softmax(&[1.0, 2.0, 3.0]);
         let s: f32 = p.iter().sum();
         assert!((s - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn median_is_robust_to_one_outlier() {
+        // A single bad frame (1.0) among live readings must not dominate.
+        assert!((median(&mut [0.001, 0.002, 1.0, 0.001, 0.003]) - 0.002).abs() < 1e-6);
+        // A real spoof (all high) stays high.
+        assert!(median(&mut [0.97, 0.99, 1.0, 0.98, 0.96]) >= 0.97);
+        // Even length averages the two middles.
+        assert!((median(&mut [0.0, 0.2, 0.4, 0.6]) - 0.3).abs() < 1e-6);
+        assert_eq!(median(&mut [0.42]), 0.42);
     }
 
     #[test]

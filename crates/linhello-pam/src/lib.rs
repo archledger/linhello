@@ -125,13 +125,26 @@ pub unsafe extern "C" fn linhello_authenticate(
 ///            will light up; stay silent and cascade to the password.
 ///   * `-1` — daemon unreachable or error; treat as "no capture" (stay silent).
 ///
+/// When the camera would engage but is currently unusable (hardware privacy
+/// switch on, or no camera detected), a short user-facing reason is written into
+/// `msg` (NUL-terminated, truncated to `msg_len`) so the PAM module can show it at
+/// the greeter instead of "Looking for your face…". `msg[0]` is set to `\0` first,
+/// so an empty string means "camera ready, no notice". `msg` may be null.
+///
 /// # Safety
-/// `user` and `service` must be NUL-terminated C strings.
+/// `user` and `service` must be NUL-terminated C strings. `msg`, if non-null, must
+/// point to at least `msg_len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn linhello_auth_will_capture(
     user: *const libc::c_char,
     service: *const libc::c_char,
+    msg: *mut u8,
+    msg_len: usize,
 ) -> i32 {
+    // Start with an empty notice so the caller never reads stale stack bytes.
+    if !msg.is_null() && msg_len > 0 {
+        *msg = 0;
+    }
     if user.is_null() || service.is_null() {
         return -1;
     }
@@ -144,7 +157,10 @@ pub unsafe extern "C" fn linhello_auth_will_capture(
         _ => return -1,
     };
     match client::request(&Request::AuthIntent { user, service }) {
-        Ok(Response::AuthPlan { engage, .. }) => {
+        Ok(Response::AuthPlan { engage, camera_notice, .. }) => {
+            if let Some(notice) = camera_notice {
+                write_cstr(msg, msg_len, &notice);
+            }
             if engage {
                 1
             } else {
@@ -153,6 +169,22 @@ pub unsafe extern "C" fn linhello_auth_will_capture(
         }
         _ => -1,
     }
+}
+
+/// Write `s` into a C buffer as a NUL-terminated string, truncated to fit. No-op
+/// if `dst` is null or `dst_len` is 0.
+///
+/// # Safety
+/// `dst`, if non-null, must point to at least `dst_len` writable bytes.
+unsafe fn write_cstr(dst: *mut u8, dst_len: usize, s: &str) {
+    if dst.is_null() || dst_len == 0 {
+        return;
+    }
+    let buf = slice::from_raw_parts_mut(dst, dst_len);
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(dst_len - 1);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    buf[n] = 0;
 }
 
 /// Reseal `password` as the user's login password envelope. Called from the

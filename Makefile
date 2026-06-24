@@ -16,6 +16,9 @@ BINDIR       ?= $(PREFIX)/bin
 PAMDIR       ?= /usr/lib/security
 SYSTEMDDIR   ?= /etc/systemd/system
 UDEVDIR      ?= /etc/udev/rules.d
+# systemd only scans /usr/lib/systemd/system-sleep for resume hooks (no /etc
+# equivalent), so this is the same on every distro — packaging need not override.
+SLEEPDIR     ?= /usr/lib/systemd/system-sleep
 CONFDIR      ?= /etc/linhello
 CARGO        ?= cargo
 CC           ?= cc
@@ -69,6 +72,11 @@ install: all
 	    $(DESTDIR)$(SYSTEMDDIR)/linhellod-camera-refresh.service
 	install -Dm644 etc/udev/rules.d/72-linhello-camera.rules \
 	    $(DESTDIR)$(UDEVDIR)/72-linhello-camera.rules
+	# Resume recovery: a system-sleep hook try-restarts linhellod after suspend,
+	# re-opening a UVC camera that wedged across USB suspend (the udev rule above
+	# only fires on re-enumeration, which a resume often skips). Must be 0755.
+	install -Dm755 etc/systemd/system-sleep/linhello-resume \
+	    $(DESTDIR)$(SLEEPDIR)/linhello-resume
 	# Declarative `linhello` system group (socket access for the unprivileged
 	# CLI). systemd-sysusers creates it from this file the same way packaging
 	# does; harmless + idempotent. DESTDIR builds (packaging) skip the immediate
