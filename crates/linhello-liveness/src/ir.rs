@@ -333,7 +333,13 @@ impl IrCalibration {
         }
         let ratio_ref = Self::robust_low(self.observations.iter().map(|o| o.face_bg_ratio).collect());
         let glint_ref = Self::robust_low(self.observations.iter().map(|o| o.eye_glint).collect());
-        let ratio_thr = ratio_ref * env_margin("LINHELLO_IR_RATIO_MARGIN", 0.7);
+        // Default ratio margin 0.8: the face/background IR lift is the stable,
+        // discriminating cue (on-hardware: live ≥1.4 / enrolled ~1.40–1.45 vs a
+        // phone-screen replay at ~1.03), so the reject floor sits at ~0.8× the
+        // user's own enrolled-low — below any live frame, above a flat replay.
+        // Glint is noisier (glasses/squint), so its margin stays generous and it
+        // only matters as the second of the two cues that must BOTH be weak.
+        let ratio_thr = ratio_ref * env_margin("LINHELLO_IR_RATIO_MARGIN", 0.8);
         let glint_thr = glint_ref * env_margin("LINHELLO_IR_GLINT_MARGIN", 0.5);
 
         let ratio_absent = live.face_bg_ratio < ratio_thr;
