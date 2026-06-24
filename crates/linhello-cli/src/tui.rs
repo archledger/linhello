@@ -53,17 +53,6 @@ fn wrapped_rows(w: u16, inner: u16) -> u16 {
     }
 }
 
-/// Clip `s` to at most `cap` display columns, appending `…` when truncated, so a
-/// one-line widget (the footer status) never spills past its border.
-fn truncate_ellipsis(s: &str, cap: usize) -> String {
-    if s.chars().count() <= cap {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(cap.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 /// A rounded, hairline-bordered block — the base for every framed surface.
 fn surface() -> Block<'static> {
     Block::bordered()
@@ -468,9 +457,10 @@ impl App {
     }
 
     fn next(&mut self) {
-        // The footer shows the lock + reason live, so a blocked step just stays
-        // put — no transient status stamp needed.
-        if self.gate().is_err() {
+        // The footer is a static legend, so surface "why can't I continue?" in the
+        // Activity panel (via the live status line) when a blocked step won't move.
+        if let Err(reason) = self.gate() {
+            self.status = format!("can't continue yet — {reason}");
             return;
         }
         let mut i = self.step_index();
@@ -987,17 +977,16 @@ impl App {
                 if let Some(p) = self.profiles.get(self.profile_cursor) {
                     let (user, samples, has_pw) = (p.user.clone(), p.samples, p.has_password);
                     self.delete_confirm = Some(user.clone());
-                    // Full prompt goes to the scrollable Activity panel (it wraps);
-                    // the footer keeps a short, one-line hint that can't overflow.
+                    // Shows as the live status line in the Activity panel (it wraps);
+                    // persists until y/n because the modal captures every key.
                     let pw_note = if has_pw {
                         " — also erases the sealed password (face login/sudo needs re-sealing after)"
                     } else {
                         ""
                     };
-                    self.push_activity(format!(
+                    self.status = format!(
                         "delete profile '{user}' ({samples} samples){pw_note}? press y to confirm, any other key to cancel"
-                    ));
-                    self.status = "confirm delete: press y, any other key cancels".to_string();
+                    );
                 }
             }
             KeyCode::Char('r') => self.refresh_profiles(),
@@ -1090,11 +1079,11 @@ impl App {
         }
         match crate::send(Request::DeleteProfile { user: user.clone() }) {
             Ok(Response::ProfileDeleted { user, samples }) => {
-                // Full detail in the scrollable Activity panel; footer stays short.
+                // Logged as a completed action (→); clear the transient prompt line.
                 self.push_activity(format!(
                     "deleted profile '{user}' ({samples} samples erased) — removed /etc/linhello/{user}/"
                 ));
-                self.status = format!("deleted profile '{user}'");
+                self.status.clear();
                 // If the enroll target was just deleted, fall back to the login user.
                 if self.active_profile == user {
                     self.active_profile = self.user.clone();
@@ -1664,8 +1653,8 @@ impl App {
         let chunks = Layout::vertical([
             Constraint::Length(3), // header
             Constraint::Min(0),    // body
-            Constraint::Length(6), // activity bar
-            Constraint::Length(5), // footer (nav + actions + status legend)
+            Constraint::Length(7), // activity bar (live messages live here)
+            Constraint::Length(4), // footer — static legend: nav + per-step keys
         ])
         .split(area);
 
@@ -1775,40 +1764,12 @@ impl App {
             Line::from(spans)
         };
 
-        // Row 3 — live "can I move on?" feedback. The gate reason names the exact
-        // key to press, so a blocked user is never stuck.
-        let status = match self.gate() {
-            Err(reason) => Line::from(vec![
-                Span::styled("🔒 ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    reason,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Ok(()) if !self.status.is_empty() => {
-                // The footer is a single fixed line — clip long status to fit
-                // cleanly (long messages belong in the scrollable Activity panel).
-                let cap = (area.width as usize).saturating_sub(8).max(8);
-                Line::from(vec![
-                    dim("• "),
-                    Span::styled(
-                        truncate_ellipsis(&self.status, cap),
-                        Style::default().fg(Color::Gray),
-                    ),
-                ])
-            }
-            Ok(()) => Line::from(vec![
-                Span::styled("✓ ", Style::default().fg(Color::Green)),
-                dim("ready — press "),
-                key("→"),
-                dim(" or "),
-                key("Tab"),
-                dim(" to continue"),
-            ]),
-        };
-
+        // The footer is a STATIC key legend (two rows): universal nav + the keys
+        // for this step. All live messages — prompts, results, errors, the "why
+        // can't I continue?" gate reason — go to the scrollable Activity panel
+        // above, never here, so the footer never moves or overflows.
         let p =
-            Paragraph::new(vec![nav, actions, status]).block(surface().padding(Padding::horizontal(2)));
+            Paragraph::new(vec![nav, actions]).block(surface().padding(Padding::horizontal(2)));
         frame.render_widget(p, area);
     }
 
@@ -1856,7 +1817,7 @@ impl App {
     fn render_activity(&self, frame: &mut Frame, area: Rect) {
         // Build the full log as wrapped lines, then scroll within it so the user
         // can Shift+↑/↓ back through prior actions (default follows the newest).
-        let lines: Vec<Line> = if self.activity.is_empty() {
+        let mut lines: Vec<Line> = if self.activity.is_empty() {
             vec![Line::from(
                 "Nothing changed yet. Any file the software touches will be listed here."
                     .dim()
@@ -1873,6 +1834,18 @@ impl App {
                 })
                 .collect()
         };
+
+        // The current live status (prompts like "press y to confirm", results,
+        // errors, the "why can't I continue?" gate reason) shows as the NEWEST
+        // line here — the footer is a static legend now, so this scrollable,
+        // wrapping panel is where every message lands. Skip when it would just
+        // duplicate the last logged action.
+        if !self.status.is_empty() && self.activity.last() != Some(&self.status) {
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+                Span::styled(self.status.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
 
         let inner_w = area.width.saturating_sub(2 + 4); // borders + horizontal(2)
         let view_rows = area.height.saturating_sub(2); // borders only
