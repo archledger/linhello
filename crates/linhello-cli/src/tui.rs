@@ -985,12 +985,17 @@ impl App {
             // Delete the highlighted profile (asks y/N — see delete_confirm_key).
             KeyCode::Char('d') => {
                 if let Some(p) = self.profiles.get(self.profile_cursor) {
-                    let (user, samples) = (p.user.clone(), p.samples);
+                    let (user, samples, has_pw) = (p.user.clone(), p.samples, p.has_password);
                     self.delete_confirm = Some(user.clone());
                     // Full prompt goes to the scrollable Activity panel (it wraps);
                     // the footer keeps a short, one-line hint that can't overflow.
+                    let pw_note = if has_pw {
+                        " — also erases the sealed password (face login/sudo needs re-sealing after)"
+                    } else {
+                        ""
+                    };
                     self.push_activity(format!(
-                        "delete profile '{user}' ({samples} samples)? — press y to confirm, any other key to cancel"
+                        "delete profile '{user}' ({samples} samples){pw_note}? press y to confirm, any other key to cancel"
                     ));
                     self.status = "confirm delete: press y, any other key cancels".to_string();
                 }

@@ -45,10 +45,12 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
-    /// Permanently delete an enrolled profile: erase its face template, sealed
-    /// password/recovery envelopes, camera binding, and IR calibration. Your
-    /// login wiring and password are untouched — face auth just stops for this
-    /// profile until you re-enroll. Root-only. Prompts to confirm unless `--yes`.
+    /// Permanently delete an enrolled profile: erase its face template, IR
+    /// liveness calibration, camera binding, and the TPM-sealed copies of the
+    /// password + recovery key. Your PAM login wiring and your actual system
+    /// password are untouched, but face login/sudo falls back to your typed
+    /// password until you re-enroll AND re-seal (`linhello seal-password`).
+    /// Root-only. Prompts to confirm unless `--yes`.
     ForgetProfile {
         #[arg(long)]
         user: String,
@@ -857,21 +859,28 @@ fn identify_cmd() -> Result<()> {
 fn forget_profile_cmd(user: &str, yes: bool) -> Result<()> {
     use std::io::Write;
     // Look it up first so we can show what's being erased and reject a typo'd name.
-    let samples = match send(Request::ListProfiles)? {
-        Response::Profiles { profiles } => {
-            profiles.into_iter().find(|p| p.user == user).map(|p| p.samples)
-        }
+    let prof = match send(Request::ListProfiles)? {
+        Response::Profiles { profiles } => profiles.into_iter().find(|p| p.user == user),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {other:?}"),
     };
-    let Some(samples) = samples else {
+    let Some(prof) = prof else {
         bail!("no enrolled profile '{user}' — run `linhello profiles` to list them");
     };
     if !yes {
         print!(
-            "Permanently delete profile '{user}' ({samples} face sample(s) + its TPM \
-             envelopes)? This cannot be undone. [y/N] "
+            "Permanently delete profile '{user}' ({} face sample(s))? This erases the face \
+             template, IR liveness calibration, and the TPM-sealed copies of your password and \
+             recovery key. ",
+            prof.samples
         );
+        if prof.has_password {
+            print!(
+                "Face login/sudo will fall back to your typed password until you re-enroll AND \
+                 re-seal (`linhello seal-password`). "
+            );
+        }
+        print!("Your actual system password is unchanged. This cannot be undone. [y/N] ");
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).ok();
