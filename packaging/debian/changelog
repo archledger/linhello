@@ -1,3 +1,12 @@
+linhello (0.6.1-1) unstable; urgency=medium
+
+  * Update path: on Fedora, `linhello update` now tracks the Copr repository via
+    dnf (auto-enabling it if missing) instead of rebuilding from a signed tag —
+    equivalent to `dnf upgrade --refresh linhello`, keeping a Fedora install
+    rpm-managed. Other distros keep the signed-tag source rebuild.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Wed, 24 Jun 2026 12:30:00 -0400
+
 linhello (0.6.0-1) unstable; urgency=medium
 
   * Profiles: create named profiles to enroll into — `linhello enroll --user NAME`

@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,6 +169,13 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.1-1
+- Update path: on Fedora, `linhello update` now tracks the Copr repository via
+  dnf (auto-enabling it if missing) instead of rebuilding from a signed tag --
+  equivalent to `dnf upgrade --refresh linhello`. Keeps a Fedora install
+  rpm-managed so a stray `sudo linhello update` can't shadow the package with a
+  side-built /usr/local binary. Other distros keep the signed-tag source rebuild.
+
 * Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.0-1
 - Profiles: create named profiles to enroll into. `linhello enroll --user NAME`
   makes a SEPARATE profile, and a new `--name "Label"` sets its friendly display
