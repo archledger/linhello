@@ -84,6 +84,8 @@ enum Cmd {
     /// samples (enroll glasses-on / glasses-off / varied lighting; auth takes
     /// the best match). `--reset` wipes prior samples first.
     Enroll {
+        /// Profile to enroll into (defaults to your login user). Use a distinct
+        /// value to create a SEPARATE profile (e.g. `--user ben-glasses`).
         #[arg(long)]
         user: Option<String>,
         #[arg(long)]
@@ -91,6 +93,11 @@ enum Cmd {
         /// How many face samples to capture this run.
         #[arg(long, default_value = "5")]
         samples: u32,
+        /// Friendly display name for the profile (e.g. "Ben — glasses"). Set on
+        /// the profile after a successful capture; handy when creating a new
+        /// `--user` profile so it's labelled in `linhello profiles`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Safe recognition self-test: captures one frame and tells you whether
     /// LinuxHello recognizes you. It does NOT drive any login prompt and
@@ -1443,9 +1450,12 @@ fn main() -> Result<()> {
             }
             other => bail!("unexpected response: {other:?}"),
         },
-        Cmd::Enroll { user, reset, samples } => {
+        Cmd::Enroll { user, reset, samples, name } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;
             enroll_guided(&user, reset, samples.max(1))?;
+            if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+                profile_name_cmd(&user, &name)?;
+            }
         }
         Cmd::Verify { user } => {
             let user = user.map(Ok).unwrap_or_else(current_user)?;

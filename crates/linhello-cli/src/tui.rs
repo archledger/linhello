@@ -268,6 +268,9 @@ struct App {
     /// When `Some(user)`, the Profiles screen is awaiting y/N confirmation to
     /// permanently delete that profile.
     delete_confirm: Option<String>,
+    /// When `Some`, the Profiles screen is typing the name of a NEW profile to
+    /// create + set as the enroll target.
+    new_profile_input: Option<String>,
     identify: IdentifyState,
     password: PasswordStep,
     uninstall: UninstallState,
@@ -355,6 +358,7 @@ impl App {
             active_profile,
             name_input: None,
             delete_confirm: None,
+            new_profile_input: None,
             identify: IdentifyState::Idle,
             password: PasswordStep::Entry {
                 input: String::new(),
@@ -751,6 +755,10 @@ impl App {
             self.name_edit_key(code);
             return;
         }
+        if self.screen == Screen::Profiles && self.new_profile_input.is_some() {
+            self.new_profile_edit_key(code);
+            return;
+        }
         if self.screen == Screen::Install && matches!(self.install_step, InstallStep::ModelPath { .. })
         {
             self.install_key(code);
@@ -959,14 +967,13 @@ impl App {
                     self.status = format!("enroll target: {}", p.user);
                 }
             }
-            // New profile: enroll under a typed name on the next step. Here we
-            // just set the active profile to a fresh login-user name via input.
+            // Create a NEW named profile and make it the enroll target: type a
+            // name, then go to Enroll to capture faces into it.
             KeyCode::Char('a') => {
-                self.active_profile = self.user.clone();
-                self.status = format!(
-                    "enroll target set to your login '{}' — go to Enroll (Tab)",
-                    self.user
-                );
+                self.new_profile_input = Some(String::new());
+                self.status =
+                    "new profile: type a name, Enter to set as enroll target, Esc to cancel"
+                        .to_string();
             }
             // Rename the highlighted profile.
             KeyCode::Char('n') => {
@@ -1026,6 +1033,43 @@ impl App {
                         Err(e) => self.status = format!("error: {e}"),
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Typing the name of a NEW profile to create + target (`new_profile_input`).
+    /// Enter sets it as the enroll target; the profile is created when you enroll.
+    fn new_profile_edit_key(&mut self, code: KeyCode) {
+        let Some(buf) = self.new_profile_input.as_mut() else { return };
+        match code {
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Esc => {
+                self.new_profile_input = None;
+                self.status = "new profile cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let name = self.new_profile_input.as_deref().unwrap_or("").trim().to_string();
+                // The name becomes a directory under /etc/linhello, so reject
+                // empties / traversal / separators (mirrors the daemon's check).
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    self.status = "invalid name — avoid empty, '/', '\\', '.' and '..'".to_string();
+                    return; // keep editing; buffer unchanged
+                }
+                self.new_profile_input = None;
+                self.active_profile = name.clone();
+                self.push_activity(format!(
+                    "new profile '{name}' set as the enroll target — go to Enroll (Tab) to capture faces into it"
+                ));
+                self.status = format!("enroll target: {name} — Tab to Enroll");
             }
             _ => {}
         }
@@ -1780,6 +1824,7 @@ impl App {
             Screen::Profiles => vec![
                 ("↑↓", "highlight"),
                 ("s", "set enroll target"),
+                ("a", "new profile"),
                 ("n", "rename"),
                 ("d", "delete"),
                 ("r", "refresh"),
@@ -2142,6 +2187,28 @@ impl App {
     }
 
     fn body_profiles(&self, frame: &mut Frame, area: Rect) {
+        if let Some(buf) = &self.new_profile_input {
+            // Create-new-profile overlay.
+            self.body_paragraph(
+                frame,
+                area,
+                vec![
+                    Line::from("Create a new profile".bold()),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw("New profile name: "),
+                        Span::styled(buf.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("▏", Style::default().fg(Color::Gray)),
+                    ]),
+                    Line::from(""),
+                    Line::from(
+                        "Enter sets it as the enroll target (then Tab to Enroll); Esc cancels."
+                            .italic(),
+                    ),
+                ],
+            );
+            return;
+        }
         if let Some(buf) = &self.name_input {
             // Name-edit overlay.
             let target = self
