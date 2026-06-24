@@ -14,7 +14,13 @@
 
 A modern, Rust-based alternative to [Howdy](https://github.com/boltgolt/howdy): your password isn't replaced — it's sealed in your computer's TPM chip and released only when your face matches, with hardware-checked anti-spoofing. If the camera, TPM, or anything else fails, you just type your password like normal. **You can never be locked out.**
 
-<!-- Tip: a short demo GIF here sells the project instantly — drop one at assets/demo.gif and reference it as ![demo](assets/demo.gif) -->
+<div align="center">
+
+[![LinuxHello — the guided setup wizard in action](assets/demo.gif)](assets/demo.webm)
+
+<sub>▶ The guided setup, start to finish — hardware check, camera, TPM password sealing, done. <a href="assets/demo.webm">Watch the full walkthrough</a>.</sub>
+
+</div>
 
 ## 🧰 What you need
 
