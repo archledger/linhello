@@ -183,7 +183,7 @@ pub struct LivenessSignals {
 }
 
 impl LivenessSignals {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         LivenessSignals {
             spoof_prob: None,
             ml_score: None,

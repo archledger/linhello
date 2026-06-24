@@ -46,7 +46,7 @@ pub struct AuthResult {
 /// Capture one frame, detect the primary face, and run the liveness gate.
 /// Returns the frame + face on success; errors (with a human-readable reason)
 /// when no face is visible or liveness rejects.
-fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
+fn capture_detect_live() -> Result<(camera::Frame, detect::Face, linhello_liveness::LivenessSignals)> {
     // Capture RGB + detect FIRST, then IR — never concurrently. On shared-USB
     // Windows-Hello modules (e.g. NexiGo N930W: RGB + IR are one USB device) a
     // simultaneous IR grab starves the RGB stream, producing slow/torn frames
@@ -80,14 +80,23 @@ fn capture_detect_live() -> Result<(camera::Frame, detect::Face)> {
             report.reason.as_deref().unwrap_or("try again")
         )));
     }
-    Ok((frame, face))
+    Ok((frame, face, report.signals))
 }
 
 pub fn capture_and_embed() -> Result<Vec<f32>> {
-    let (frame, face) = capture_detect_live()?;
+    capture_and_embed_signals().map(|(v, _)| v)
+}
+
+/// Like [`capture_and_embed`] but also returns the liveness signals from the same
+/// capture, so the caller can apply a per-user calibrated IR liveness gate (the
+/// signals carry the active-IR cues) or record an enrollment observation.
+pub fn capture_and_embed_signals(
+) -> Result<(Vec<f32>, linhello_liveness::LivenessSignals)> {
+    let (frame, face, signals) = capture_detect_live()?;
     let aligned = align::align(&frame, &face)?;
     let embedder = embed::Embedder::cached()?;
-    embedder.embed(&aligned)
+    let emb = embedder.embed(&aligned)?;
+    Ok((emb, signals))
 }
 
 /// Capture one RGB frame and return live framing geometry for the enrollment

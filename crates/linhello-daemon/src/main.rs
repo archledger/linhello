@@ -386,8 +386,9 @@ fn do_status() -> Response {
 }
 
 fn do_enroll(user: &str, reset: bool) -> Response {
-    // Capture + liveness + embed.
-    let embedding = match linhello_biometrics::capture_and_embed() {
+    // Capture + liveness + embed. Keep the liveness signals so we can record the
+    // live user's active-IR signature for the per-user IR liveness gate.
+    let (embedding, signals) = match linhello_biometrics::capture_and_embed_signals() {
         Ok(v) => v,
         Err(e) => return Response::Error { message: e.to_string() },
     };
@@ -417,6 +418,20 @@ fn do_enroll(user: &str, reset: bool) -> Response {
     // Record camera identity (soft-SDCP). Overwritten on each enroll so
     // a hardware upgrade is handled by re-enrolling.
     save_camera_binding(user, &snapshot_camera_binding());
+
+    // Accumulate the live user's active-IR signature into their calibrated IR
+    // liveness envelope (reset clears it). Only frames that actually carried an
+    // IR observation contribute; a no-IR setup never reaches the ready threshold,
+    // so the gate stays dormant there. See ir_gate_check / IrCalibration::gate.
+    let mut cal = if reset {
+        linhello_liveness::ir::IrCalibration::default()
+    } else {
+        load_ir_calibration(user)
+    };
+    if let Some(obs) = linhello_liveness::ir::IrObservation::from_signals(&signals) {
+        cal.push(obs);
+    }
+    save_ir_calibration(user, &cal);
 
     let samples = all_raw.len() / (linhello_biometrics::enroll::EMBEDDING_DIM * 4);
     Response::Enrolled { samples }
@@ -458,6 +473,93 @@ fn save_camera_binding(user: &str, binding: &CameraBinding) {
 fn enrolled_binding(user: &str) -> Option<CameraBinding> {
     let json = std::fs::read_to_string(camera_binding_path(user)).ok()?;
     serde_json::from_str(&json).ok()
+}
+
+// ── Per-user calibrated active-IR liveness gate ─────────────────────────────
+
+fn ir_calibration_path(user: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(linhello_common::CONFIG_ROOT)
+        .join(user)
+        .join("ir_calibration.json")
+}
+
+fn load_ir_calibration(user: &str) -> linhello_liveness::ir::IrCalibration {
+    std::fs::read_to_string(ir_calibration_path(user))
+        .ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+fn save_ir_calibration(user: &str, cal: &linhello_liveness::ir::IrCalibration) {
+    let path = ir_calibration_path(user);
+    if let Ok(json) = serde_json::to_string_pretty(cal) {
+        let _ = std::fs::write(&path, json);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// Escape hatch: `LINHELLO_IR_GATE=0` disables the calibrated IR gate (e.g. if a
+/// hardware/lighting change starts false-rejecting until the user re-enrolls).
+fn ir_gate_disabled() -> bool {
+    std::env::var("LINHELLO_IR_GATE")
+        .ok()
+        .as_deref()
+        .map(|v| matches!(v, "0" | "false" | "no" | "off"))
+        .unwrap_or(false)
+}
+
+/// Apply the per-user calibrated active-IR liveness gate to a finished capture's
+/// signals. `Err(reason)` when the live IR signature is inconsistent with the
+/// enrolled live envelope (likely a photo/screen), or when the user enrolled with
+/// IR but this attempt produced no IR frame (fail closed). A legacy/uncalibrated
+/// profile passes through (IR stays advisory, exactly as before). Additive to the
+/// ML anti-spoof already enforced inside `capture_and_embed_signals`.
+fn ir_gate_check(
+    user: &str,
+    signals: &linhello_liveness::LivenessSignals,
+) -> std::result::Result<(), String> {
+    use linhello_liveness::ir::{IrGate, IrObservation};
+    if ir_gate_disabled() {
+        return Ok(());
+    }
+    let cal = load_ir_calibration(user);
+    if !cal.is_ready() {
+        return Ok(());
+    }
+    match IrObservation::from_signals(signals) {
+        Some(obs) => match cal.gate(&obs) {
+            IrGate::Pass => {
+                tracing::debug!(
+                    "IR gate: pass for '{user}' (face/bg {:.2}, glint {:.0})",
+                    obs.face_bg_ratio,
+                    obs.eye_glint
+                );
+                Ok(())
+            }
+            IrGate::Reject(reason) => {
+                tracing::warn!("IR gate: REJECT for '{user}': {reason}");
+                Err(format!("liveness check failed: {reason}"))
+            }
+            IrGate::NotCalibrated => Ok(()),
+        },
+        None => Err(
+            "IR liveness required (you enrolled with IR) but no IR frame was captured this attempt"
+                .to_string(),
+        ),
+    }
+}
+
+/// Capture + embed + the per-user calibrated IR liveness gate. Centralises the
+/// gate so every credential-releasing path enforces it identically.
+fn capture_embed_gated(user: &str) -> std::result::Result<Vec<f32>, String> {
+    let (live, signals) =
+        linhello_biometrics::capture_and_embed_signals().map_err(|e| e.to_string())?;
+    ir_gate_check(user, &signals)?;
+    Ok(live)
 }
 
 /// Hardware assurance tier for `user`, fixed by the camera they enrolled with: an
@@ -772,11 +874,11 @@ fn do_verify(user: &str) -> Response {
             return Response::Error { message: e.to_string() };
         }
     };
-    let live = match linhello_biometrics::capture_and_embed() {
+    let live = match capture_embed_gated(user) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Verify: capture/liveness failed for '{user}' after {:?}: {e}", started.elapsed());
-            return Response::Error { message: e.to_string() };
+            return Response::Error { message: e };
         }
     };
     let r = linhello_biometrics::match_against(&live, &samples);
@@ -977,9 +1079,9 @@ fn do_unseal(user: &str) -> Response {
         Ok(s) => s,
         Err(e) => return Response::Error { message: e },
     };
-    let live = match linhello_biometrics::capture_and_embed() {
+    let live = match capture_embed_gated(user) {
         Ok(v) => v,
-        Err(e) => return Response::Error { message: e.to_string() },
+        Err(e) => return Response::Error { message: e },
     };
     let r = linhello_biometrics::match_against(&live, &samples);
     if !r.matched {
@@ -1188,11 +1290,11 @@ fn do_unseal_password(user: &str) -> Response {
             return Response::Error { message: e };
         }
     };
-    let live = match linhello_biometrics::capture_and_embed() {
+    let live = match capture_embed_gated(user) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("UnsealPassword: capture/liveness failed for '{user}': {e}");
-            return Response::Error { message: e.to_string() };
+            return Response::Error { message: e };
         }
     };
     let r = linhello_biometrics::match_against(&live, &samples);

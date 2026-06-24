@@ -45,6 +45,7 @@
 //! return "move closer" (the same UX constraint Windows Hello lives with).
 
 use image::GrayImage;
+use serde::{Deserialize, Serialize};
 
 /// Minimum face width / frame width before we accept the frame for
 /// recognition. Below this the face is too small to recognise reliably, so we
@@ -234,6 +235,120 @@ fn eye_glint_at(ir: &GrayImage, cx: i32, cy: i32, r: i32) -> f32 {
     (maxv as f32 - sum as f32 / n as f32).max(0.0)
 }
 
+// ── Enrollment-calibrated active-IR liveness gate ───────────────────────────
+//
+// The raw IR cues (face/background ratio, corneal glint) are too rig/lighting/
+// pose-dependent to hard-gate on with ABSOLUTE thresholds — that false-rejected
+// live users ~75% of the time, which is why IR was demoted to advisory. The fix
+// is to calibrate PER USER at enrollment: record the live user's own IR cue
+// distribution, then at auth require the live signature to stay within that
+// envelope. A flat photo or a screen replay can't reproduce it (a screen emits
+// almost no NIR → dark face region + no twin corneal glints; a far photo has no
+// active-emitter face/bg lift), while the genuine user — measured against their
+// OWN enrolled values, not a one-size threshold — passes. The gate is ADDITIVE
+// to the ML anti-spoof (both must pass), so it only ever tightens security.
+
+/// One IR observation captured from the live user (at enrollment) or the current
+/// attempt (at auth). Only the AE-gain-invariant, per-user-stable cues are kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IrObservation {
+    pub face_bg_ratio: f32,
+    pub eye_glint: f32,
+    pub ir_score: f32,
+    /// Face fill at capture time — recorded for context/auditing (the gate runs
+    /// only past the `MIN_FACE_FRAC` framing check, so all observations are close).
+    pub face_frac: f32,
+}
+
+impl IrObservation {
+    /// Extract an observation from a finished [`crate::LivenessSignals`], or
+    /// `None` if no IR frame contributed (so the caller can fail closed).
+    pub fn from_signals(s: &crate::LivenessSignals) -> Option<Self> {
+        Some(IrObservation {
+            face_bg_ratio: s.ir_face_bg_ratio?,
+            eye_glint: s.ir_eye_glint?,
+            ir_score: s.ir_score?,
+            face_frac: s.face_frac?,
+        })
+    }
+}
+
+/// Per-user IR liveness envelope, accumulated across enrollment captures.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IrCalibration {
+    pub observations: Vec<IrObservation>,
+}
+
+/// Outcome of gating a live observation against the enrolled envelope.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrGate {
+    /// Live IR signature is consistent with the enrolled live user.
+    Pass,
+    /// Live IR cues fell below the enrolled envelope — likely a presentation
+    /// attack (flat photo / screen replay).
+    Reject(String),
+    /// Too few enrolled IR observations to gate (legacy / non-IR enrollment).
+    NotCalibrated,
+}
+
+/// Minimum IR observations before the gate engages. Below this we stay advisory
+/// (legacy profiles, or hardware where IR rarely captured during enroll).
+pub const MIN_CALIBRATION_OBSERVATIONS: usize = 3;
+
+fn env_margin(var: &str, default: f32) -> f32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(default)
+}
+
+impl IrCalibration {
+    pub fn is_ready(&self) -> bool {
+        self.observations.len() >= MIN_CALIBRATION_OBSERVATIONS
+    }
+
+    pub fn push(&mut self, o: IrObservation) {
+        self.observations.push(o);
+    }
+
+    /// Robust low-end of a cue: ~20th percentile (so one noisy enroll frame
+    /// doesn't set the floor), but never below the smallest sample for tiny N.
+    fn robust_low(mut vals: Vec<f32>) -> f32 {
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if vals.is_empty() {
+            return 0.0;
+        }
+        let idx = (((vals.len() as f32) * 0.2).floor() as usize).min(vals.len() - 1);
+        vals[idx]
+    }
+
+    /// Gate a live observation. Rejects only when BOTH active-IR cues fall below
+    /// the user's own enrolled envelope (margined) — lenient to the genuine user
+    /// (who shows at least one cue), strict on flat media (which shows neither).
+    /// Margins are tunable via `LINHELLO_IR_RATIO_MARGIN` / `LINHELLO_IR_GLINT_MARGIN`.
+    pub fn gate(&self, live: &IrObservation) -> IrGate {
+        if !self.is_ready() {
+            return IrGate::NotCalibrated;
+        }
+        let ratio_ref = Self::robust_low(self.observations.iter().map(|o| o.face_bg_ratio).collect());
+        let glint_ref = Self::robust_low(self.observations.iter().map(|o| o.eye_glint).collect());
+        let ratio_thr = ratio_ref * env_margin("LINHELLO_IR_RATIO_MARGIN", 0.7);
+        let glint_thr = glint_ref * env_margin("LINHELLO_IR_GLINT_MARGIN", 0.5);
+
+        let ratio_absent = live.face_bg_ratio < ratio_thr;
+        let glint_absent = live.eye_glint < glint_thr;
+        if ratio_absent && glint_absent {
+            IrGate::Reject(format!(
+                "active-IR liveness below your enrolled profile (face/bg {:.2} < {:.2} AND eye-glint {:.0} < {:.0}) — looks like a photo or screen, not a live face",
+                live.face_bg_ratio, ratio_thr, live.eye_glint, glint_thr
+            ))
+        } else {
+            IrGate::Pass
+        }
+    }
+}
+
 fn empty_signals() -> IrSignals {
     IrSignals {
         mean_face: 0.0,
@@ -298,5 +413,50 @@ mod tests {
     fn glintless_face_passes_ir_gate() {
         // Glints are advisory too — a frame without glints still passes IR.
         assert_eq!(classify(&sig(1.5, 0.0), 0.45), IrVerdict::Real);
+    }
+
+    fn obs(face_bg_ratio: f32, eye_glint: f32) -> IrObservation {
+        IrObservation { face_bg_ratio, eye_glint, ir_score: 0.8, face_frac: 0.3 }
+    }
+
+    fn live_cal() -> IrCalibration {
+        // A genuine user's enrolled envelope: strong face/bg lift + corneal glints.
+        IrCalibration {
+            observations: vec![
+                obs(1.6, 45.0), obs(1.5, 38.0), obs(1.7, 52.0), obs(1.55, 41.0),
+            ],
+        }
+    }
+
+    #[test]
+    fn calibration_not_ready_below_min_observations() {
+        let cal = IrCalibration { observations: vec![obs(1.6, 45.0), obs(1.5, 40.0)] };
+        assert_eq!(cal.gate(&obs(1.0, 1.0)), IrGate::NotCalibrated);
+    }
+
+    #[test]
+    fn live_user_passes_their_own_envelope() {
+        assert_eq!(live_cal().gate(&obs(1.5, 40.0)), IrGate::Pass);
+        // Even a somewhat-low frame passes while ONE cue stays healthy.
+        assert_eq!(live_cal().gate(&obs(1.0, 40.0)), IrGate::Pass); // glint healthy
+        assert_eq!(live_cal().gate(&obs(1.6, 5.0)), IrGate::Pass);  // ratio healthy
+    }
+
+    #[test]
+    fn flat_photo_or_screen_rejected() {
+        // Screen replay / matte photo: no face/bg lift AND no twin corneal glint.
+        assert!(matches!(live_cal().gate(&obs(1.0, 2.0)), IrGate::Reject(_)));
+        assert!(matches!(live_cal().gate(&obs(0.9, 0.0)), IrGate::Reject(_)));
+    }
+
+    #[test]
+    fn from_signals_requires_ir_fields() {
+        let mut s = crate::LivenessSignals::empty();
+        assert!(IrObservation::from_signals(&s).is_none());
+        s.ir_face_bg_ratio = Some(1.5);
+        s.ir_eye_glint = Some(40.0);
+        s.ir_score = Some(0.8);
+        s.face_frac = Some(0.3);
+        assert!(IrObservation::from_signals(&s).is_some());
     }
 }
