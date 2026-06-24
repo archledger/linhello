@@ -21,7 +21,8 @@ extern int  linhello_unseal_keyring(const char *user, uint8_t *buf, size_t len);
 extern int  linhello_verify_face(const char *user);
 extern int  linhello_authenticate(const char *user, const char *service,
                                   uint8_t *buf, size_t len);
-extern int  linhello_auth_will_capture(const char *user, const char *service);
+extern int  linhello_auth_will_capture(const char *user, const char *service,
+                                       uint8_t *msg, size_t msg_len);
 extern int  linhello_reseal_password(const char *user, uint8_t *buf, size_t len);
 extern void linhello_zero_buf(uint8_t *buf, size_t len);
 
@@ -75,7 +76,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * there the camera stays dark and we must fall straight through to the
      * password silently. The secure tier (login unseals, unlock verifies) and any
      * lock-screen Verify still light the camera, so the prompt shows there. */
-    int will_capture = linhello_auth_will_capture(user, service);
+    /* The pre-flight also reports WHY the camera can't be used, when it can't
+     * (hardware privacy switch on, or no camera detected), so we can tell the
+     * user instead of failing to the password silently. */
+    char notice[256];
+    notice[0] = '\0';
+    int will_capture = linhello_auth_will_capture(user, service,
+                                                  (uint8_t *)notice, sizeof(notice));
     if (will_capture <= 0) {
         /* 0 = policy deny (no camera engaged); <0 = daemon unreachable/error.
          * Either way there is no capture to narrate: stay silent, don't run the
@@ -92,7 +99,15 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * InfoQuery; sudo prints a line). The non-interactive parallel lockscreen
      * stacks (kde-fingerprint, `wait`) don't, so skip the prompt there. */
     if (waits == 0) {
-        pam_info(pamh, "Looking for your face…");
+        if (notice[0] != '\0') {
+            /* Camera blocked (privacy key) or absent: show why, rather than a
+             * bare "Looking for your face…" that never engages. We still run the
+             * attempt below (and the parallel `wait` stack keeps retrying), so
+             * un-blocking the camera re-engages face unlock with no re-lock. */
+            pam_info(pamh, "%s", notice);
+        } else {
+            pam_info(pamh, "Looking for your face…");
+        }
     }
     time_t deadline = time(NULL) + waits;
 

@@ -614,9 +614,48 @@ fn do_auth_intent(user: &str, service: &str, peer_is_root: bool) -> Response {
             tier.as_str()
         );
     }
+    // If the camera *would* engage but is currently unusable (hardware privacy
+    // switch on, or no camera present), attach a short reason so the PAM module
+    // can tell the user at the greeter/lock screen — instead of a silent password
+    // fall-through that leaves them wondering why face unlock "did nothing".
+    let camera_notice = if action == Action::Deny {
+        None
+    } else {
+        camera_block_notice()
+    };
     Response::AuthPlan {
         engage: action != Action::Deny,
         action: label.to_string(),
+        camera_notice,
+    }
+}
+
+/// A user-facing reason the camera can't be used *right now*, or `None` if it is
+/// ready. Drives the greeter notice (and lets the lock screen explain a blocked
+/// camera). Uses the bounded [`enumerate`] (which reads `V4L2_CID_PRIVACY`), so a
+/// wedged device can't stall the pre-flight. Recomputed each call — so once the
+/// user toggles the privacy key off or replugs the camera, the next attempt sees
+/// it ready and the notice clears, which is what makes auto-re-engage observable.
+fn camera_block_notice() -> Option<String> {
+    use linhello_biometrics::camera;
+    let cams = camera::enumerate();
+    let rgb = camera::rgb_device();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    let rgb_node = canon(&rgb);
+    match cams.iter().find(|c| canon(&c.path) == rgb_node) {
+        // Camera present but the hardware privacy switch/shutter is engaged.
+        Some(c) if c.privacy == Some(true) => Some(
+            "Camera privacy switch is on — toggle the camera-privacy key (e.g. Fn+F10) to use face unlock"
+                .to_string(),
+        ),
+        // Present and usable.
+        Some(_) => None,
+        // Resolved camera isn't among the live capture nodes: unplugged, or a
+        // hardware kill-switch/eShutter removed it (the OS then sees no camera).
+        None => Some(
+            "No camera detected — it may be disconnected or a hardware privacy switch is on; using your password"
+                .to_string(),
+        ),
     }
 }
 

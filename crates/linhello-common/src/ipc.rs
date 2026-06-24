@@ -369,6 +369,13 @@ pub enum Response {
     AuthPlan {
         engage: bool,
         action: String,
+        /// When the camera *would* engage but is currently unusable, a short,
+        /// user-facing reason the PAM module shows at the greeter/lock screen
+        /// instead of "Looking for your face…" (e.g. the hardware privacy switch
+        /// is on, or no camera is detected). `None` when the camera is ready or
+        /// the operation doesn't engage it. `#[serde(default)]` for older daemons.
+        #[serde(default)]
+        camera_notice: Option<String>,
     },
     /// Result of [`Request::PolicyStatus`]: the effective tier and per-operation
     /// policy the daemon would apply right now.
