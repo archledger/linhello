@@ -3296,6 +3296,17 @@ pub fn run(user: String) -> anyhow::Result<()> {
 fn init_terminal() -> ratatui::DefaultTerminal {
     let terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // `ratatui::init()` installs a panic hook that restores the screen (raw mode
+    // + alternate screen) but NOT mouse reporting — so a panic mid-loop would
+    // leave the user's shell echoing mouse escape sequences on every move/click.
+    // Chain a hook that turns mouse capture off first, then runs ratatui's. (init
+    // is re-called after each suspended sub-flow; ratatui re-sets its hook each
+    // time, so we re-wrap each time and the chain never grows unbounded.)
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        prev(info);
+    }));
     terminal
 }
 

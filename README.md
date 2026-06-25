@@ -279,7 +279,12 @@ approach in a few respects:
 sudo linhello uninstall --yes
 ```
 
-Removes everything (PAM is unwired first — password login is never at risk).
+Leaves no trace. PAM is unwired first (password login is never at risk), then
+the package is removed through your distro's own manager — `dnf` on Fedora,
+`pacman` on Arch, `apt` on Debian/Ubuntu — so its database stays consistent
+(rather than deleting packaged files by hand); a source install is swept
+directly instead. Enrolled faces, TPM envelopes, config, and the models are
+erased. (In the setup TUI, the same thing lives behind the `u` key.)
 
 ## 📜 License
 
