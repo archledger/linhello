@@ -26,5 +26,13 @@ jobs:
     trigger: release
     owner: archledger
     project: linhello
+    # The %build runs `cargo build`, which fetches crates from crates.io at build
+    # time. Copr build roots are network-isolated by default (Packit's enable_net
+    # has defaulted to false since 2022-06), which made every release's automatic
+    # build fail with "unable to update registry crates-io" and need a manual
+    # `copr-cli build --enable-net on` resubmit. Turn network on for the build so
+    # the dependency fetch works — matching how CI (release.yml), Arch (makepkg),
+    # and Debian (dpkg-buildpackage) already build with network.
+    enable_net: true
     targets:
       - fedora-44-x86_64
