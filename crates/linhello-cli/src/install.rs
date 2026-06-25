@@ -1237,7 +1237,7 @@ pub fn uninstall_plan(remove_models: bool) -> Vec<String> {
         "stop and disable the linhellod service".to_string(),
         "remove the linhello / linhellod / reseal-hook programs".to_string(),
         "remove the PAM modules (pam_linhello.so, liblinhello_pam.so)".to_string(),
-        "remove the systemd unit and the pacman reseal hook".to_string(),
+        "remove the systemd unit and the post-update reseal hook".to_string(),
         "ERASE enrolled faces, TPM envelopes, and config in /etc/linhello".to_string(),
     ];
     if remove_models {
@@ -1246,6 +1246,19 @@ pub fn uninstall_plan(remove_models: bool) -> Vec<String> {
         v.push("keep only the ~190MB face models (so a reinstall skips re-fetch)".to_string());
     }
     v
+}
+
+/// True when `linhello` is tracked as an installed rpm — so uninstall must go
+/// through `dnf remove` rather than deleting rpm-owned files behind its back.
+fn rpm_owns_linhello() -> bool {
+    Command::new("rpm")
+        .args(["-q", "linhello"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Remove LinuxHello from this host. PAM is unwired *first* so the module is
@@ -1268,6 +1281,30 @@ pub fn uninstall(remove_models: bool) -> Result<Vec<String>, String> {
     // system-auth reseal line, a throwaway test service, stragglers) so the
     // module is never left referenced after it is deleted.
     scrub_pam_references(&mut log);
+
+    // On a Fedora rpm install, hand the package to dnf so the rpm database stays
+    // consistent: deleting rpm-owned files by hand leaves the package recorded as
+    // installed with every file missing. dnf removes its own files; we then clear
+    // the runtime data it doesn't own (enrolled faces, envelopes, config, models).
+    // Output is captured (not streamed) so it can't corrupt the TUI's screen.
+    if platform::distro_family() == platform::DistroFamily::Fedora && rpm_owns_linhello() {
+        run_systemctl(&["disable", "--now", "linhellod"]);
+        let out = Command::new("dnf")
+            .args(["remove", "-y", "linhello"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("running dnf remove: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "dnf remove linhello failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        log.push("removed the linhello package via dnf".to_string());
+        run_systemctl(&["daemon-reload"]);
+        remove_config_data(remove_models, &mut log);
+        return Ok(log);
+    }
 
     if run_systemctl(&["disable", "--now", "linhellod"]) {
         log.push("stopped and disabled linhellod".to_string());
