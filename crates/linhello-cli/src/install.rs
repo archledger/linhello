@@ -1237,7 +1237,7 @@ pub fn uninstall_plan(remove_models: bool) -> Vec<String> {
         "stop and disable the linhellod service".to_string(),
         "remove the linhello / linhellod / reseal-hook programs".to_string(),
         "remove the PAM modules (pam_linhello.so, liblinhello_pam.so)".to_string(),
-        "remove the systemd unit and the pacman reseal hook".to_string(),
+        "remove the systemd unit and the post-update reseal hook".to_string(),
         "ERASE enrolled faces, TPM envelopes, and config in /etc/linhello".to_string(),
     ];
     if remove_models {
@@ -1246,6 +1246,84 @@ pub fn uninstall_plan(remove_models: bool) -> Vec<String> {
         v.push("keep only the ~190MB face models (so a reinstall skips re-fetch)".to_string());
     }
     v
+}
+
+/// The package manager whose database records linhello, if any. An uninstall
+/// removes the package *through* this manager so its records stay correct —
+/// deleting package-owned files by hand leaves the package recorded as installed
+/// with every file missing (true for rpm, pacman, and dpkg alike).
+#[derive(Clone, Copy)]
+enum PkgMgr {
+    Dnf,    // Fedora / rpm
+    Pacman, // Arch
+    Apt,    // Debian / Ubuntu / dpkg
+}
+
+/// Which package manager owns `linhello` here (checked by querying each db; only
+/// the native tool exists on a given distro). `None` ⇒ a source/unmanaged install.
+fn owning_package_manager() -> Option<PkgMgr> {
+    if pkg_query("rpm", &["-q", "linhello"]) {
+        Some(PkgMgr::Dnf)
+    } else if pkg_query("pacman", &["-Q", "linhello"]) {
+        Some(PkgMgr::Pacman)
+    } else if dpkg_installed() {
+        Some(PkgMgr::Apt)
+    } else {
+        None
+    }
+}
+
+/// True if `prog args…` exits 0 (i.e. the package db knows linhello).
+fn pkg_query(prog: &str, args: &[&str]) -> bool {
+    Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// dpkg reports a package even in the config-remnant ("deinstall") state, so
+/// check the Status field actually says it's installed.
+fn dpkg_installed() -> bool {
+    Command::new("dpkg-query")
+        .args(["-W", "-f=${Status}", "linhello"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("ok installed"))
+        .unwrap_or(false)
+}
+
+/// Remove the linhello package via its owning manager. Best-effort: a failure is
+/// logged and the caller's direct file sweep still removes the binaries, so
+/// linhello ends up gone either way. Output is captured (not streamed) so it
+/// can't corrupt the TUI's alternate screen.
+fn remove_package(pm: PkgMgr, log: &mut Vec<String>) {
+    // Use the "leave nothing behind" variants: pacman -Rn drops .pacsave config
+    // backups; apt-get purge removes the deb's conffiles. (dnf remove already
+    // takes the package's files; runtime data is cleared separately.)
+    let (prog, args): (&str, &[&str]) = match pm {
+        PkgMgr::Dnf => ("dnf", &["remove", "-y", "linhello"]),
+        PkgMgr::Pacman => ("pacman", &["-Rn", "--noconfirm", "linhello"]),
+        PkgMgr::Apt => ("apt-get", &["purge", "-y", "linhello"]),
+    };
+    match Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => log.push(format!("removed the linhello package via {prog}")),
+        Ok(o) => log.push(format!(
+            "{prog} could not remove the package ({}); removing files directly",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => log.push(format!("could not run {prog} ({e}); removing files directly")),
+    }
 }
 
 /// Remove LinuxHello from this host. PAM is unwired *first* so the module is
@@ -1273,6 +1351,17 @@ pub fn uninstall(remove_models: bool) -> Result<Vec<String>, String> {
         log.push("stopped and disabled linhellod".to_string());
     } else {
         log.push("linhellod was not running / already disabled".to_string());
+    }
+
+    // Detect how linhello got here and remove it the matching way. If a package
+    // manager (dnf/pacman/dpkg) owns it, remove it THROUGH that manager so its
+    // database stays consistent — otherwise the records say "installed" while
+    // every file is gone. Best-effort; the file sweep below runs regardless, so
+    // a source install (or a /usr/local shadow over a package install) is also
+    // cleaned and linhello ends up nowhere on the system.
+    match owning_package_manager() {
+        Some(pm) => remove_package(pm, &mut log),
+        None => log.push("no package record — removing installed files directly".to_string()),
     }
 
     for dir in BIN_DIRS {

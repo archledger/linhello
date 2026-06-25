@@ -955,8 +955,14 @@ impl App {
         // Screen-specific handling.
         match self.screen {
             Screen::Welcome if matches!(code, KeyCode::Char('u')) => {
-                self.screen = Screen::Uninstall;
-                self.uninstall = UninstallState::Idle { remove_models: true };
+                // Only offer uninstall when something is actually installed —
+                // otherwise `u` would open the destructive screen for nothing.
+                if self.install.is_installed() {
+                    self.screen = Screen::Uninstall;
+                    self.uninstall = UninstallState::Idle { remove_models: true };
+                } else {
+                    self.log_activity("LinuxHello isn't installed — nothing to uninstall.");
+                }
             }
             Screen::Install => self.install_key(code),
             Screen::Cameras => self.cameras_key(code),
@@ -1451,10 +1457,11 @@ impl App {
                         self.log_activity("uninstalling LinuxHello…");
                         match crate::install::uninstall(remove_models) {
                             Ok(log) => {
-                                for l in &log {
-                                    self.log_activity(l.clone());
-                                }
+                                // The per-item detail stays in the Done body; the
+                                // Activity panel gets one clean confirmation rather
+                                // than a flood of every removed file.
                                 self.install = crate::install::InstallState::detect();
+                                self.log_activity("LinuxHello uninstalled.");
                                 self.uninstall = UninstallState::Done { log };
                             }
                             Err(e) => {
