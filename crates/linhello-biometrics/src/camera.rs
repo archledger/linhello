@@ -728,8 +728,13 @@ fn auto_brighten_rgb(dev: &Device, stream: &mut Stream<'_>, fourcc: &FourCC, w: 
     }
     let dv = (b1 - b0) as f32;
     let dl = l1 - l0;
-    if dv.abs() < 0.5 || dl.abs() < 0.5 {
-        return; // control couldn't move, or has no luma effect
+    // Require a clear luma response before trusting the slope: a real BRIGHTNESS
+    // control moves luma by tens over a ±16 probe, so a sub-3 change means the
+    // control is near-useless here — extrapolating from that noise would solve to
+    // a wild value (the driver would just clamp it to the rail). Leave the modest
+    // probe offset in place and bail.
+    if dv.abs() < 0.5 || dl.abs() < 3.0 {
+        return; // control couldn't move, or its luma response is too weak to trust
     }
     let sensitivity = dl / dv; // luma per control unit
     // Solve for the value that lands on target from the (b1, l1) point.
