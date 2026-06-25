@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.6.2
+Version:        0.6.3
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,6 +169,17 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Thu Jun 25 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.3-1
+- Fix the Arch source build: `make dist` had a hardcoded version (0.3.2) that
+  never matched PKGBUILD, so `make dist && makepkg` was broken; it now derives
+  the version from PKGBUILD.
+- Copr: enable network for the Packit build so the cargo dependency fetch
+  succeeds (builds were network-isolated and failed on crates.io).
+- TUI: turn mouse reporting off on a panic too, so a crash can't leave the
+  terminal echoing mouse escape sequences.
+- Camera auto-brightness: ignore a weak/noisy brightness-control response
+  instead of extrapolating to a clamped extreme.
+
 * Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.2-1
 - Uninstall now removes linhello through its owning package manager so the
   package database stays consistent: dnf on Fedora, pacman -Rn on Arch, and

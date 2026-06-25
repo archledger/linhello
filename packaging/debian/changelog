@@ -1,3 +1,12 @@
+linhello (0.6.3-1) unstable; urgency=medium
+
+  * Fix the Arch source build (make dist version derived from PKGBUILD), enable
+    network for the Packit/Copr build so the cargo fetch succeeds, disable mouse
+    reporting on a TUI panic, and harden camera auto-brightness against a weak
+    brightness-control response.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Thu, 25 Jun 2026 00:30:00 -0400
+
 linhello (0.6.2-1) unstable; urgency=medium
 
   * Uninstall removes linhello through its owning package manager (dnf/pacman/
