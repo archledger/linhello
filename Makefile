@@ -33,8 +33,10 @@ RUST_PAM_LIB := $(TARGET_DIR)/liblinhello_pam.so
 
 .PHONY: all build pam install check clean dist
 
-# Version must match pkgver in packaging/arch/PKGBUILD.
-DIST_VERSION ?= 0.3.2
+# Derived from the single source of truth (PKGBUILD pkgver) so `make dist`
+# always matches the package version — never a stale hardcoded value. Override
+# with `make dist DIST_VERSION=x.y.z` if needed.
+DIST_VERSION ?= $(shell sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
 DIST_PREFIX  := linhello-$(DIST_VERSION)
 DIST_TARBALL := packaging/arch/$(DIST_PREFIX).tar.gz
 
