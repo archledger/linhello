@@ -15,7 +15,7 @@ repositories:
 
 | Package      | Spec                  | What it is |
 |--------------|-----------------------|------------|
-| `onnxruntime`| `onnxruntime/onnxruntime.spec`    | Official Microsoft prebuilt `libonnxruntime.so`, version-matched to the `ort` crate LinuxHello is built against (1.22.x ↔ ort 2.0.0-rc.10). |
+| `onnxruntime`| `onnxruntime/onnxruntime.spec`    | Official Microsoft prebuilt `libonnxruntime.so`, version-matched to the `ort` crate LinuxHello is built against (1.24.4 ↔ ort 2.0.0-rc.12, `api-24`). |
 | `linhello`   | `linhello.spec`       | The daemon/CLI/PAM module. `Recommends: onnxruntime`, so `dnf` pulls it from the same COPR by default. |
 
 > **Layout note:** `onnxruntime.spec` lives in its **own subdirectory**
