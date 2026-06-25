@@ -1,3 +1,14 @@
+linhello (0.6.2-1) unstable; urgency=medium
+
+  * Uninstall removes linhello through its owning package manager (dnf/pacman/
+    apt-get purge) so the package database stays consistent, then sweeps any
+    leftover files and runtime data — linhello ends up nowhere on the system.
+    Verified on Fedora, Arch, and Ubuntu.
+  * TUI: post-uninstall no longer floods the Activity panel; `u` on the welcome
+    screen is a no-op when nothing is installed.
+
+ -- wisbendji fimerlus <archledger236@gmail.com>  Wed, 24 Jun 2026 14:00:00 -0400
+
 linhello (0.6.1-1) unstable; urgency=medium
 
   * Update path: on Fedora, `linhello update` now tracks the Copr repository via

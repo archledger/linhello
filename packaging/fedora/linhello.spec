@@ -5,7 +5,7 @@
 %global selinuxtype targeted
 
 Name:           linhello
-Version:        0.6.1
+Version:        0.6.2
 Release:        1%{?dist}
 Summary:        TPM-backed face authentication for Linux (Windows Hello-style)
 
@@ -169,6 +169,19 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %changelog
+* Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.2-1
+- Uninstall now removes linhello through its owning package manager so the
+  package database stays consistent: dnf on Fedora, pacman -Rn on Arch, and
+  apt-get purge on Debian/Ubuntu (previously it deleted package-owned files by
+  hand, leaving the package recorded as installed with every file missing). A
+  direct file sweep still runs, so source installs and /usr/local shadows are
+  cleaned too -- linhello ends up nowhere on the system. Verified end-to-end on
+  Fedora, Arch, and Ubuntu.
+- TUI: the post-uninstall result no longer floods the Activity panel with every
+  removed file (one clean line; detail stays in the result body), and pressing
+  `u` on the welcome screen when nothing is installed no longer opens the
+  destructive uninstall screen.
+
 * Wed Jun 24 2026 wisbendji fimerlus <archledger236@gmail.com> - 0.6.1-1
 - Update path: on Fedora, `linhello update` now tracks the Copr repository via
   dnf (auto-enabling it if missing) instead of rebuilding from a signed tag --
