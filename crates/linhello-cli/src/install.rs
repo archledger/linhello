@@ -1304,10 +1304,13 @@ fn dpkg_installed() -> bool {
 /// linhello ends up gone either way. Output is captured (not streamed) so it
 /// can't corrupt the TUI's alternate screen.
 fn remove_package(pm: PkgMgr, log: &mut Vec<String>) {
+    // Use the "leave nothing behind" variants: pacman -Rn drops .pacsave config
+    // backups; apt-get purge removes the deb's conffiles. (dnf remove already
+    // takes the package's files; runtime data is cleared separately.)
     let (prog, args): (&str, &[&str]) = match pm {
         PkgMgr::Dnf => ("dnf", &["remove", "-y", "linhello"]),
-        PkgMgr::Pacman => ("pacman", &["-R", "--noconfirm", "linhello"]),
-        PkgMgr::Apt => ("apt-get", &["remove", "-y", "linhello"]),
+        PkgMgr::Pacman => ("pacman", &["-Rn", "--noconfirm", "linhello"]),
+        PkgMgr::Apt => ("apt-get", &["purge", "-y", "linhello"]),
     };
     match Command::new(prog)
         .args(args)
